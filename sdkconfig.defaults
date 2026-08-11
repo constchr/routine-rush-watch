@@ -121,3 +121,33 @@ CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
 # symbol costs ~12.8 KiB — not the ~205 KiB a 16bpp canvas would need. That is
 # what makes it affordable without PSRAM.
 CONFIG_LV_USE_QRCODE=y
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LVGL filesystem + image cache (Phase 4)
+#
+# The emoji manifest (generated in the app repo, not editable here) emits paths
+# like "/lfs/emoji/1faa5.bin". LVGL addresses files as "<LETTER>:<path>", so we
+# register the POSIX driver as letter 'L' (76) with an EMPTY working directory.
+# An LVGL path is then literally "L:" + the manifest path, and littlefs is
+# mounted at /lfs to match.
+CONFIG_LV_USE_FS_POSIX=y
+CONFIG_LV_FS_POSIX_LETTER=76
+CONFIG_LV_FS_POSIX_PATH=""
+CONFIG_LV_FS_POSIX_CACHE_SIZE=512
+
+# Image handling — the heap-critical decision on a board with ~180 KiB free.
+#
+# LV_BIN_DECODER_RAM_LOAD=n (the default, made explicit): the bin decoder
+# STREAMS an RGB565A8 image from flash as it draws, instead of loading the
+# whole thing. A 96x96 RGB565A8 emoji is 27,660 bytes; loading one would spend
+# ~15% of our working RAM on a single glyph, and the routine runtime shows a
+# step's emoji for minutes at a time where the read cost is irrelevant.
+CONFIG_LV_BIN_DECODER_RAM_LOAD=n
+
+# Cache disabled deliberately. Caching only pays when decoding is expensive
+# (PNG/JPEG); these are raw framebuffer-format blobs with no decode step, so a
+# cache would trade real RAM for nothing. The single-step-focus design also
+# shows exactly ONE emoji at a time, so there is no working set to retain.
+# Revisit only if profiling shows the per-draw reads hurting the ring animation.
+CONFIG_LV_CACHE_DEF_SIZE=0
+CONFIG_LV_IMAGE_HEADER_CACHE_DEF_CNT=4

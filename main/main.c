@@ -136,6 +136,19 @@ void app_main(void)
         ESP_ERROR_CHECK(rr_ui_show_pairing_qr(payload));
     }
 
+    // ── Phase 4 demo: prove fonts, then render a real cached step ───────────
+    // Static only — no timer, no interaction (that is the next step).
+    rr_ui_font_selftest();
+    vTaskDelay(pdMS_TO_TICKS(6000));
+
+    rr_step_view_t step;
+    if (rr_store_get_step(0, 0, &step) == ESP_OK) {
+        ESP_LOGI(TAG, "cached routine '%s' — showing step 1/%d", step.routine_name, step.step_count);
+        rr_ui_show_step(&step);
+    } else {
+        ESP_LOGW(TAG, "no cached routines — push some over BLE, then reboot");
+    }
+
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         if (rr_rtc_get(&now) == ESP_OK) {

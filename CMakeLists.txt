@@ -16,3 +16,20 @@ if("${IDF_VERSION_MAJOR}.${IDF_VERSION_MINOR}" VERSION_LESS "5.5")
 endif()
 
 project(routine_rush_watch)
+
+# ── littlefs image: the emoji set ────────────────────────────────────────────
+# The manifest expects the images under an "emoji/" directory INSIDE the
+# partition, so stage them into that shape at configure time rather than
+# restructuring assets/ (the emoji are generated into assets/emoji/ by the app
+# repo's tooling).
+#
+# ⚠️ Flashing this image REPLACES the whole littlefs partition, which includes
+# the routine cache written at runtime. That is acceptable — the cache is
+# disposable by design and refills on the next ROUTINE_PUSH — but it does mean
+# a firmware flash with FLASH_IN_PROJECT un-caches the watch's routines.
+set(LFS_STAGE "${CMAKE_BINARY_DIR}/lfs_image")
+file(MAKE_DIRECTORY "${LFS_STAGE}/emoji")
+file(GLOB RR_EMOJI_BINS "${CMAKE_SOURCE_DIR}/assets/emoji/*.bin")
+file(COPY ${RR_EMOJI_BINS} DESTINATION "${LFS_STAGE}/emoji")
+
+littlefs_create_partition_image(littlefs "${LFS_STAGE}" FLASH_IN_PROJECT)

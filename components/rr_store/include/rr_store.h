@@ -54,3 +54,25 @@ esp_err_t rr_store_log_routines(void);
 
 /** Delete the cached routines (part of a factory reset). */
 esp_err_t rr_store_clear_routines(void);
+
+// ── Phase 4: reading one step out of the cache ───────────────────────────────
+
+/**
+ * A single step, flattened for rendering. Strings are COPIED into the struct
+ * so the caller never holds a pointer into a cJSON tree that has been freed —
+ * the parse-then-free rule from §2.1 (RAM is the ceiling) means the tree is
+ * released as soon as the fields are extracted.
+ */
+typedef struct {
+    char routine_name[64];
+    char routine_emoji[16];
+    char label[64];
+    char emoji[16];
+    int  time_limit_s;
+    int  position;     /**< 0-based index of this step */
+    int  step_count;   /**< total steps in the routine */
+    int  routine_count;
+} rr_step_view_t;
+
+/** Read one step out of the cached routine set. ESP_ERR_NOT_FOUND if absent. */
+esp_err_t rr_store_get_step(int routine_idx, int step_idx, rr_step_view_t *out);

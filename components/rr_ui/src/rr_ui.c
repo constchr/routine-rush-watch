@@ -24,6 +24,10 @@
 #include "bsp/display.h"
 #include "lvgl.h"
 
+#include "rr_fonts.h"
+#include "rr_store.h"
+#include "emoji_manifest.h"
+
 static const char *TAG = "rr_ui";
 
 // The panel is 410x502. Keep the QR comfortably inside the narrow axis so the
@@ -226,4 +230,151 @@ esp_err_t rr_ui_restore_after_reset_prompt(void)
     if (!s_reset_prompt_active) return ESP_OK;
     s_reset_prompt_active = false;
     return rr_ui_show_last_status();
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 4 — routine step screen (§8 screen 2, static: no timer yet)
+//
+// Single-step-focus: one step on screen, large enough for a child to read at
+// arm's length. Kids-app palette (§9), not the parent monochrome.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#define RR_BG      lv_color_hex(0x0D1117)
+#define RR_TEXT    lv_color_hex(0xF0F6FC)
+#define RR_MUTED   lv_color_hex(0x8B949E)
+#define RR_ACCENT  lv_color_hex(0xFF6B35)
+#define RR_SURFACE lv_color_hex(0x161B22)
+
+// LVGL addresses files as "<LETTER>:<path>". The emoji manifest is generated in
+// the app repo and emits bare POSIX paths ("/lfs/emoji/x.bin"), so we prepend
+// the drive letter here rather than editing a generated file. The POSIX driver
+// is registered with an EMPTY working directory (sdkconfig.defaults), so the
+// remainder passes through to open() unchanged.
+static bool to_lv_path(const char *posix_path, char *out, size_t cap)
+{
+    if (posix_path == NULL) return false;
+    int n = snprintf(out, cap, "%c:%s", (char) CONFIG_LV_FS_POSIX_LETTER, posix_path);
+    return n > 0 && (size_t) n < cap;
+}
+
+esp_err_t rr_ui_font_selftest(void)
+{
+    bsp_display_lock(0);
+    lv_obj_clean(s_screen);
+    lv_obj_set_style_bg_color(s_screen, RR_BG, LV_PART_MAIN);
+
+    // The gate: Greek and Latin in the SAME font, both legible, no boxes.
+    lv_obj_t *el = lv_label_create(s_screen);
+    lv_label_set_text(el, "Πρωινή ρουτίνα");
+    lv_obj_set_style_text_font(el, &rr_font_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(el, RR_TEXT, LV_PART_MAIN);
+    lv_obj_align(el, LV_ALIGN_CENTER, 0, -60);
+
+    lv_obj_t *en = lv_label_create(s_screen);
+    lv_label_set_text(en, "Morning routine");
+    lv_obj_set_style_text_font(en, &rr_font_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(en, RR_ACCENT, LV_PART_MAIN);
+    lv_obj_align(en, LV_ALIGN_CENTER, 0, 0);
+
+    // Mixed in one string — the real case, since a bilingual family's routine
+    // names and step labels are not guaranteed to be single-script.
+    lv_obj_t *mix = lv_label_create(s_screen);
+    lv_label_set_text(mix, "Βούρτσισμα · brush · 1/3");
+    lv_obj_set_style_text_font(mix, &rr_font_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(mix, RR_MUTED, LV_PART_MAIN);
+    lv_obj_align(mix, LV_ALIGN_CENTER, 0, 60);
+
+    bsp_display_unlock();
+    log_heap("after font selftest");
+    ESP_LOGI(TAG, "font selftest rendered (Greek + Latin, rr_font_36 / rr_font_20)");
+    return ESP_OK;
+}
+
+esp_err_t rr_ui_show_step(const rr_step_view_t *v)
+{
+    if (v == NULL) return ESP_ERR_INVALID_ARG;
+
+    log_heap("before step screen");
+
+    bsp_display_lock(0);
+    lv_obj_clean(s_screen);
+    lv_obj_set_style_bg_color(s_screen, RR_BG, LV_PART_MAIN);
+
+    // ── position "1 / 3" ────────────────────────────────────────────────────
+    char pos[24];
+    snprintf(pos, sizeof(pos), "%d / %d", v->position + 1, v->step_count);
+    lv_obj_t *lpos = lv_label_create(s_screen);
+    lv_label_set_text(lpos, pos);
+    lv_obj_set_style_text_font(lpos, &rr_font_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lpos, RR_MUTED, LV_PART_MAIN);
+    lv_obj_align(lpos, LV_ALIGN_TOP_MID, 0, 18);
+
+    // ── emoji, 96px, streamed from littlefs ─────────────────────────────────
+    char lvpath[96];
+    const char *posix_path = rr_emoji_path(v->emoji);
+    bool drew_emoji = false;
+    if (posix_path != NULL && to_lv_path(posix_path, lvpath, sizeof(lvpath))) {
+        lv_obj_t *img = lv_image_create(s_screen);
+        lv_image_set_src(img, lvpath);
+        lv_obj_align(img, LV_ALIGN_TOP_MID, 0, 52);
+        drew_emoji = true;
+        ESP_LOGI(TAG, "emoji '%s' -> %s", v->emoji, lvpath);
+    } else {
+        // Fallback dot (§8) — an unmapped emoji must not leave a hole.
+        lv_obj_t *dot = lv_obj_create(s_screen);
+        lv_obj_set_size(dot, 96, 96);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(dot, RR_SURFACE, LV_PART_MAIN);
+        lv_obj_set_style_border_width(dot, 0, LV_PART_MAIN);
+        lv_obj_align(dot, LV_ALIGN_TOP_MID, 0, 52);
+        ESP_LOGW(TAG, "emoji '%s' unmapped — drew fallback dot", v->emoji);
+    }
+
+    // ── step label, Greek font, wraps ───────────────────────────────────────
+    lv_obj_t *llabel = lv_label_create(s_screen);
+    lv_label_set_long_mode(llabel, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(llabel, 360);
+    lv_label_set_text(llabel, v->label);
+    lv_obj_set_style_text_font(llabel, &rr_font_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(llabel, RR_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_text_align(llabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(llabel, LV_ALIGN_TOP_MID, 0, 168);
+
+    // ── countdown ring — STATIC at full for now (no timer this session) ─────
+    lv_obj_t *arc = lv_arc_create(s_screen);
+    lv_obj_set_size(arc, 190, 190);
+    lv_arc_set_rotation(arc, 270);
+    lv_arc_set_bg_angles(arc, 0, 360);
+    lv_arc_set_range(arc, 0, 100);
+    lv_arc_set_value(arc, 100);                 // full — a fresh, unstarted step
+    lv_obj_remove_style(arc, NULL, LV_PART_KNOB);
+    lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_arc_width(arc, 14, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arc, 14, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(arc, RR_SURFACE, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(arc, RR_ACCENT, LV_PART_INDICATOR);
+    lv_obj_align(arc, LV_ALIGN_BOTTOM_MID, 0, -22);
+
+    // mm:ss in the ring centre. Untimed steps show a dash rather than 0:00,
+    // which would read as "already expired".
+    char mmss[16];
+    if (v->time_limit_s > 0) {
+        snprintf(mmss, sizeof(mmss), "%d:%02d", v->time_limit_s / 60, v->time_limit_s % 60);
+    } else {
+        snprintf(mmss, sizeof(mmss), "—");
+    }
+    lv_obj_t *lring = lv_label_create(s_screen);
+    lv_label_set_text(lring, mmss);
+    lv_obj_set_style_text_font(lring, &rr_font_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lring, RR_TEXT, LV_PART_MAIN);
+    lv_obj_align_to(lring, arc, LV_ALIGN_CENTER, 0, 0);
+
+    bsp_display_unlock();
+
+    log_heap("after step screen");
+    ESP_LOGI(TAG, "step screen: [%d/%d] '%s' %s  limit=%ds  emoji=%s",
+             v->position + 1, v->step_count, v->label, v->emoji,
+             v->time_limit_s, drew_emoji ? "rendered" : "FALLBACK");
+    s_last_screen = RR_SCREEN_NONE;
+    return ESP_OK;
 }

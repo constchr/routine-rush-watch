@@ -52,3 +52,13 @@ esp_err_t rr_ui_restore_after_reset_prompt(void);
 
 /** Re-render the last status screen (paired / waiting / QR). */
 esp_err_t rr_ui_show_last_status(void);
+
+// ── Phase 4 ──────────────────────────────────────────────────────────────────
+
+#include "rr_store.h"
+
+/** Gate check: Greek + Latin in one font, no boxes. */
+esp_err_t rr_ui_font_selftest(void);
+
+/** §8 screen 2, static (no timer): emoji + label + full ring + position. */
+esp_err_t rr_ui_show_step(const rr_step_view_t *v);

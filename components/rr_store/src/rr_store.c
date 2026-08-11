@@ -24,7 +24,10 @@
 
 static const char *TAG = "rr_store";
 
-#define MOUNT_POINT   "/littlefs"
+// Mounted at /lfs, not /littlefs: the generated emoji manifest hardcodes
+// "/lfs/emoji/<cp>.bin" and it is generated in the app repo, so the firmware
+// matches the manifest rather than the other way round.
+#define MOUNT_POINT   "/lfs"
 #define PARTITION_LBL "littlefs"
 #define CACHE_DIR     MOUNT_POINT "/cache"
 #define ROUTINES_PATH CACHE_DIR "/routines.json"
@@ -222,4 +225,63 @@ esp_err_t rr_store_clear_routines(void)
     }
     ESP_LOGI(TAG, "no routine cache to delete");
     return ESP_ERR_NOT_FOUND;
+}
+
+// ── Phase 4: read one step for rendering ─────────────────────────────────────
+
+static void copy_str(char *dst, size_t cap, const cJSON *j, const char *fallback)
+{
+    const char *src = cJSON_IsString(j) ? j->valuestring : fallback;
+    strlcpy(dst, src, cap);
+}
+
+esp_err_t rr_store_get_step(int routine_idx, int step_idx, rr_step_view_t *out)
+{
+    if (!s_mounted || out == NULL) return ESP_ERR_INVALID_ARG;
+
+    struct stat st;
+    if (stat(ROUTINES_PATH, &st) != 0) return ESP_ERR_NOT_FOUND;
+
+    FILE *f = fopen(ROUTINES_PATH, "rb");
+    if (f == NULL) return ESP_FAIL;
+    char *buf = malloc((size_t) st.st_size + 1);
+    if (buf == NULL) { fclose(f); return ESP_ERR_NO_MEM; }
+    size_t got = fread(buf, 1, (size_t) st.st_size, f);
+    fclose(f);
+    buf[got] = '\0';
+
+    cJSON *root = cJSON_ParseWithLength(buf, got);
+    free(buf);
+    if (root == NULL || !cJSON_IsArray(root)) { cJSON_Delete(root); return ESP_ERR_INVALID_STATE; }
+
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    memset(out, 0, sizeof(*out));
+    out->routine_count = cJSON_GetArraySize(root);
+
+    cJSON *r = cJSON_GetArrayItem(root, routine_idx);
+    if (r != NULL) {
+        copy_str(out->routine_name, sizeof(out->routine_name),
+                 cJSON_GetObjectItemCaseSensitive(r, "name"), "(unnamed)");
+        copy_str(out->routine_emoji, sizeof(out->routine_emoji),
+                 cJSON_GetObjectItemCaseSensitive(r, "emoji"), "");
+
+        const cJSON *steps = cJSON_GetObjectItemCaseSensitive(r, "steps");
+        if (cJSON_IsArray(steps)) {
+            out->step_count = cJSON_GetArraySize(steps);
+            cJSON *s = cJSON_GetArrayItem((cJSON *) steps, step_idx);
+            if (s != NULL) {
+                copy_str(out->label, sizeof(out->label),
+                         cJSON_GetObjectItemCaseSensitive(s, "label"), "(unlabelled)");
+                copy_str(out->emoji, sizeof(out->emoji),
+                         cJSON_GetObjectItemCaseSensitive(s, "emoji"), "");
+                const cJSON *lim = cJSON_GetObjectItemCaseSensitive(s, "time_limit_s");
+                out->time_limit_s = cJSON_IsNumber(lim) ? lim->valueint : 0;
+                out->position = step_idx;
+                err = ESP_OK;
+            }
+        }
+    }
+
+    cJSON_Delete(root);
+    return err;
 }
