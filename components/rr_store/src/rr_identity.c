@@ -212,3 +212,8 @@ esp_err_t rr_identity_factory_reset(void)
     }
     return err;
 }
+
+void rr_identity_new_uuid(char *out, size_t out_len)
+{
+    mint_uuid_v4(out, out_len);
+}

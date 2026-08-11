@@ -57,6 +57,10 @@ static ble_uuid128_t s_svc_uuid;
 static ble_uuid128_t s_time_sync_uuid;
 static ble_uuid128_t s_routine_push_uuid;
 static ble_uuid128_t s_control_uuid;
+static ble_uuid128_t s_queue_status_uuid;
+static ble_uuid128_t s_queue_pull_uuid;
+static ble_uuid128_t s_run_ack_uuid;
+static uint16_t s_queue_status_handle;
 
 // ROUTINE_PUSH reassembly. The contract sends [u32 len][JSON] chunked across
 // MTU-sized writes; we accumulate until 4+len bytes have arrived.
@@ -66,6 +70,8 @@ static ble_uuid128_t s_control_uuid;
 // length and exhaust the ~180 KiB we have. Real routine sets are a few KB.
 #define RR_ROUTINE_PUSH_MAX 32768
 #define RR_CONTROL_MAX 1024
+#define RR_QUEUE_PULL_MAX 4096
+#define RR_FW_VERSION 5      /**< packed firmware version reported in QUEUE_STATUS */
 
 static uint8_t *s_rx_buf;
 static size_t   s_rx_len;
@@ -209,6 +215,147 @@ static bool peer_is_trusted(uint16_t conn_handle)
     return true;
 }
 
+
+
+static bool conn_is_authorised(uint16_t conn_handle);   // defined below
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 5 — the completion queue characteristics (frozen contract v2, §6B.3)
+//
+// All three are gated on the same authorisation as ROUTINE_PUSH: a queued run
+// is a record of a child's day, so it does not go to an arbitrary bonded
+// central.
+// ═════════════════════════════════════════════════════════════════════════════
+
+// QUEUE_STATUS — read | notify — 9 bytes LE (see rr_queue_status_t).
+static int queue_status_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void) attr_handle; (void) arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
+    if (!conn_is_authorised(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+
+    rr_queue_status_t st = {
+        .queued_count = (uint16_t) rr_queue_count(),
+        .oldest_ts = rr_queue_oldest_ts(),
+        .fw_version = RR_FW_VERSION,
+        .batt = 0,   // AXP2101 wiring is Phase 10; 0 is honest, not a guess
+    };
+    ESP_LOGI(TAG, "QUEUE_STATUS read: %u queued, oldest_ts=%" PRIu32,
+             (unsigned) st.queued_count, st.oldest_ts);
+
+    return os_mbuf_append(ctxt->om, &st, sizeof(st)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
+}
+
+// QUEUE_PULL — read (multi-packet) — a stream of [u16 len][JSON] frames.
+//
+// NimBLE appends the WHOLE value here and handles ATT Read Blob fragmentation
+// itself, so this callback runs once per logical read regardless of MTU.
+static int queue_pull_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void) attr_handle; (void) arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
+    if (!conn_is_authorised(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+
+    int need = rr_queue_read_unacked(NULL, 0);
+    if (need <= 0) {
+        ESP_LOGI(TAG, "QUEUE_PULL: queue empty");
+        return 0;   // zero-length value == nothing queued
+    }
+    if (need > RR_QUEUE_PULL_MAX) {
+        ESP_LOGW(TAG, "QUEUE_PULL: %d bytes queued, capping the read at %d",
+                 need, RR_QUEUE_PULL_MAX);
+        need = RR_QUEUE_PULL_MAX;
+    }
+
+    char *ndjson = malloc((size_t) need + 1);
+    if (ndjson == NULL) return BLE_ATT_ERR_INSUFFICIENT_RES;
+    int got = rr_queue_read_unacked(ndjson, (size_t) need);
+    if (got <= 0) { free(ndjson); return 0; }
+    ndjson[got] = '\0';
+
+    // The queue is stored NDJSON but the contract frames each record as
+    // [u16 len][json] (§6B.3 QUEUE_PULL), so convert line-by-line here rather
+    // than changing the on-flash format — the log stays greppable and
+    // append-only, and the wire stays exactly what the phone decodes.
+    int rc = 0, frames = 0;
+    char *line = ndjson;
+    while (line != NULL && *line != '\0') {
+        char *nl = strchr(line, '\n');
+        size_t len = nl ? (size_t) (nl - line) : strlen(line);
+        if (len > 0 && len <= 0xFFFF) {
+            uint16_t l16 = (uint16_t) len;
+            if (os_mbuf_append(ctxt->om, &l16, sizeof(l16)) != 0 ||
+                os_mbuf_append(ctxt->om, line, len) != 0) {
+                rc = BLE_ATT_ERR_INSUFFICIENT_RES;
+                break;
+            }
+            frames++;
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    free(ndjson);
+
+    ESP_LOGI(TAG, "QUEUE_PULL: streamed %d frame(s), %d bytes", frames, got);
+    return rc;
+}
+
+// RUN_ACK — write — 38 bytes LE (see rr_run_ack_t).
+static int run_ack_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                             struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void) attr_handle; (void) arg;
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
+    if (!conn_is_authorised(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+
+    if (OS_MBUF_PKTLEN(ctxt->om) != RR_RUN_ACK_SIZE) {
+        ESP_LOGW(TAG, "RUN_ACK: expected %d bytes, got %u",
+                 RR_RUN_ACK_SIZE, (unsigned) OS_MBUF_PKTLEN(ctxt->om));
+        return BLE_ATT_ERR_INVALID_ATTR_VALUE_LEN;
+    }
+
+    rr_run_ack_t ack;
+    uint16_t copied = 0;
+    if (ble_hs_mbuf_to_flat(ctxt->om, &ack, sizeof(ack), &copied) != 0 || copied != sizeof(ack)) {
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    // local_id is 16 raw bytes in CANONICAL order (§6B.3) — render it back to
+    // the string form the queue stores.
+    char local_id[37];
+    const uint8_t *b = ack.local_id;
+    snprintf(local_id, sizeof(local_id),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+             b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+
+    ESP_LOGI(TAG, "RUN_ACK: local_id=%s xp=%" PRIu32 " streak=%u",
+             local_id, ack.authoritative_xp, (unsigned) ack.authoritative_streak);
+
+    esp_err_t err = rr_queue_ack(local_id);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "RUN_ACK: queue ack failed: %s", esp_err_to_name(err));
+    }
+    rr_ble_notify_queue_status();
+    return 0;
+}
+
+void rr_ble_notify_queue_status(void)
+{
+    if (s_conn_handle == BLE_HS_CONN_HANDLE_NONE || s_queue_status_handle == 0) return;
+
+    rr_queue_status_t st = {
+        .queued_count = (uint16_t) rr_queue_count(),
+        .oldest_ts = rr_queue_oldest_ts(),
+        .fw_version = RR_FW_VERSION,
+        .batt = 0,
+    };
+    struct os_mbuf *om = ble_hs_mbuf_from_flat(&st, sizeof(st));
+    if (om != NULL) {
+        ble_gatts_notify_custom(s_conn_handle, s_queue_status_handle, om);
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Authorisation model (contract v2)
@@ -541,6 +688,22 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
                 .access_cb = control_access_cb,
                 .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
             },
+            {
+                .uuid = &s_queue_status_uuid.u,
+                .access_cb = queue_status_access_cb,
+                .val_handle = &s_queue_status_handle,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC | BLE_GATT_CHR_F_NOTIFY,
+            },
+            {
+                .uuid = &s_queue_pull_uuid.u,
+                .access_cb = queue_pull_access_cb,
+                .flags = BLE_GATT_CHR_F_READ | BLE_GATT_CHR_F_READ_ENC,
+            },
+            {
+                .uuid = &s_run_ack_uuid.u,
+                .access_cb = run_ack_access_cb,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
+            },
             { 0 }
         },
     },
@@ -766,10 +929,16 @@ esp_err_t rr_ble_init(void)
     static const uint8_t ts_canonical[16] = RR_SYNC_CHAR_TIME_SYNC_UUID_BYTES;
     static const uint8_t rp_canonical[16] = RR_SYNC_CHAR_ROUTINE_PUSH_UUID_BYTES;
     static const uint8_t ctl_canonical[16] = RR_SYNC_CHAR_RR_CONTROL_UUID_BYTES;
+    static const uint8_t qs_canonical[16] = RR_SYNC_CHAR_QUEUE_STATUS_UUID_BYTES;
+    static const uint8_t qp_canonical[16] = RR_SYNC_CHAR_QUEUE_PULL_UUID_BYTES;
+    static const uint8_t ra_canonical[16] = RR_SYNC_CHAR_RUN_ACK_UUID_BYTES;
     uuid128_from_canonical(&s_svc_uuid, svc_canonical);
     uuid128_from_canonical(&s_time_sync_uuid, ts_canonical);
     uuid128_from_canonical(&s_routine_push_uuid, rp_canonical);
     uuid128_from_canonical(&s_control_uuid, ctl_canonical);
+    uuid128_from_canonical(&s_queue_status_uuid, qs_canonical);
+    uuid128_from_canonical(&s_queue_pull_uuid, qp_canonical);
+    uuid128_from_canonical(&s_run_ack_uuid, ra_canonical);
 
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {

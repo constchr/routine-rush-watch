@@ -136,3 +136,50 @@ void rr_rtc_format(const rr_rtc_time_t *t, char *buf, size_t buflen)
     snprintf(buf, buflen, "%04u-%02u-%02u %02u:%02u:%02u",
              t->year, t->month, t->day, t->hour, t->minute, t->second);
 }
+
+uint32_t rr_rtc_get_epoch(void)
+{
+    rr_rtc_time_t t;
+    if (rr_rtc_get(&t) != ESP_OK) return 0;
+
+    struct tm tm_utc = {
+        .tm_year = t.year - 1900,
+        .tm_mon  = t.month - 1,
+        .tm_mday = t.day,
+        .tm_hour = t.hour,
+        .tm_min  = t.minute,
+        .tm_sec  = t.second,
+    };
+    // Computed directly rather than via mktime(): mktime applies the local
+    // timezone, which would shift every recorded run. timegm() is not in
+    // newlib, so this is the days-from-civil algorithm (Howard Hinnant's),
+    // valid for the RTC's whole 2000..2099 range.
+    int y = tm_utc.tm_year + 1900;
+    unsigned m = (unsigned) tm_utc.tm_mon + 1;
+    unsigned d = (unsigned) tm_utc.tm_mday;
+    y -= m <= 2;
+    const int era = (y >= 0 ? y : y - 399) / 400;
+    const unsigned yoe = (unsigned) (y - era * 400);
+    const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    const long days = (long) era * 146097 + (long) doe - 719468;
+
+    long secs = days * 86400L + tm_utc.tm_hour * 3600L + tm_utc.tm_min * 60L + tm_utc.tm_sec;
+    return secs < 0 ? 0 : (uint32_t) secs;
+}
+
+void rr_rtc_format_iso(const rr_rtc_time_t *t, char *buf, size_t buflen)
+{
+    snprintf(buf, buflen, "%04u-%02u-%02uT%02u:%02u:%02uZ",
+             t->year, t->month, t->day, t->hour, t->minute, t->second);
+}
+
+void rr_rtc_epoch_to_iso(uint32_t epoch, char *buf, size_t buflen)
+{
+    time_t e = (time_t) epoch;
+    struct tm tm_utc;
+    if (gmtime_r(&e, &tm_utc) == NULL) { snprintf(buf, buflen, "1970-01-01T00:00:00Z"); return; }
+    snprintf(buf, buflen, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+             tm_utc.tm_year + 1900, tm_utc.tm_mon + 1, tm_utc.tm_mday,
+             tm_utc.tm_hour, tm_utc.tm_min, tm_utc.tm_sec);
+}

@@ -53,3 +53,6 @@ bool rr_ble_is_connected(void);
  * long-press reset. `reason` is logged.
  */
 void rr_ble_factory_reset(const char *reason);
+
+/** Push a fresh QUEUE_STATUS to a subscribed central (queue depth changed). */
+void rr_ble_notify_queue_status(void);

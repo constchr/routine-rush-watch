@@ -105,3 +105,6 @@ bool rr_identity_is_paired_peer(const uint8_t addr[6], uint8_t addr_type);
  * (the CBError 14 trap found in Phase 3).
  */
 esp_err_t rr_identity_factory_reset(void);
+
+/** Mint a fresh RFC-4122 v4 UUID (used for a run's local_id). */
+void rr_identity_new_uuid(char *out, size_t out_len);

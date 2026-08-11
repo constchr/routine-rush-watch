@@ -37,3 +37,12 @@ esp_err_t rr_rtc_set_epoch(uint32_t epoch_utc);
 
 /** Format as "YYYY-MM-DD HH:MM:SS" into buf (needs >= 20 bytes). */
 void rr_rtc_format(const rr_rtc_time_t *t, char *buf, size_t buflen);
+
+/** Current time as a Unix epoch (UTC). 0 if the RTC cannot be read. */
+uint32_t rr_rtc_get_epoch(void);
+
+/** Format as an ISO-8601 UTC instant, "YYYY-MM-DDTHH:MM:SSZ" (needs >= 21). */
+void rr_rtc_format_iso(const rr_rtc_time_t *t, char *buf, size_t buflen);
+
+/** ISO-8601 for an epoch captured earlier this run. */
+void rr_rtc_epoch_to_iso(uint32_t epoch, char *buf, size_t buflen);

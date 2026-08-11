@@ -64,6 +64,9 @@ esp_err_t rr_store_clear_routines(void);
  * released as soon as the fields are extracted.
  */
 typedef struct {
+    char assignment_id[40];   /**< routine.id — the run's assignment_id */
+    char step_id[40];         /**< step.id — reported per-step to the relay */
+    int  base_xp;             /**< feeds the provisional-XP formula */
     char routine_name[64];
     char routine_emoji[16];
     char label[64];
@@ -76,3 +79,36 @@ typedef struct {
 
 /** Read one step out of the cached routine set. ESP_ERR_NOT_FOUND if absent. */
 esp_err_t rr_store_get_step(int routine_idx, int step_idx, rr_step_view_t *out);
+
+
+// ── Phase 5: the durable completion queue (§5, §6.3) ─────────────────────────
+//
+// /lfs/queue/runs.log     append-only NDJSON, one completed run per line
+// /lfs/queue/cursor.json  { "offset": <bytes acked> }
+//
+// This is the ONE thing on the watch that is not disposable. The routine cache
+// can be lost and refetched; a lost queue entry is a child's completed routine
+// that silently never counted. Every append is fsync'd before it is reported
+// as queued.
+
+/** Append one run record (a single JSON line). Durable on return. */
+esp_err_t rr_queue_append(const char *json, size_t len);
+
+/** Number of runs queued and not yet acked. */
+int rr_queue_count(void);
+
+/**
+ * Copy every unacked record into `out` as NDJSON. Returns bytes written, or
+ * -1 on error. Pass NULL to query the required size.
+ */
+int rr_queue_read_unacked(char *out, size_t cap);
+
+/**
+ * Ack the record at the head of the queue if its local_id matches, advancing
+ * the cursor past it. A repeat ack for an already-advanced record is a
+ * deliberate no-op, which is what makes re-flush after a BLE drop safe.
+ */
+esp_err_t rr_queue_ack(const char *local_id);
+
+/** Oldest unacked record's completed_at epoch, or 0 if the queue is empty. */
+uint32_t rr_queue_oldest_ts(void);

@@ -264,6 +264,11 @@ esp_err_t rr_store_get_step(int routine_idx, int step_idx, rr_step_view_t *out)
                  cJSON_GetObjectItemCaseSensitive(r, "name"), "(unnamed)");
         copy_str(out->routine_emoji, sizeof(out->routine_emoji),
                  cJSON_GetObjectItemCaseSensitive(r, "emoji"), "");
+        copy_str(out->assignment_id, sizeof(out->assignment_id),
+                 cJSON_GetObjectItemCaseSensitive(r, "assignment_id"), "");
+
+        copy_str(out->assignment_id, sizeof(out->assignment_id),
+                 cJSON_GetObjectItemCaseSensitive(r, "assignment_id"), "");
 
         const cJSON *steps = cJSON_GetObjectItemCaseSensitive(r, "steps");
         if (cJSON_IsArray(steps)) {
@@ -274,8 +279,12 @@ esp_err_t rr_store_get_step(int routine_idx, int step_idx, rr_step_view_t *out)
                          cJSON_GetObjectItemCaseSensitive(s, "label"), "(unlabelled)");
                 copy_str(out->emoji, sizeof(out->emoji),
                          cJSON_GetObjectItemCaseSensitive(s, "emoji"), "");
+                copy_str(out->step_id, sizeof(out->step_id),
+                         cJSON_GetObjectItemCaseSensitive(s, "id"), "");
                 const cJSON *lim = cJSON_GetObjectItemCaseSensitive(s, "time_limit_s");
                 out->time_limit_s = cJSON_IsNumber(lim) ? lim->valueint : 0;
+                const cJSON *bx = cJSON_GetObjectItemCaseSensitive(s, "base_xp");
+                out->base_xp = cJSON_IsNumber(bx) ? bx->valueint : 0;
                 out->position = step_idx;
                 err = ESP_OK;
             }
@@ -284,4 +293,179 @@ esp_err_t rr_store_get_step(int routine_idx, int step_idx, rr_step_view_t *out)
 
     cJSON_Delete(root);
     return err;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 5 — the durable completion queue
+// ═════════════════════════════════════════════════════════════════════════════
+
+#define QUEUE_DIR    MOUNT_POINT "/queue"
+#define RUNS_PATH    QUEUE_DIR "/runs.log"
+#define CURSOR_PATH  QUEUE_DIR "/cursor.json"
+
+static long cursor_get(void)
+{
+    FILE *f = fopen(CURSOR_PATH, "rb");
+    if (f == NULL) return 0;
+    char buf[64] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    if (n == 0) return 0;
+    cJSON *j = cJSON_Parse(buf);
+    long off = 0;
+    if (j) {
+        const cJSON *o = cJSON_GetObjectItemCaseSensitive(j, "offset");
+        if (cJSON_IsNumber(o)) off = (long) o->valuedouble;
+        cJSON_Delete(j);
+    }
+    return off < 0 ? 0 : off;
+}
+
+static esp_err_t cursor_set(long off)
+{
+    FILE *f = fopen(CURSOR_PATH, "wb");
+    if (f == NULL) return ESP_FAIL;
+    fprintf(f, "{\"offset\":%ld}", off);
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    return ESP_OK;
+}
+
+// Once every record has been acked, reclaim the log rather than letting it
+// grow forever. Truncating only when fully drained keeps this trivially safe:
+// there is nothing left that a reader could still need.
+static void compact_if_drained(void)
+{
+    struct stat st;
+    if (stat(RUNS_PATH, &st) != 0) return;
+    if (cursor_get() >= st.st_size && st.st_size > 0) {
+        unlink(RUNS_PATH);
+        cursor_set(0);
+        ESP_LOGI(TAG, "queue fully acked — log compacted");
+    }
+}
+
+esp_err_t rr_queue_append(const char *json, size_t len)
+{
+    if (!s_mounted || json == NULL || len == 0) return ESP_ERR_INVALID_ARG;
+    mkdir(QUEUE_DIR, 0755);
+
+    FILE *f = fopen(RUNS_PATH, "ab");
+    if (f == NULL) {
+        ESP_LOGE(TAG, "cannot open %s for append", RUNS_PATH);
+        return ESP_FAIL;
+    }
+    size_t w = fwrite(json, 1, len, f);
+    fputc('\n', f);
+    // fsync before returning: the caller is about to tell the child their
+    // routine is complete, and that claim must already be durable.
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+
+    if (w != len) {
+        ESP_LOGE(TAG, "queue append short write (%u/%u)", (unsigned) w, (unsigned) len);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "queued run (%u bytes) — %d now pending", (unsigned) len, rr_queue_count());
+    return ESP_OK;
+}
+
+int rr_queue_count(void)
+{
+    if (!s_mounted) return 0;
+    struct stat st;
+    if (stat(RUNS_PATH, &st) != 0) return 0;
+
+    long off = cursor_get();
+    if (off >= st.st_size) return 0;
+
+    FILE *f = fopen(RUNS_PATH, "rb");
+    if (f == NULL) return 0;
+    fseek(f, off, SEEK_SET);
+    int lines = 0, c;
+    while ((c = fgetc(f)) != EOF) if (c == '\n') lines++;
+    fclose(f);
+    return lines;
+}
+
+int rr_queue_read_unacked(char *out, size_t cap)
+{
+    if (!s_mounted) return -1;
+    struct stat st;
+    if (stat(RUNS_PATH, &st) != 0) return 0;
+
+    long off = cursor_get();
+    if (off >= st.st_size) return 0;
+    size_t need = (size_t) (st.st_size - off);
+    if (out == NULL) return (int) need;
+    if (need > cap) return -1;
+
+    FILE *f = fopen(RUNS_PATH, "rb");
+    if (f == NULL) return -1;
+    fseek(f, off, SEEK_SET);
+    size_t got = fread(out, 1, need, f);
+    fclose(f);
+    return (int) got;
+}
+
+esp_err_t rr_queue_ack(const char *local_id)
+{
+    if (!s_mounted || local_id == NULL) return ESP_ERR_INVALID_ARG;
+    struct stat st;
+    if (stat(RUNS_PATH, &st) != 0) return ESP_ERR_NOT_FOUND;
+
+    long off = cursor_get();
+    if (off >= st.st_size) {
+        ESP_LOGI(TAG, "ack for %s but queue is already drained — no-op", local_id);
+        return ESP_OK;
+    }
+
+    FILE *f = fopen(RUNS_PATH, "rb");
+    if (f == NULL) return ESP_FAIL;
+    fseek(f, off, SEEK_SET);
+
+    char line[1024];
+    if (fgets(line, sizeof(line), f) == NULL) { fclose(f); return ESP_FAIL; }
+    long next = ftell(f);
+    fclose(f);
+
+    cJSON *j = cJSON_Parse(line);
+    const cJSON *lid = j ? cJSON_GetObjectItemCaseSensitive(j, "local_id") : NULL;
+    bool match = cJSON_IsString(lid) && strcmp(lid->valuestring, local_id) == 0;
+    cJSON_Delete(j);
+
+    if (!match) {
+        // Not the head. Either a duplicate ack for a record already advanced
+        // past, or an out-of-order ack. Both are safe to ignore: we only ever
+        // send in order, and the record stays queued for the next flush.
+        ESP_LOGW(TAG, "ack for %s does not match the queue head — ignoring", local_id);
+        return ESP_OK;
+    }
+
+    esp_err_t err = cursor_set(next);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "acked %s — cursor %ld, %d still pending", local_id, next, rr_queue_count());
+        compact_if_drained();
+    }
+    return err;
+}
+
+uint32_t rr_queue_oldest_ts(void)
+{
+    char buf[1024];
+    int n = rr_queue_read_unacked(buf, sizeof(buf) - 1);
+    if (n <= 0) return 0;
+    buf[n] = '\0';
+    char *nl = strchr(buf, '\n');
+    if (nl) *nl = '\0';
+    cJSON *j = cJSON_Parse(buf);
+    uint32_t ts = 0;
+    if (j) {
+        const cJSON *e = cJSON_GetObjectItemCaseSensitive(j, "completed_epoch");
+        if (cJSON_IsNumber(e)) ts = (uint32_t) e->valuedouble;
+        cJSON_Delete(j);
+    }
+    return ts;
 }
