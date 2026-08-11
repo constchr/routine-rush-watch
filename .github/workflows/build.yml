@@ -1,0 +1,130 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  # Waveshare's own CI baseline for this board. The board BSP declares
+  # idf >=5.5.0 and will not resolve on older IDF.
+  IDF_VERSION: v5.5.5
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────────────
+  # The generated BLE header must always match the vendored contract, and the
+  # vendored contract must always match the app repo. Two separate checks:
+  # the first is cheap and always runs; the second needs cross-repo access.
+  # ───────────────────────────────────────────────────────────────────────────
+  ble-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # 1. Local consistency: is the committed header what the generator
+      #    produces from the committed contract? Also revalidates that the
+      #    contract's documented offsets sum to its exported sizes.
+      - name: Header matches vendored contract
+        run: node tools/gen-ble-contract.mjs --check
+
+      # 2. Cross-repo drift: has the app repo's contract moved on without us?
+      #    Requires a token with read access to the app repo. If the secret is
+      #    absent (forks, or before it is configured) this step reports the
+      #    gap loudly and does not fail the build — an unconfigured secret is
+      #    not the same signal as a genuine protocol drift.
+      - name: Check vendored copy against app repo
+        env:
+          APP_REPO_TOKEN: ${{ secrets.APP_REPO_TOKEN }}
+        run: |
+          if [ -z "$APP_REPO_TOKEN" ]; then
+            echo "::warning::APP_REPO_TOKEN not set — skipping cross-repo drift check."
+            echo "::warning::The vendored contract could be stale and CI would not know."
+            exit 0
+          fi
+          git clone --depth 1 --filter=blob:none --sparse \
+            "https://x-access-token:$APP_REPO_TOKEN@github.com/${{ github.repository_owner }}/routine-rush.git" /tmp/app
+          git -C /tmp/app sparse-checkout set packages/ble/src
+          if ! diff -u /tmp/app/packages/ble/src/watchProtocol.ts tools/watchProtocol.ts; then
+            echo "::error::tools/watchProtocol.ts has drifted from the app repo (the source of truth)."
+            echo "::error::Re-vendor it and regenerate: cp <app>/packages/ble/src/watchProtocol.ts tools/ && node tools/gen-ble-contract.mjs"
+            exit 1
+          fi
+          echo "vendored contract matches the app repo"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: ble-contract
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # ble_contract.h is generated, not committed — produce it before building.
+      - name: Generate BLE contract header
+        run: node tools/gen-ble-contract.mjs
+
+      - name: Build (ESP-IDF ${{ env.IDF_VERSION }}, esp32c6)
+        uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: ${{ env.IDF_VERSION }}
+          target: esp32c6
+
+      # Guard the Phase 0 lessons that are easy to undo by accident. These are
+      # asserted against the GENERATED sdkconfig, not sdkconfig.defaults, so a
+      # setting silently overridden by a component's Kconfig is still caught.
+      - name: Assert console is on USB-Serial-JTAG, not the IMU interrupt pins
+        run: |
+          echo "--- console config as built ---"
+          grep -E '^CONFIG_ESP_CONSOLE' build/../sdkconfig || true
+
+          if grep -qE '^CONFIG_ESP_CONSOLE_UART_TX_GPIO=(16|17)$' sdkconfig \
+          || grep -qE '^CONFIG_ESP_CONSOLE_UART_RX_GPIO=(16|17)$' sdkconfig; then
+            echo "::error::Console UART is on GPIO 16/17 — those are QMI8658 INT1/INT2."
+            echo "::error::Raise-to-wake and the pedometer need those pins. See sdkconfig.defaults."
+            exit 1
+          fi
+          if ! grep -q '^CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y$' sdkconfig; then
+            echo "::error::Console is not on USB-Serial-JTAG. See sdkconfig.defaults."
+            exit 1
+          fi
+          echo "console routing OK"
+
+      # There is no Kconfig switch for this in IDF 5.5 — esp_wifi is always in
+      # the component graph, and the stack is kept out purely by linker GC. So
+      # assert the property that actually matters: no Wi-Fi MAC/PHY code in the
+      # linked image. A single stray esp_wifi_* reference would drag it back in.
+      # (modem_clock_*wifi* symbols are expected — BLE shares that hardware.)
+      - name: Assert Wi-Fi stack is not linked into the image
+        run: |
+          ELF=build/routine_rush_watch.elf
+          NM=$(find "$IDF_TOOLS_PATH" ~/.espressif -name 'riscv32-esp-elf-nm' 2>/dev/null | head -1)
+          [ -n "$NM" ] || NM=riscv32-esp-elf-nm
+          if "$NM" "$ELF" | grep -qE ' (T|t) (esp_wifi_init|ieee80211_[a-z_]+)$'; then
+            echo "::error::Wi-Fi MAC/PHY is linked into the image. BLE is the sole uplink (spec §2.2)."
+            echo "::error::Something now references esp_wifi_* — find it and remove it."
+            "$NM" "$ELF" | grep -E ' (T|t) (esp_wifi_init|ieee80211_[a-z_]+)$' | head
+            exit 1
+          fi
+          echo "wifi not linked OK"
+
+      - name: Report binary size
+        run: |
+          ls -la build/*.bin
+          echo "--- app partition usage ---"
+          python -m esptool --chip esp32c6 image_info build/routine_rush_watch.bin 2>/dev/null | head -20 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: routine-rush-watch-${{ github.sha }}
+          path: |
+            build/routine_rush_watch.bin
+            build/bootloader/bootloader.bin
+            build/partition_table/partition-table.bin
+            build/flash_args

@@ -1,0 +1,19 @@
+## Routine Rush Watch — managed dependencies
+dependencies:
+  idf:
+    version: ">=5.5.0"
+
+  ## Waveshare board support package for ESP32-C6-Touch-AMOLED-2.06.
+  ## Brings in the SH8601 display driver (the panel is a CO5300; the two are
+  ## register-compatible), FT3168 touch via esp_lcd_touch_ft5x06, the ES8311
+  ## codec path, and the shared I2C bus. All verified on hardware in Phase 0.
+  waveshare/esp32_c6_touch_amoled_2_06:
+    version: "^2.0.0"
+
+  ## 6-axis IMU: raise-to-wake (Phase 6) + pedometer (Phase 9).
+  waveshare/qmi8658:
+    version: "^2.0.0"
+
+  lvgl/lvgl:
+    version: "9.5.0"
+    public: true

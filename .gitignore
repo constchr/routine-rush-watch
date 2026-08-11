@@ -1,0 +1,19 @@
+# ESP-IDF build output
+build/
+managed_components/
+dependencies.lock
+
+# Local, machine-specific config. sdkconfig.defaults IS committed;
+# sdkconfig is generated from it and must not be.
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+
+# Generated — produced by tools/gen-ble-contract.mjs, never hand-edited
+components/rr_ble/include/ble_contract.h
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp

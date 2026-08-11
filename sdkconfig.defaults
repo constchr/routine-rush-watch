@@ -1,0 +1,118 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Routine Rush Watch — project defaults
+#
+# Requires ESP-IDF v5.5+ (vendor CI baseline v5.5.5). The Waveshare board BSP
+# `waveshare/esp32_c6_touch_amoled_2_06 ^2.0.0` declares `idf: ">=5.5.0"` and
+# will NOT resolve on v5.4.x — the dependency solver fails outright.
+#
+# Several settings here encode hardware findings from Phase 0 board bring-up.
+# Read the comments before changing any of them; the console block in
+# particular has a silent failure mode.
+# ─────────────────────────────────────────────────────────────────────────────
+
+CONFIG_IDF_TARGET="esp32c6"
+
+# ── Flash: 16MB, QIO @ 80MHz ────────────────────────────────────────────────
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ⚠️  CONSOLE — USB-Serial-JTAG ONLY.  DO NOT ROUTE THE CONSOLE TO UART.
+#
+# Waveshare's own examples ship with:
+#     CONFIG_ESP_CONSOLE_UART_CUSTOM=y
+#     CONFIG_ESP_CONSOLE_UART_TX_GPIO=16
+#     CONFIG_ESP_CONSOLE_UART_RX_GPIO=17
+#
+# but GPIO 16 = QMI8658 INT1 and GPIO 17 = QMI8658 INT2 (Waveshare's own pin
+# audit). Those are exactly the interrupt lines raise-to-wake (§10, Phase 6)
+# and the pedometer (Phase 9) need.
+#
+# The failure mode is silent: NOTHING ERRORS. The IMU still reads fine over
+# I2C, so the board looks healthy — but the interrupt lines are owned by the
+# console driver, so wake-on-motion has to fall back to polling the IMU from
+# the main CPU. That destroys the battery budget the whole power design rests
+# on, and presents later as "the wake gesture is just unreliable".
+#
+# The C6 has USB-Serial-JTAG in silicon; we flash and monitor over the same
+# single USB-C cable either way, so this costs us nothing.
+# ═════════════════════════════════════════════════════════════════════════════
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_ESP_CONSOLE_UART_CUSTOM=n
+CONFIG_ESP_CONSOLE_NONE=n
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# ── Wi-Fi: OFF. Never initialised. (spec §2.2) ──────────────────────────────
+# BLE is the sole uplink. There is NO Kconfig switch to remove Wi-Fi in IDF
+# 5.5 (CONFIG_ESP_WIFI_ENABLED is not a user-settable symbol — esp_wifi is
+# always in the component graph). Exclusion is achieved by LINKER GARBAGE
+# COLLECTION instead: if nothing ever references esp_wifi_init(), the MAC/PHY
+# stack is never pulled into the image.
+#
+# Verified on this scaffold: the ELF contains no esp_wifi_init / ieee80211_*
+# symbols — only shared modem-clock HAL functions, which BLE needs too.
+#
+# THE RULE THIS DEPENDS ON: never add esp_wifi to a component's REQUIRES, and
+# never call esp_wifi_*(). One stray reference silently drags the whole stack
+# back in and costs RAM we do not have. CI asserts this on every build.
+CONFIG_ESP_COEX_SW_COEXIST_ENABLE=n
+
+# ── Bluetooth: NimBLE only (peripheral role) ────────────────────────────────
+# The watch is a GATT *server*/peripheral; the phone is the central (§6B.1).
+# NimBLE is the smaller stack — relevant when RAM is the binding constraint.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+
+# ═════════════════════════════════════════════════════════════════════════════
+# LVGL — PARTIAL RENDER. A full framebuffer does not fit.
+#
+# Measured on hardware in Phase 0: only ~274 KiB of dynamic RAM is free at
+# boot (248 KiB main heap + 11 KiB + 15 KiB RTC), before LVGL, NimBLE, or any
+# app state. There is NO PSRAM on this board.
+#
+# A full-screen 410x502 16bpp framebuffer is ~400 KiB. That is not "wasteful",
+# it is larger than all the RAM we have. Render in horizontal bands instead.
+#
+#   BSP_DISPLAY_LVGL_BUF_HEIGHT = 50 lines
+#   → 410 px * 50 lines * 2 B = ~41 KiB per buffer  (≈ 1/10 screen)
+#
+# The BSP default is 100 lines (~82 KiB). Raise this only with a heap
+# measurement in hand, and never to the point of a full frame.
+# ═════════════════════════════════════════════════════════════════════════════
+CONFIG_BSP_DISPLAY_LVGL_BUF_HEIGHT=50
+CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR=n
+
+CONFIG_LV_USE_CLIB_MALLOC=y
+CONFIG_LV_USE_CLIB_STRING=y
+CONFIG_LV_USE_CLIB_SPRINTF=y
+CONFIG_LV_OS_FREERTOS=y
+CONFIG_LV_DEF_REFR_PERIOD=15
+CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y
+# Greek (el) is a first-class locale — keep a Cyrillic/Greek-capable font set.
+CONFIG_LV_FONT_MONTSERRAT_16=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+CONFIG_LV_FONT_MONTSERRAT_28=y
+
+# ── I2C / I2S: match the board BSP ──────────────────────────────────────────
+CONFIG_BSP_I2C_NUM=0
+CONFIG_BSP_I2S_NUM=1
+
+# ── FreeRTOS / system ───────────────────────────────────────────────────────
+CONFIG_FREERTOS_HZ=1000
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
+
+# ── Power management (Phase 10) ─────────────────────────────────────────────
+# Enabled but not tuned; light-sleep is where the multi-day battery target
+# comes from. Do not enable automatic light-sleep until raise-to-wake is
+# proven on the IMU interrupt lines (see console warning above).
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
