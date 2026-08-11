@@ -80,3 +80,25 @@ void rr_ui_set_countdown(int remaining_s, int total_s);
 
 /** §8 screen 5, minimal: a tick, the routine name, and a done/skipped count. */
 esp_err_t rr_ui_show_routine_complete(const char *routine_name, int done, int skipped);
+
+// ── Phase 6: the idle watch face (§9B) ───────────────────────────────────────
+
+typedef struct {
+    int  hour, minute;
+    int  year, month, day;
+    char language[4];        /**< "el" / "en" from the cached child */
+    int  steps_today;
+    bool steps_valid;        /**< false until Phase 9's pedometer exists */
+    int  level;              /**< 0 = hide the XP line */
+    int  queued_runs;        /**< unsynced completions, shown as a small badge */
+    rr_next_routine_t next;
+} rr_watchface_t;
+
+/** Render the idle face. All inputs are local — no phone required (§9B.3). */
+esp_err_t rr_ui_show_watchface(const rr_watchface_t *w);
+
+/** ISO weekday (1=Mon..7=Sun) for a civil date. */
+int rr_ui_iso_weekday(int y, int m, int d);
+
+/** True if the last screen rendered was the idle watch face. */
+bool rr_ui_last_screen_is_watchface(void);

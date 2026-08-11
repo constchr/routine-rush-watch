@@ -469,3 +469,87 @@ uint32_t rr_queue_oldest_ts(void)
     }
     return ts;
 }
+
+// ── Phase 6: next scheduled routine ──────────────────────────────────────────
+
+esp_err_t rr_store_next_routine(int iso_weekday, int now_hour, int now_min,
+                                rr_next_routine_t *out)
+{
+    if (!s_mounted || out == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+
+    struct stat st;
+    if (stat(ROUTINES_PATH, &st) != 0) return ESP_ERR_NOT_FOUND;
+    FILE *f = fopen(ROUTINES_PATH, "rb");
+    if (f == NULL) return ESP_FAIL;
+    char *buf = malloc((size_t) st.st_size + 1);
+    if (buf == NULL) { fclose(f); return ESP_ERR_NO_MEM; }
+    size_t got = fread(buf, 1, (size_t) st.st_size, f);
+    fclose(f);
+    buf[got] = '\0';
+
+    cJSON *root = cJSON_ParseWithLength(buf, got);
+    free(buf);
+    if (root == NULL || !cJSON_IsArray(root)) { cJSON_Delete(root); return ESP_ERR_INVALID_STATE; }
+
+    const int now_mins = now_hour * 60 + now_min;
+    int best_today = 24 * 60 + 1;    // minutes-of-day, lower is sooner
+    int best_later = 24 * 60 + 1;
+    const cJSON *pick_today = NULL, *pick_later = NULL;
+    int pick_today_hm = 0, pick_later_hm = 0;
+
+    int n = cJSON_GetArraySize(root);
+    for (int i = 0; i < n; i++) {
+        cJSON *r = cJSON_GetArrayItem(root, i);
+        const cJSON *scheds = cJSON_GetObjectItemCaseSensitive(r, "schedules");
+        if (!cJSON_IsArray(scheds)) continue;
+
+        int sn = cJSON_GetArraySize(scheds);
+        for (int j = 0; j < sn; j++) {
+            cJSON *sc = cJSON_GetArrayItem((cJSON *) scheds, j);
+            const cJSON *tt = cJSON_GetObjectItemCaseSensitive(sc, "trigger_time");
+            const cJSON *days = cJSON_GetObjectItemCaseSensitive(sc, "days");
+            if (!cJSON_IsString(tt) || !cJSON_IsArray(days)) continue;
+
+            int hh = 0, mm = 0;
+            if (sscanf(tt->valuestring, "%d:%d", &hh, &mm) != 2) continue;
+            const int at = hh * 60 + mm;
+
+            bool runs_today = false, runs_other_day = false;
+            int dn = cJSON_GetArraySize(days);
+            for (int k = 0; k < dn; k++) {
+                cJSON *d = cJSON_GetArrayItem((cJSON *) days, k);
+                if (!cJSON_IsNumber(d)) continue;
+                // The app emits ISO weekdays (1=Mon..7=Sun) but the sample data
+                // also uses 0 for Sunday, so accept both spellings.
+                int wd = d->valueint;
+                if (wd == 0) wd = 7;
+                if (wd == iso_weekday) runs_today = true;
+                else runs_other_day = true;
+            }
+
+            if (runs_today && at >= now_mins && at < best_today) {
+                best_today = at; pick_today = r; pick_today_hm = at;
+            }
+            if ((runs_other_day || runs_today) && at < best_later) {
+                best_later = at; pick_later = r; pick_later_hm = at;
+            }
+        }
+    }
+
+    const cJSON *pick = pick_today ? pick_today : pick_later;
+    int hm = pick_today ? pick_today_hm : pick_later_hm;
+    if (pick != NULL) {
+        out->found = true;
+        out->today = (pick_today != NULL);
+        out->hour = hm / 60;
+        out->minute = hm % 60;
+        const cJSON *nm = cJSON_GetObjectItemCaseSensitive(pick, "name");
+        const cJSON *em = cJSON_GetObjectItemCaseSensitive(pick, "emoji");
+        strlcpy(out->routine_name, cJSON_IsString(nm) ? nm->valuestring : "", sizeof(out->routine_name));
+        strlcpy(out->routine_emoji, cJSON_IsString(em) ? em->valuestring : "", sizeof(out->routine_emoji));
+    }
+
+    cJSON_Delete(root);
+    return out->found ? ESP_OK : ESP_ERR_NOT_FOUND;
+}

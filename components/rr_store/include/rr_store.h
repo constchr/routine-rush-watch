@@ -112,3 +112,22 @@ esp_err_t rr_queue_ack(const char *local_id);
 
 /** Oldest unacked record's completed_at epoch, or 0 if the queue is empty. */
 uint32_t rr_queue_oldest_ts(void);
+
+// ── Phase 6: the next scheduled routine, for the idle face (§9B.1) ───────────
+
+typedef struct {
+    bool found;
+    char routine_name[64];
+    char routine_emoji[16];
+    int  hour;
+    int  minute;
+    bool today;        /**< false => the soonest is tomorrow or later */
+} rr_next_routine_t;
+
+/**
+ * Soonest upcoming scheduled routine at or after (now_hour:now_min) on
+ * `iso_weekday` (1=Mon..7=Sun). If nothing remains today, wraps to the
+ * earliest schedule on any later day and sets today=false.
+ */
+esp_err_t rr_store_next_routine(int iso_weekday, int now_hour, int now_min,
+                                rr_next_routine_t *out);

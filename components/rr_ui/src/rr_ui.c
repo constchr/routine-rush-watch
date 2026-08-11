@@ -38,7 +38,7 @@ static lv_obj_t *s_screen;
 
 // Last non-transient screen, so an aborted reset countdown can restore exactly
 // what the watch was showing instead of guessing at pairing state.
-typedef enum { RR_SCREEN_NONE, RR_SCREEN_QR, RR_SCREEN_PAIRED, RR_SCREEN_WAITING } rr_screen_t;
+typedef enum { RR_SCREEN_NONE, RR_SCREEN_QR, RR_SCREEN_PAIRED, RR_SCREEN_WAITING, RR_SCREEN_WATCHFACE } rr_screen_t;
 static rr_screen_t s_last_screen;
 static char s_last_qr_payload[128];
 
@@ -496,4 +496,144 @@ esp_err_t rr_ui_show_routine_complete(const char *routine_name, int done, int sk
 
     ESP_LOGI(TAG, "routine complete: %d done, %d skipped", done, skipped);
     return ESP_OK;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 6 — the idle watch face (§9B.1)
+//
+// Everything here is LOCAL: time from the PCF85063, date from the same, the
+// next-routine hint from the littlefs cache. It renders identically whether or
+// not a phone has ever connected (§9B.3) — that is the point of the design,
+// not an optimisation.
+//
+// AMOLED-friendly: mostly black pixels, because on this panel an unlit pixel
+// costs nothing. That is why the face is sparse rather than decorated.
+// ═════════════════════════════════════════════════════════════════════════════
+
+static const char *WEEKDAY_EN[7] = { "Monday", "Tuesday", "Wednesday", "Thursday",
+                                     "Friday", "Saturday", "Sunday" };
+static const char *WEEKDAY_EL[7] = { "Δευτέρα", "Τρίτη", "Τετάρτη", "Πέμπτη",
+                                     "Παρασκευή", "Σάββατο", "Κυριακή" };
+static const char *MONTH_EN[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+static const char *MONTH_EL[12] = { "Ιαν", "Φεβ", "Μαρ", "Απρ", "Μαΐ", "Ιουν",
+                                    "Ιουλ", "Αυγ", "Σεπ", "Οκτ", "Νοε", "Δεκ" };
+
+// ISO weekday (1=Mon..7=Sun) from a civil date — Sakamoto's method.
+int rr_ui_iso_weekday(int y, int m, int d)
+{
+    static const int t[] = { 0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4 };
+    if (m < 3) y -= 1;
+    int dow = (y + y / 4 - y / 100 + y / 400 + t[m - 1] + d) % 7;  // 0=Sunday
+    return dow == 0 ? 7 : dow;
+}
+
+esp_err_t rr_ui_show_watchface(const rr_watchface_t *w)
+{
+    if (w == NULL) return ESP_ERR_INVALID_ARG;
+
+    bsp_display_lock(0);
+    lv_obj_clean(s_screen);
+    s_arc = NULL;
+    s_mmss = NULL;
+    lv_obj_set_style_bg_color(s_screen, RR_BG, LV_PART_MAIN);
+
+    const bool el = (w->language[0] == 'e' && w->language[1] == 'l');
+    const int wd = rr_ui_iso_weekday(w->year, w->month, w->day);
+
+    // ── time: the watch is a watch first (§9B.1) ────────────────────────────
+    char hhmm[8];
+    snprintf(hhmm, sizeof(hhmm), "%02d:%02d", w->hour, w->minute);
+    lv_obj_t *ltime = lv_label_create(s_screen);
+    lv_label_set_text(ltime, hhmm);
+    lv_obj_set_style_text_font(ltime, &rr_font_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ltime, RR_TEXT, LV_PART_MAIN);
+    lv_obj_align(ltime, LV_ALIGN_TOP_MID, 0, 96);
+
+    // ── date, localized from the child's cached language ────────────────────
+    char date[64];
+    snprintf(date, sizeof(date), "%s %d %s",
+             el ? WEEKDAY_EL[wd - 1] : WEEKDAY_EN[wd - 1],
+             w->day,
+             el ? MONTH_EL[w->month - 1] : MONTH_EN[w->month - 1]);
+    lv_obj_t *ldate = lv_label_create(s_screen);
+    lv_label_set_text(ldate, date);
+    lv_obj_set_style_text_font(ldate, &rr_font_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ldate, RR_MUTED, LV_PART_MAIN);
+    lv_obj_align(ldate, LV_ALIGN_TOP_MID, 0, 156);
+
+    // ── steps: the SLOT, with a placeholder value ───────────────────────────
+    // Phase 9 owns the pedometer. Showing a real-looking number now would be
+    // a lie the child would believe, so it reads "—" until it is real.
+    lv_obj_t *lsteps = lv_label_create(s_screen);
+    if (w->steps_valid) {
+        char sbuf[32];
+        snprintf(sbuf, sizeof(sbuf), "%d", w->steps_today);
+        lv_label_set_text(lsteps, sbuf);
+    } else {
+        lv_label_set_text(lsteps, "—");
+    }
+    lv_obj_set_style_text_font(lsteps, &rr_font_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lsteps, RR_ACCENT, LV_PART_MAIN);   // data = orange
+    lv_obj_align(lsteps, LV_ALIGN_TOP_MID, -34, 216);
+
+    lv_obj_t *lsteplbl = lv_label_create(s_screen);
+    lv_label_set_text(lsteplbl, el ? "βήματα" : "steps");
+    lv_obj_set_style_text_font(lsteplbl, &rr_font_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lsteplbl, RR_MUTED, LV_PART_MAIN);
+    lv_obj_align(lsteplbl, LV_ALIGN_TOP_MID, 34, 224);
+
+    // ── next routine, or an all-done state ──────────────────────────────────
+    char hint[96];
+    if (w->next.found) {
+        snprintf(hint, sizeof(hint), "%s %02d:%02d  %s",
+                 el ? "Επόμενο:" : "Next:",
+                 w->next.hour, w->next.minute, w->next.routine_name);
+    } else {
+        snprintf(hint, sizeof(hint), "%s", el ? "Όλα έτοιμα ✓" : "All done ✓");
+    }
+    lv_obj_t *lnext = lv_label_create(s_screen);
+    lv_label_set_long_mode(lnext, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lnext, 370);
+    lv_label_set_text(lnext, hint);
+    lv_obj_set_style_text_font(lnext, &rr_font_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lnext, w->next.found ? RR_TEXT : RR_SUCCESS, LV_PART_MAIN);
+    lv_obj_set_style_text_align(lnext, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(lnext, LV_ALIGN_TOP_MID, 0, 286);
+
+    // ── XP / level, deliberately subtle (§9B.1 "optional") ──────────────────
+    if (w->level > 0) {
+        char xp[32];
+        snprintf(xp, sizeof(xp), "L%d", w->level);
+        lv_obj_t *lxp = lv_label_create(s_screen);
+        lv_label_set_text(lxp, xp);
+        lv_obj_set_style_text_font(lxp, &rr_font_20, LV_PART_MAIN);
+        lv_obj_set_style_text_color(lxp, RR_MUTED, LV_PART_MAIN);
+        lv_obj_align(lxp, LV_ALIGN_BOTTOM_MID, 0, -26);
+    }
+
+    // A queued-but-unsynced marker: the child completed routines the parent
+    // has not seen yet. Small, but it makes an invisible state visible.
+    if (w->queued_runs > 0) {
+        char q[32];
+        snprintf(q, sizeof(q), LV_SYMBOL_UPLOAD " %d", w->queued_runs);
+        lv_obj_t *lq = lv_label_create(s_screen);
+        lv_label_set_text(lq, q);
+        lv_obj_set_style_text_font(lq, &rr_font_20, LV_PART_MAIN);
+        lv_obj_set_style_text_color(lq, RR_MUTED, LV_PART_MAIN);
+        lv_obj_align(lq, LV_ALIGN_TOP_RIGHT, -18, 18);
+    }
+
+    bsp_display_unlock();
+
+    s_last_screen = RR_SCREEN_WATCHFACE;
+    ESP_LOGI(TAG, "watchface: %s  %s  next=%s  steps=%s",
+             hhmm, date, w->next.found ? w->next.routine_name : "(none)",
+             w->steps_valid ? "real" : "placeholder");
+    return ESP_OK;
+}
+
+bool rr_ui_last_screen_is_watchface(void)
+{
+    return s_last_screen == RR_SCREEN_WATCHFACE;
 }

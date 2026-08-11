@@ -32,6 +32,7 @@
 #include "freertos/task.h"
 
 #include "rr_ble.h"
+#include "rr_idle.h"
 #include "rr_ui.h"
 
 static const char *TAG = "rr_reset_btn";
@@ -52,6 +53,15 @@ static void reset_button_task(void *arg)
         bool pressed = gpio_get_level(BOOT_GPIO) == 0;
 
         if (!pressed) {
+            // A SHORT press is the manual wake of §9B.2. The spec names the PWR
+            // button, but PWR is wired to the AXP2101's PWRON pin rather than a
+            // GPIO, so reading it means polling PMIC registers over I2C. BOOT is
+            // directly readable and already debounced by this loop, so it serves
+            // as the fallback until Phase 10 wires the PMIC interrupt.
+            if (held_ms > 0 && held_ms < ARM_MS) {
+                ESP_LOGI(TAG, "short press (%d ms) — manual wake", held_ms);
+                rr_idle_wake_manual();
+            }
             if (countdown_shown) {
                 ESP_LOGI(TAG, "reset aborted — button released at %d ms", held_ms);
                 rr_ui_restore_after_reset_prompt();

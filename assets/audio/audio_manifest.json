@@ -1,0 +1,479 @@
+{
+  "generator": "tools/watch-audio/gen-watch-audio.mjs",
+  "label_source": "packages/shared/src/types/app.ts ROUTINE_TEMPLATES (starter templates)",
+  "coverage_warning": "Starter-template labels only. template_step.label is free text; custom steps have no clip.",
+  "format": {
+    "encoding": "WAV PCM s16le",
+    "rate_hz": 22050,
+    "bits": 16,
+    "channels": 1
+  },
+  "tts": {
+    "tool": "piper (offline ONNX)",
+    "voices": {
+      "en": "en_US-amy-medium",
+      "el": "el_GR-joy-medium"
+    },
+    "volume": "0.9"
+  },
+  "mount": "/lfs/audio",
+  "counts": {
+    "voice": 36,
+    "tone": 5,
+    "total": 41
+  },
+  "total_bytes": 2802300,
+  "clips": [
+    {
+      "file": "voice_en_get_up.wav",
+      "bytes": 49948,
+      "ms": 1132,
+      "kind": "voice",
+      "id": "get_up",
+      "lang": "en",
+      "label": "Get Up",
+      "text": "Time to get up",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_get_up.wav",
+      "bytes": 58146,
+      "ms": 1318,
+      "kind": "voice",
+      "id": "get_up",
+      "lang": "el",
+      "label": "Get Up",
+      "text": "Ώρα να σηκωθείς",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_toilet.wav",
+      "bytes": 56644,
+      "ms": 1283,
+      "kind": "voice",
+      "id": "toilet",
+      "lang": "en",
+      "label": "Toilet",
+      "text": "Time for the toilet",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_toilet.wav",
+      "bytes": 64816,
+      "ms": 1469,
+      "kind": "voice",
+      "id": "toilet",
+      "lang": "el",
+      "label": "Toilet",
+      "text": "Ώρα για την τουαλέτα",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_brush_teeth.wav",
+      "bytes": 76096,
+      "ms": 1725,
+      "kind": "voice",
+      "id": "brush_teeth",
+      "lang": "en",
+      "label": "Brush Teeth",
+      "text": "Time to brush your teeth",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_brush_teeth.wav",
+      "bytes": 98020,
+      "ms": 2222,
+      "kind": "voice",
+      "id": "brush_teeth",
+      "lang": "el",
+      "label": "Brush Teeth",
+      "text": "Ώρα να πλύνεις τα δόντια σου",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_get_dressed.wav",
+      "bytes": 58622,
+      "ms": 1328,
+      "kind": "voice",
+      "id": "get_dressed",
+      "lang": "en",
+      "label": "Get Dressed",
+      "text": "Time to get dressed",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_get_dressed.wav",
+      "bytes": 53510,
+      "ms": 1212,
+      "kind": "voice",
+      "id": "get_dressed",
+      "lang": "el",
+      "label": "Get Dressed",
+      "text": "Ώρα να ντυθείς",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_bag_shoes.wav",
+      "bytes": 81270,
+      "ms": 1842,
+      "kind": "voice",
+      "id": "bag_shoes",
+      "lang": "en",
+      "label": "Bag & Shoes",
+      "text": "Time for your bag and shoes",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_bag_shoes.wav",
+      "bytes": 105070,
+      "ms": 2382,
+      "kind": "voice",
+      "id": "bag_shoes",
+      "lang": "el",
+      "label": "Bag & Shoes",
+      "text": "Ώρα για την τσάντα και τα παπούτσια",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_bath.wav",
+      "bytes": 53496,
+      "ms": 1212,
+      "kind": "voice",
+      "id": "bath",
+      "lang": "en",
+      "label": "Bath",
+      "text": "Time for your bath",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_bath.wav",
+      "bytes": 52468,
+      "ms": 1189,
+      "kind": "voice",
+      "id": "bath",
+      "lang": "el",
+      "label": "Bath",
+      "text": "Ώρα για μπάνιο",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_pyjamas.wav",
+      "bytes": 56278,
+      "ms": 1275,
+      "kind": "voice",
+      "id": "pyjamas",
+      "lang": "en",
+      "label": "Pyjamas",
+      "text": "Time for pyjamas",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_pyjamas.wav",
+      "bytes": 71742,
+      "ms": 1626,
+      "kind": "voice",
+      "id": "pyjamas",
+      "lang": "el",
+      "label": "Pyjamas",
+      "text": "Ώρα για τις πιτζάμες",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_read.wav",
+      "bytes": 44966,
+      "ms": 1019,
+      "kind": "voice",
+      "id": "read",
+      "lang": "en",
+      "label": "Read",
+      "text": "Time to read",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_read.wav",
+      "bytes": 69254,
+      "ms": 1569,
+      "kind": "voice",
+      "id": "read",
+      "lang": "el",
+      "label": "Read",
+      "text": "Ώρα να διαβάσεις",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_lights_out.wav",
+      "bytes": 58350,
+      "ms": 1322,
+      "kind": "voice",
+      "id": "lights_out",
+      "lang": "en",
+      "label": "Lights Out",
+      "text": "Time for lights out",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_lights_out.wav",
+      "bytes": 87364,
+      "ms": 1980,
+      "kind": "voice",
+      "id": "lights_out",
+      "lang": "el",
+      "label": "Lights Out",
+      "text": "Ώρα να σβήσουν τα φώτα",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_unpack_bag.wav",
+      "bytes": 72064,
+      "ms": 1633,
+      "kind": "voice",
+      "id": "unpack_bag",
+      "lang": "en",
+      "label": "Unpack Bag",
+      "text": "Time to unpack your bag",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_unpack_bag.wav",
+      "bytes": 90944,
+      "ms": 2061,
+      "kind": "voice",
+      "id": "unpack_bag",
+      "lang": "el",
+      "label": "Unpack Bag",
+      "text": "Ώρα να αδειάσεις την τσάντα",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_task_1.wav",
+      "bytes": 64038,
+      "ms": 1451,
+      "kind": "voice",
+      "id": "task_1",
+      "lang": "en",
+      "label": "Task 1",
+      "text": "Time for task one",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_task_1.wav",
+      "bytes": 89352,
+      "ms": 2025,
+      "kind": "voice",
+      "id": "task_1",
+      "lang": "el",
+      "label": "Task 1",
+      "text": "Ώρα για την πρώτη εργασία",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_task_2.wav",
+      "bytes": 60392,
+      "ms": 1368,
+      "kind": "voice",
+      "id": "task_2",
+      "lang": "en",
+      "label": "Task 2",
+      "text": "Time for task two",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_task_2.wav",
+      "bytes": 90798,
+      "ms": 2058,
+      "kind": "voice",
+      "id": "task_2",
+      "lang": "el",
+      "label": "Task 2",
+      "text": "Ώρα για τη δεύτερη εργασία",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_pack_bag.wav",
+      "bytes": 65298,
+      "ms": 1480,
+      "kind": "voice",
+      "id": "pack_bag",
+      "lang": "en",
+      "label": "Pack Bag",
+      "text": "Time to pack your bag",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_pack_bag.wav",
+      "bytes": 89388,
+      "ms": 2026,
+      "kind": "voice",
+      "id": "pack_bag",
+      "lang": "el",
+      "label": "Pack Bag",
+      "text": "Ώρα να ετοιμάσεις την τσάντα",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_tidy_room.wav",
+      "bytes": 71798,
+      "ms": 1627,
+      "kind": "voice",
+      "id": "tidy_room",
+      "lang": "en",
+      "label": "Tidy Room",
+      "text": "Time to tidy your room",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_tidy_room.wav",
+      "bytes": 121592,
+      "ms": 2756,
+      "kind": "voice",
+      "id": "tidy_room",
+      "lang": "el",
+      "label": "Tidy Room",
+      "text": "Ώρα να τακτοποιήσεις το δωμάτιο",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_vacuum.wav",
+      "bytes": 48978,
+      "ms": 1110,
+      "kind": "voice",
+      "id": "vacuum",
+      "lang": "en",
+      "label": "Vacuum",
+      "text": "Time to vacuum",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_vacuum.wav",
+      "bytes": 63266,
+      "ms": 1434,
+      "kind": "voice",
+      "id": "vacuum",
+      "lang": "el",
+      "label": "Vacuum",
+      "text": "Ώρα για σκούπισμα",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_dishes.wav",
+      "bytes": 69590,
+      "ms": 1577,
+      "kind": "voice",
+      "id": "dishes",
+      "lang": "en",
+      "label": "Dishes",
+      "text": "Time to do the dishes",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_dishes.wav",
+      "bytes": 91384,
+      "ms": 2071,
+      "kind": "voice",
+      "id": "dishes",
+      "lang": "el",
+      "label": "Dishes",
+      "text": "Ώρα να πλύνεις τα πιάτα",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_well_done.wav",
+      "bytes": 69424,
+      "ms": 1573,
+      "kind": "voice",
+      "id": "well_done",
+      "lang": "en",
+      "label": null,
+      "text": "Well done, you did it!",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_well_done.wav",
+      "bytes": 82994,
+      "ms": 1881,
+      "kind": "voice",
+      "id": "well_done",
+      "lang": "el",
+      "label": null,
+      "text": "Μπράβο σου, τα κατάφερες!",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "voice_en_all_done.wav",
+      "bytes": 78880,
+      "ms": 1788,
+      "kind": "voice",
+      "id": "all_done",
+      "lang": "en",
+      "label": null,
+      "text": "All done! Great job!",
+      "source": "piper en_US-amy-medium"
+    },
+    {
+      "file": "voice_el_all_done.wav",
+      "bytes": 91358,
+      "ms": 2071,
+      "kind": "voice",
+      "id": "all_done",
+      "lang": "el",
+      "label": null,
+      "text": "Τέλειωσες! Μπράβο σου!",
+      "source": "piper el_GR-joy-medium"
+    },
+    {
+      "file": "tone_alarm.wav",
+      "bytes": 109412,
+      "ms": 2480,
+      "kind": "tone",
+      "id": "alarm",
+      "lang": null,
+      "label": null,
+      "text": null,
+      "source": "synthesised (sine + AR envelope)"
+    },
+    {
+      "file": "tone_routine_start.wav",
+      "bytes": 22094,
+      "ms": 500,
+      "kind": "tone",
+      "id": "routine_start",
+      "lang": null,
+      "label": null,
+      "text": null,
+      "source": "synthesised (sine + AR envelope)"
+    },
+    {
+      "file": "tone_step_done.wav",
+      "bytes": 6218,
+      "ms": 140,
+      "kind": "tone",
+      "id": "step_done",
+      "lang": null,
+      "label": null,
+      "text": null,
+      "source": "synthesised (sine + AR envelope)"
+    },
+    {
+      "file": "tone_xp_chime.wav",
+      "bytes": 11510,
+      "ms": 260,
+      "kind": "tone",
+      "id": "xp_chime",
+      "lang": null,
+      "label": null,
+      "text": null,
+      "source": "synthesised (sine + AR envelope)"
+    },
+    {
+      "file": "tone_routine_complete.wav",
+      "bytes": 45468,
+      "ms": 1030,
+      "kind": "tone",
+      "id": "routine_complete",
+      "lang": null,
+      "label": null,
+      "text": null,
+      "source": "synthesised (sine + AR envelope)"
+    }
+  ]
+}

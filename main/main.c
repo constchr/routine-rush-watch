@@ -1,6 +1,6 @@
 // Routine Rush Watch — application entry point.
 //
-// PHASE 4b: live routine runtime — countdown, Done/Skip, step advancement.
+// PHASE 6: idle watch face + raise-to-wake.
 //
 // The watch mints a persistent device_id, generates an ephemeral pairing
 // nonce, renders both as a QR on the AMOLED, and waits. The parent app scans
@@ -28,6 +28,8 @@
 #include "rr_identity.h"
 #include "rr_store.h"
 #include "rr_routine.h"
+#include "rr_imu.h"
+#include "rr_idle.h"
 #include "rr_rtc.h"
 #include "rr_ui.h"
 #include "rr_reset_button.h"
@@ -48,7 +50,7 @@ static const char *TAG = "rr_watch";
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Routine Rush Watch — Phase 4b (routine runtime)");
+    ESP_LOGI(TAG, "Routine Rush Watch — Phase 6 (watch face + raise-to-wake)");
     ESP_LOGI(TAG, "ESP-IDF %s", esp_get_idf_version());
 
     // NVS first — app_main owns the NVS lifecycle for the whole firmware.
@@ -137,24 +139,26 @@ void app_main(void)
         ESP_ERROR_CHECK(rr_ui_show_pairing_qr(payload));
     }
 
-    // ── Phase 4b: run the first cached routine ──────────────────────────────
-    // Manual for now — you tap through it. The scheduler that fires a routine
-    // by time is Phase 7.
-    rr_ui_font_selftest();
-    vTaskDelay(pdMS_TO_TICKS(4000));
+    // ── Phase 6: IMU + the idle watch face ──────────────────────────────────
+    // rr_imu is the SHARED sensor owner: raise-to-wake uses it now, Phase 9's
+    // pedometer extends the same handle rather than re-initialising.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(rr_imu_init(bsp_i2c_get_handle()));
 
-    if (rr_routine_start(0) != ESP_OK) {
-        ESP_LOGW(TAG, "no cached routines — push some over BLE, then reboot");
-    }
+    // A running routine must not be blanked mid-step.
+    rr_idle_set_suspend_check(rr_routine_is_active);
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(rr_idle_init());
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         if (rr_rtc_get(&now) == ESP_OK) {
             rr_rtc_format(&now, tbuf, sizeof(tbuf));
-            ESP_LOGI(TAG, "RTC %s | ble=%s | routine=%s | heap %u",
+            ESP_LOGI(TAG, "RTC %s | ble=%s | routine=%s | screen=%s | queued=%d | heap %u",
                      tbuf,
                      rr_ble_is_connected() ? "CONNECTED" : "advertising",
                      rr_routine_is_active() ? "RUNNING" : "idle",
+                     rr_idle_is_awake() ? "awake" : "asleep",
+                     rr_queue_count(),
                      (unsigned) esp_get_free_heap_size());
         }
     }
