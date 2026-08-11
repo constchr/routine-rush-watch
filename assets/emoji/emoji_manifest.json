@@ -1,0 +1,1061 @@
+{
+  "generator": "tools/watch-emoji/gen-watch-emoji.mjs",
+  "source": "packages/ui/src/icons/stepIcons.ts",
+  "format": "LVGL 9.5.0 binary image, RGB565A8 (cf 0x14)",
+  "size": 96,
+  "mount": "/lfs/emoji",
+  "count": 150,
+  "total_bytes": 4149000,
+  "emoji": [
+    {
+      "emoji": "🌅",
+      "codepoints": "1F305",
+      "file": "1f305.bin",
+      "category": "Morning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🌞",
+      "codepoints": "1F31E",
+      "file": "1f31e.bin",
+      "category": "Morning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "☀️",
+      "codepoints": "2600 FE0F",
+      "file": "2600.bin",
+      "category": "Morning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🌤️",
+      "codepoints": "1F324 FE0F",
+      "file": "1f324.bin",
+      "category": "Morning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🌄",
+      "codepoints": "1F304",
+      "file": "1f304.bin",
+      "category": "Morning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🛏️",
+      "codepoints": "1F6CF FE0F",
+      "file": "1f6cf.bin",
+      "category": "Morning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "⏰",
+      "codepoints": "23F0",
+      "file": "23f0.bin",
+      "category": "Morning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🕐",
+      "codepoints": "1F550",
+      "file": "1f550.bin",
+      "category": "Morning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "⏱️",
+      "codepoints": "23F1 FE0F",
+      "file": "23f1.bin",
+      "category": "Morning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🔔",
+      "codepoints": "1F514",
+      "file": "1f514.bin",
+      "category": "Morning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🐓",
+      "codepoints": "1F413",
+      "file": "1f413.bin",
+      "category": "Morning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🪥",
+      "codepoints": "1FAA5",
+      "file": "1faa5.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🦷",
+      "codepoints": "1F9B7",
+      "file": "1f9b7.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧼",
+      "codepoints": "1F9FC",
+      "file": "1f9fc.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧴",
+      "codepoints": "1F9F4",
+      "file": "1f9f4.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🚿",
+      "codepoints": "1F6BF",
+      "file": "1f6bf.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🛁",
+      "codepoints": "1F6C1",
+      "file": "1f6c1.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "💧",
+      "codepoints": "1F4A7",
+      "file": "1f4a7.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧻",
+      "codepoints": "1F9FB",
+      "file": "1f9fb.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "💅",
+      "codepoints": "1F485",
+      "file": "1f485.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "💈",
+      "codepoints": "1F488",
+      "file": "1f488.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🪒",
+      "codepoints": "1FA92",
+      "file": "1fa92.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧽",
+      "codepoints": "1F9FD",
+      "file": "1f9fd.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "👅",
+      "codepoints": "1F445",
+      "file": "1f445.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "💊",
+      "codepoints": "1F48A",
+      "file": "1f48a.bin",
+      "category": "Hygiene",
+      "bytes": 27660
+    },
+    {
+      "emoji": "👕",
+      "codepoints": "1F455",
+      "file": "1f455.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "👖",
+      "codepoints": "1F456",
+      "file": "1f456.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "👗",
+      "codepoints": "1F457",
+      "file": "1f457.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "👚",
+      "codepoints": "1F45A",
+      "file": "1f45a.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "👔",
+      "codepoints": "1F454",
+      "file": "1f454.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧥",
+      "codepoints": "1F9E5",
+      "file": "1f9e5.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "👟",
+      "codepoints": "1F45F",
+      "file": "1f45f.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "👞",
+      "codepoints": "1F45E",
+      "file": "1f45e.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🥿",
+      "codepoints": "1F97F",
+      "file": "1f97f.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "👢",
+      "codepoints": "1F462",
+      "file": "1f462.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧦",
+      "codepoints": "1F9E6",
+      "file": "1f9e6.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎒",
+      "codepoints": "1F392",
+      "file": "1f392.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧤",
+      "codepoints": "1F9E4",
+      "file": "1f9e4.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧢",
+      "codepoints": "1F9E2",
+      "file": "1f9e2.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "👒",
+      "codepoints": "1F452",
+      "file": "1f452.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "👓",
+      "codepoints": "1F453",
+      "file": "1f453.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "⌚",
+      "codepoints": "231A",
+      "file": "231a.bin",
+      "category": "Getting dressed",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🍳",
+      "codepoints": "1F373",
+      "file": "1f373.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🥚",
+      "codepoints": "1F95A",
+      "file": "1f95a.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🥣",
+      "codepoints": "1F963",
+      "file": "1f963.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🥛",
+      "codepoints": "1F95B",
+      "file": "1f95b.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🍎",
+      "codepoints": "1F34E",
+      "file": "1f34e.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🍌",
+      "codepoints": "1F34C",
+      "file": "1f34c.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🍇",
+      "codepoints": "1F347",
+      "file": "1f347.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🥕",
+      "codepoints": "1F955",
+      "file": "1f955.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🥤",
+      "codepoints": "1F964",
+      "file": "1f964.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧃",
+      "codepoints": "1F9C3",
+      "file": "1f9c3.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🍞",
+      "codepoints": "1F35E",
+      "file": "1f35e.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🥪",
+      "codepoints": "1F96A",
+      "file": "1f96a.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🥗",
+      "codepoints": "1F957",
+      "file": "1f957.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧀",
+      "codepoints": "1F9C0",
+      "file": "1f9c0.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🍵",
+      "codepoints": "1F375",
+      "file": "1f375.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🍽️",
+      "codepoints": "1F37D FE0F",
+      "file": "1f37d.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🍴",
+      "codepoints": "1F374",
+      "file": "1f374.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🍪",
+      "codepoints": "1F36A",
+      "file": "1f36a.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🍕",
+      "codepoints": "1F355",
+      "file": "1f355.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🍿",
+      "codepoints": "1F37F",
+      "file": "1f37f.bin",
+      "category": "Food & drink",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🏃",
+      "codepoints": "1F3C3",
+      "file": "1f3c3.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🤸",
+      "codepoints": "1F938",
+      "file": "1f938.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧘",
+      "codepoints": "1F9D8",
+      "file": "1f9d8.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "💪",
+      "codepoints": "1F4AA",
+      "file": "1f4aa.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🏋️",
+      "codepoints": "1F3CB FE0F",
+      "file": "1f3cb.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🚴",
+      "codepoints": "1F6B4",
+      "file": "1f6b4.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "⚽",
+      "codepoints": "26BD",
+      "file": "26bd.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🏀",
+      "codepoints": "1F3C0",
+      "file": "1f3c0.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎾",
+      "codepoints": "1F3BE",
+      "file": "1f3be.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🤾",
+      "codepoints": "1F93E",
+      "file": "1f93e.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "⛹️",
+      "codepoints": "26F9 FE0F",
+      "file": "26f9.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🏊",
+      "codepoints": "1F3CA",
+      "file": "1f3ca.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🤺",
+      "codepoints": "1F93A",
+      "file": "1f93a.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🥋",
+      "codepoints": "1F94B",
+      "file": "1f94b.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🛹",
+      "codepoints": "1F6F9",
+      "file": "1f6f9.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🏅",
+      "codepoints": "1F3C5",
+      "file": "1f3c5.bin",
+      "category": "Exercise",
+      "bytes": 27660
+    },
+    {
+      "emoji": "📚",
+      "codepoints": "1F4DA",
+      "file": "1f4da.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "📖",
+      "codepoints": "1F4D6",
+      "file": "1f4d6.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "✏️",
+      "codepoints": "270F FE0F",
+      "file": "270f.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "📝",
+      "codepoints": "1F4DD",
+      "file": "1f4dd.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎨",
+      "codepoints": "1F3A8",
+      "file": "1f3a8.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🖌️",
+      "codepoints": "1F58C FE0F",
+      "file": "1f58c.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎵",
+      "codepoints": "1F3B5",
+      "file": "1f3b5.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎼",
+      "codepoints": "1F3BC",
+      "file": "1f3bc.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎹",
+      "codepoints": "1F3B9",
+      "file": "1f3b9.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🖥️",
+      "codepoints": "1F5A5 FE0F",
+      "file": "1f5a5.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🔬",
+      "codepoints": "1F52C",
+      "file": "1f52c.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧮",
+      "codepoints": "1F9EE",
+      "file": "1f9ee.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🔢",
+      "codepoints": "1F522",
+      "file": "1f522.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🌍",
+      "codepoints": "1F30D",
+      "file": "1f30d.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "📐",
+      "codepoints": "1F4D0",
+      "file": "1f4d0.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧪",
+      "codepoints": "1F9EA",
+      "file": "1f9ea.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧩",
+      "codepoints": "1F9E9",
+      "file": "1f9e9.bin",
+      "category": "Learning",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧹",
+      "codepoints": "1F9F9",
+      "file": "1f9f9.bin",
+      "category": "Chores",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🗑️",
+      "codepoints": "1F5D1 FE0F",
+      "file": "1f5d1.bin",
+      "category": "Chores",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧺",
+      "codepoints": "1F9FA",
+      "file": "1f9fa.bin",
+      "category": "Chores",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🪴",
+      "codepoints": "1FAB4",
+      "file": "1fab4.bin",
+      "category": "Chores",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🐕",
+      "codepoints": "1F415",
+      "file": "1f415.bin",
+      "category": "Chores",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🐈",
+      "codepoints": "1F408",
+      "file": "1f408.bin",
+      "category": "Chores",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🛒",
+      "codepoints": "1F6D2",
+      "file": "1f6d2.bin",
+      "category": "Chores",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🪣",
+      "codepoints": "1FAA3",
+      "file": "1faa3.bin",
+      "category": "Chores",
+      "bytes": 27660
+    },
+    {
+      "emoji": "📦",
+      "codepoints": "1F4E6",
+      "file": "1f4e6.bin",
+      "category": "Chores",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧯",
+      "codepoints": "1F9EF",
+      "file": "1f9ef.bin",
+      "category": "Chores",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🪑",
+      "codepoints": "1FA91",
+      "file": "1fa91.bin",
+      "category": "Chores",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧷",
+      "codepoints": "1F9F7",
+      "file": "1f9f7.bin",
+      "category": "Chores",
+      "bytes": 27660
+    },
+    {
+      "emoji": "♻️",
+      "codepoints": "267B FE0F",
+      "file": "267b.bin",
+      "category": "Chores",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🌙",
+      "codepoints": "1F319",
+      "file": "1f319.bin",
+      "category": "Evening",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🌛",
+      "codepoints": "1F31B",
+      "file": "1f31b.bin",
+      "category": "Evening",
+      "bytes": 27660
+    },
+    {
+      "emoji": "💤",
+      "codepoints": "1F4A4",
+      "file": "1f4a4.bin",
+      "category": "Evening",
+      "bytes": 27660
+    },
+    {
+      "emoji": "😴",
+      "codepoints": "1F634",
+      "file": "1f634.bin",
+      "category": "Evening",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🛌",
+      "codepoints": "1F6CC",
+      "file": "1f6cc.bin",
+      "category": "Evening",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧸",
+      "codepoints": "1F9F8",
+      "file": "1f9f8.bin",
+      "category": "Evening",
+      "bytes": 27660
+    },
+    {
+      "emoji": "📓",
+      "codepoints": "1F4D3",
+      "file": "1f4d3.bin",
+      "category": "Evening",
+      "bytes": 27660
+    },
+    {
+      "emoji": "📕",
+      "codepoints": "1F4D5",
+      "file": "1f4d5.bin",
+      "category": "Evening",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🌟",
+      "codepoints": "1F31F",
+      "file": "1f31f.bin",
+      "category": "Evening",
+      "bytes": 27660
+    },
+    {
+      "emoji": "⭐",
+      "codepoints": "2B50",
+      "file": "2b50.bin",
+      "category": "Evening",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🕯️",
+      "codepoints": "1F56F FE0F",
+      "file": "1f56f.bin",
+      "category": "Evening",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎮",
+      "codepoints": "1F3AE",
+      "file": "1f3ae.bin",
+      "category": "Play",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎲",
+      "codepoints": "1F3B2",
+      "file": "1f3b2.bin",
+      "category": "Play",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🃏",
+      "codepoints": "1F0CF",
+      "file": "1f0cf.bin",
+      "category": "Play",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎭",
+      "codepoints": "1F3AD",
+      "file": "1f3ad.bin",
+      "category": "Play",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎪",
+      "codepoints": "1F3AA",
+      "file": "1f3aa.bin",
+      "category": "Play",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🏰",
+      "codepoints": "1F3F0",
+      "file": "1f3f0.bin",
+      "category": "Play",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎠",
+      "codepoints": "1F3A0",
+      "file": "1f3a0.bin",
+      "category": "Play",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🪀",
+      "codepoints": "1FA80",
+      "file": "1fa80.bin",
+      "category": "Play",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎯",
+      "codepoints": "1F3AF",
+      "file": "1f3af.bin",
+      "category": "Play",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎸",
+      "codepoints": "1F3B8",
+      "file": "1f3b8.bin",
+      "category": "Play",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🪁",
+      "codepoints": "1FA81",
+      "file": "1fa81.bin",
+      "category": "Play",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎺",
+      "codepoints": "1F3BA",
+      "file": "1f3ba.bin",
+      "category": "Play",
+      "bytes": 27660
+    },
+    {
+      "emoji": "❤️",
+      "codepoints": "2764 FE0F",
+      "file": "2764.bin",
+      "category": "Health",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🩹",
+      "codepoints": "1FA79",
+      "file": "1fa79.bin",
+      "category": "Health",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🌡️",
+      "codepoints": "1F321 FE0F",
+      "file": "1f321.bin",
+      "category": "Health",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🧠",
+      "codepoints": "1F9E0",
+      "file": "1f9e0.bin",
+      "category": "Health",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🥦",
+      "codepoints": "1F966",
+      "file": "1f966.bin",
+      "category": "Health",
+      "bytes": 27660
+    },
+    {
+      "emoji": "😊",
+      "codepoints": "1F60A",
+      "file": "1f60a.bin",
+      "category": "Health",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🦵",
+      "codepoints": "1F9B5",
+      "file": "1f9b5.bin",
+      "category": "Health",
+      "bytes": 27660
+    },
+    {
+      "emoji": "⚡",
+      "codepoints": "26A1",
+      "file": "26a1.bin",
+      "category": "Special",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🏆",
+      "codepoints": "1F3C6",
+      "file": "1f3c6.bin",
+      "category": "Special",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🌈",
+      "codepoints": "1F308",
+      "file": "1f308.bin",
+      "category": "Special",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🚀",
+      "codepoints": "1F680",
+      "file": "1f680.bin",
+      "category": "Special",
+      "bytes": 27660
+    },
+    {
+      "emoji": "✨",
+      "codepoints": "2728",
+      "file": "2728.bin",
+      "category": "Special",
+      "bytes": 27660
+    },
+    {
+      "emoji": "💫",
+      "codepoints": "1F4AB",
+      "file": "1f4ab.bin",
+      "category": "Special",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🦄",
+      "codepoints": "1F984",
+      "file": "1f984.bin",
+      "category": "Special",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎁",
+      "codepoints": "1F381",
+      "file": "1f381.bin",
+      "category": "Special",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🌻",
+      "codepoints": "1F33B",
+      "file": "1f33b.bin",
+      "category": "Special",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🌸",
+      "codepoints": "1F338",
+      "file": "1f338.bin",
+      "category": "Special",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🦋",
+      "codepoints": "1F98B",
+      "file": "1f98b.bin",
+      "category": "Special",
+      "bytes": 27660
+    },
+    {
+      "emoji": "🎉",
+      "codepoints": "1F389",
+      "file": "1f389.bin",
+      "category": "Special",
+      "bytes": 27660
+    }
+  ]
+}

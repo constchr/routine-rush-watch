@@ -18,6 +18,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
+#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -47,7 +48,30 @@ void app_main(void)
     ESP_LOGI(TAG, "Routine Rush Watch — Phase 2 (QR pairing)");
     ESP_LOGI(TAG, "ESP-IDF %s", esp_get_idf_version());
 
-    // Identity first: the QR cannot be built without it, and a failure here is
+    // NVS first — app_main owns the NVS lifecycle for the whole firmware.
+    //
+    // Two consumers need it and neither may initialise it itself: rr_identity
+    // stores the device_id, and NimBLE's bond store persists pairing keys.
+    // Doing it here (the conventional ESP-IDF place) means module init order
+    // can be reasoned about locally instead of each module racing to be the
+    // one that initialised NVS.
+    //
+    // The erase-and-retry branch is the canonical pattern: NO_FREE_PAGES means
+    // the partition is full, NEW_VERSION_FOUND means it was written by a newer
+    // NVS format. Both are unrecoverable without a wipe — and wiping costs us
+    // the device_id, so the watch would need re-pairing. That is the correct
+    // trade: the alternative is a device that cannot boot at all.
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS unusable (%s) — erasing; device_id will be regenerated "
+                      "and the watch will need re-pairing", esp_err_to_name(nvs_err));
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
+    ESP_LOGI(TAG, "NVS initialised");
+
+    // Identity next: the QR cannot be built without it, and a failure here is
     // fatal to pairing (see rr_identity.c on why we refuse a volatile id).
     ESP_ERROR_CHECK(rr_identity_init());
 

@@ -154,6 +154,8 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
 // A 128-bit UUID costs 18 of the 31 adv bytes, and flags costs 3, so the name
 // does not fit alongside it — it goes in the scan response instead.
 // ─────────────────────────────────────────────────────────────────────────────
+static int gap_event_cb(struct ble_gap_event *event, void *arg);
+
 static void advertise(void)
 {
     struct ble_hs_adv_fields fields = { 0 };
@@ -182,7 +184,12 @@ static void advertise(void)
     params.conn_mode = BLE_GAP_CONN_MODE_UND;
     params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
-    rc = ble_gap_adv_start(s_addr_type, NULL, BLE_HS_FOREVER, &params, NULL, NULL);
+    // The GAP callback MUST be passed here — without it NimBLE delivers no
+    // connect / disconnect / encryption-change events at all, so the watch
+    // never re-advertises after a peer drops and bonding completion is
+    // invisible. (Phase 1 passed NULL; a GATT write still worked, which is
+    // why it went unnoticed until -Wunused-function flagged the dead handler.)
+    rc = ble_gap_adv_start(s_addr_type, NULL, BLE_HS_FOREVER, &params, gap_event_cb, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "adv_start failed: %d", rc);
         return;
@@ -292,12 +299,8 @@ void ble_store_config_init(void);
 
 esp_err_t rr_ble_init(void)
 {
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
+    // NVS is initialised by app_main, not here — it is shared with rr_identity
+    // and must be up before either module runs. NimBLE's bond store needs it.
 
     // Build NimBLE-order UUIDs from the generated canonical bytes.
     static const uint8_t svc_canonical[16] = RR_SYNC_SERVICE_UUID_BYTES;
@@ -305,7 +308,7 @@ esp_err_t rr_ble_init(void)
     uuid128_from_canonical(&s_svc_uuid, svc_canonical);
     uuid128_from_canonical(&s_time_sync_uuid, ts_canonical);
 
-    err = nimble_port_init();
+    esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "nimble_port_init failed: %s", esp_err_to_name(err));
         return err;
