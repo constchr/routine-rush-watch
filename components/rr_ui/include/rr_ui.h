@@ -24,6 +24,33 @@
 // ── Phase 2 surface (implemented) ────────────────────────────────────────────
 
 #include "esp_err.h"
+#include "lvgl.h"
+
+// ── Curved-bezel safe zone (panel is 410x502 with ~R44 physical corners) ─────
+//
+// Critical UI — text, numerals, buttons — must stay inside the safe box, which
+// is inset RR_SAFE_INSET on every side. The glass clips anything closer to the
+// edge, and it CANNOT be seen in a simulator: it only appears on the device.
+//
+// Screens should not hand-place near edges. Call rr_ui_begin_screen() and add
+// corner/edge content to the container it returns; hero content that may
+// exceed the box (avatar, QR, ring — the centre is unobstructed) goes on
+// rr_ui_screen_root().
+#define RR_SCREEN_W   410
+#define RR_SCREEN_H   502
+#define RR_SAFE_INSET 45
+#define RR_SAFE_W     (RR_SCREEN_W - 2 * RR_SAFE_INSET)   /* 320 */
+#define RR_SAFE_H     (RR_SCREEN_H - 2 * RR_SAFE_INSET)   /* 412 */
+#define RR_CORNER_R   44
+
+/** Clear the screen, apply the bezel clip, and return the SAFE container. */
+lv_obj_t *rr_ui_begin_screen(lv_color_t bg);
+
+/** The full screen — for hero content allowed to exceed the safe box. */
+lv_obj_t *rr_ui_screen_root(void);
+
+/** The safe container created by the last rr_ui_begin_screen(). */
+lv_obj_t *rr_ui_safe_area(void);
 
 /**
  * Bring up the display (SH8601 QSPI), touch, and LVGL in partial-render mode,
@@ -83,7 +110,13 @@ esp_err_t rr_ui_show_routine_complete(const char *routine_name, int done, int sk
 
 // ── Phase 6: the idle watch face (§9B) ───────────────────────────────────────
 
+#define RR_BATT_LOW_PCT 20   /**< below this the % turns red (unless charging) */
+
 typedef struct {
+    char avatar_id[16];      /**< from the cached child record */
+    uint8_t batt_percent;
+    bool batt_valid;
+    bool charging;
     int  hour, minute;
     int  year, month, day;
     char language[4];        /**< "el" / "en" from the cached child */

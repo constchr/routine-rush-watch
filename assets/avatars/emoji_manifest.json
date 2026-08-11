@@ -1,0 +1,53 @@
+{
+  "generator": "tools/watch-emoji/gen-watch-emoji.mjs",
+  "source": "packages/ui/src/icons/stepIcons.ts",
+  "format": "LVGL 9.5.0 binary image, RGB565A8 (cf 0x14)",
+  "size": 280,
+  "mount": "/lfs/emoji",
+  "count": 6,
+  "total_bytes": 1411272,
+  "emoji": [
+    {
+      "emoji": "🦁",
+      "codepoints": "1F981",
+      "file": "1f981.bin",
+      "category": "Avatar",
+      "bytes": 235212
+    },
+    {
+      "emoji": "🦊",
+      "codepoints": "1F98A",
+      "file": "1f98a.bin",
+      "category": "Avatar",
+      "bytes": 235212
+    },
+    {
+      "emoji": "🐻",
+      "codepoints": "1F43B",
+      "file": "1f43b.bin",
+      "category": "Avatar",
+      "bytes": 235212
+    },
+    {
+      "emoji": "🐰",
+      "codepoints": "1F430",
+      "file": "1f430.bin",
+      "category": "Avatar",
+      "bytes": 235212
+    },
+    {
+      "emoji": "🐼",
+      "codepoints": "1F43C",
+      "file": "1f43c.bin",
+      "category": "Avatar",
+      "bytes": 235212
+    },
+    {
+      "emoji": "🦉",
+      "codepoints": "1F989",
+      "file": "1f989.bin",
+      "category": "Avatar",
+      "bytes": 235212
+    }
+  ]
+}

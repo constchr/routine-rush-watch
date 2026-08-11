@@ -26,6 +26,7 @@
 #include "bsp/display.h"
 #include "lvgl.h"
 
+#include "rr_battery.h"
 #include "rr_imu.h"
 #include "rr_rtc.h"
 #include "rr_store.h"
@@ -73,14 +74,29 @@ static void build_and_show_face(void)
         w.year = 2000; w.month = 1; w.day = 1;
     }
 
-    // Language would come from the cached child record; that is not cached yet
-    // (Phase 5 pushes routines only), so default to Greek and note the gap
-    // rather than inventing a lookup.
-    strlcpy(w.language, "el", sizeof(w.language));
+    // Child record: avatar + language, now actually cached (the app pushes it
+    // alongside the routines). Falls back gracefully before the first push.
+    rr_child_t child;
+    if (rr_store_get_child(&child) == ESP_OK) {
+        strlcpy(w.language, child.language, sizeof(w.language));
+        strlcpy(w.avatar_id, child.avatar_id, sizeof(w.avatar_id));
+        w.level = child.level;
+    } else {
+        strlcpy(w.language, "en", sizeof(w.language));
+    }
+
+    // Battery is read HERE — on face build, i.e. on wake — not on a timer.
+    // A percentage a few minutes stale is fine; waking the CPU to refresh it
+    // is exactly the kind of thing that quietly costs a day of runtime.
+    rr_battery_t b;
+    if (rr_battery_read(&b) == ESP_OK) {
+        w.batt_valid = true;
+        w.batt_percent = b.percent;
+        w.charging = b.charging;
+    }
 
     w.steps_today = 0;
     w.steps_valid = false;      // Phase 9 flips this
-    w.level = 0;
     w.queued_runs = rr_queue_count();
 
     int wd = rr_ui_iso_weekday(w.year, w.month, w.day);

@@ -32,4 +32,11 @@ file(MAKE_DIRECTORY "${LFS_STAGE}/emoji")
 file(GLOB RR_EMOJI_BINS "${CMAKE_SOURCE_DIR}/assets/emoji/*.bin")
 file(COPY ${RR_EMOJI_BINS} DESTINATION "${LFS_STAGE}/emoji")
 
+# Hero-size avatars (280px) for the idle face. Separate directory because they
+# are a different asset class from the 96px step emoji, generated on demand for
+# the six AVATARS the app offers rather than the whole icon set.
+file(MAKE_DIRECTORY "${LFS_STAGE}/avatars")
+file(GLOB RR_AVATAR_BINS "${CMAKE_SOURCE_DIR}/assets/avatars/*.bin")
+file(COPY ${RR_AVATAR_BINS} DESTINATION "${LFS_STAGE}/avatars")
+
 littlefs_create_partition_image(littlefs "${LFS_STAGE}" FLASH_IN_PROJECT)

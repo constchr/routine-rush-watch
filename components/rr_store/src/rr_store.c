@@ -31,6 +31,7 @@ static const char *TAG = "rr_store";
 #define PARTITION_LBL "littlefs"
 #define CACHE_DIR     MOUNT_POINT "/cache"
 #define ROUTINES_PATH CACHE_DIR "/routines.json"
+#define CHILD_PATH    CACHE_DIR "/child.json"
 
 static bool s_mounted;
 
@@ -83,17 +84,51 @@ esp_err_t rr_store_put_routines(const char *json, size_t len)
         ESP_LOGE(TAG, "refusing to cache: payload is not valid JSON");
         return ESP_ERR_INVALID_ARG;
     }
-    if (!cJSON_IsArray(probe)) {
-        ESP_LOGE(TAG, "refusing to cache: routines.json must be a JSON array");
+
+    // Two accepted shapes:
+    //   [ ...routines ]              — the original document
+    //   { child: {...}, routines: [] } — the same document plus the child it
+    //                                    belongs to (§5 caches both)
+    // Both are DATA. This is not the v2 mistake of putting commands on a data
+    // characteristic, and it needs no change to watchProtocol.ts, whose
+    // encodeRoutinePush() takes `unknown` and stringifies it.
+    const cJSON *arr = probe;
+    if (cJSON_IsObject(probe)) {
+        const cJSON *child = cJSON_GetObjectItemCaseSensitive(probe, "child");
+        if (cJSON_IsObject(child)) {
+            char *cjson = cJSON_PrintUnformatted(child);
+            if (cjson != NULL) {
+                FILE *cf = fopen(CHILD_PATH, "wb");
+                if (cf != NULL) {
+                    fwrite(cjson, 1, strlen(cjson), cf);
+                    fflush(cf); fsync(fileno(cf)); fclose(cf);
+                    ESP_LOGI(TAG, "cached child record (%u bytes)", (unsigned) strlen(cjson));
+                }
+                free(cjson);
+            }
+        }
+        arr = cJSON_GetObjectItemCaseSensitive(probe, "routines");
+    }
+
+    if (!cJSON_IsArray(arr)) {
+        ESP_LOGE(TAG, "refusing to cache: no routines array in the payload");
         cJSON_Delete(probe);
         return ESP_ERR_INVALID_ARG;
     }
-    int count = cJSON_GetArraySize(probe);
+    int count = cJSON_GetArraySize(arr);
+
+    // Persist just the routines array, so routines.json keeps its §5 shape
+    // regardless of which envelope it arrived in.
+    char *routines_only = cJSON_PrintUnformatted(arr);
     cJSON_Delete(probe);
+    if (routines_only == NULL) return ESP_ERR_NO_MEM;
+    json = routines_only;
+    len = strlen(routines_only);
 
     FILE *f = fopen(ROUTINES_PATH, "wb");
     if (f == NULL) {
         ESP_LOGE(TAG, "fopen(%s) for write failed", ROUTINES_PATH);
+        free((void *) routines_only);
         return ESP_FAIL;
     }
     size_t written = fwrite(json, 1, len, f);
@@ -107,10 +142,12 @@ esp_err_t rr_store_put_routines(const char *json, size_t len)
         ESP_LOGE(TAG, "short write (%u of %u bytes) — deleting partial cache",
                  (unsigned) written, (unsigned) len);
         unlink(ROUTINES_PATH);
+        free((void *) routines_only);
         return ESP_FAIL;
     }
 
     ESP_LOGI(TAG, "cached %u bytes → %s (%d routines)", (unsigned) len, ROUTINES_PATH, count);
+    free((void *) routines_only);
     return ESP_OK;
 }
 
@@ -552,4 +589,42 @@ esp_err_t rr_store_next_routine(int iso_weekday, int now_hour, int now_min,
 
     cJSON_Delete(root);
     return out->found ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+
+// ── Phase 6b: the cached child record ────────────────────────────────────────
+
+esp_err_t rr_store_get_child(rr_child_t *out)
+{
+    if (!s_mounted || out == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+    strlcpy(out->language, "en", sizeof(out->language));
+
+    struct stat st;
+    if (stat(CHILD_PATH, &st) != 0) return ESP_ERR_NOT_FOUND;
+    FILE *f = fopen(CHILD_PATH, "rb");
+    if (f == NULL) return ESP_FAIL;
+    char *buf = malloc((size_t) st.st_size + 1);
+    if (buf == NULL) { fclose(f); return ESP_ERR_NO_MEM; }
+    size_t got = fread(buf, 1, (size_t) st.st_size, f);
+    fclose(f);
+    buf[got] = '\0';
+
+    cJSON *j = cJSON_ParseWithLength(buf, got);
+    free(buf);
+    if (j == NULL) return ESP_ERR_INVALID_STATE;
+
+    copy_str(out->name, sizeof(out->name), cJSON_GetObjectItemCaseSensitive(j, "name"), "");
+    copy_str(out->avatar_id, sizeof(out->avatar_id),
+             cJSON_GetObjectItemCaseSensitive(j, "avatar_id"), "");
+    copy_str(out->language, sizeof(out->language),
+             cJSON_GetObjectItemCaseSensitive(j, "language"), "en");
+    const cJSON *lv = cJSON_GetObjectItemCaseSensitive(j, "level");
+    out->level = cJSON_IsNumber(lv) ? lv->valueint : 0;
+    const cJSON *xp = cJSON_GetObjectItemCaseSensitive(j, "total_xp");
+    out->total_xp = cJSON_IsNumber(xp) ? xp->valueint : 0;
+    cJSON_Delete(j);
+
+    out->valid = true;
+    return ESP_OK;
 }

@@ -131,3 +131,18 @@ typedef struct {
  */
 esp_err_t rr_store_next_routine(int iso_weekday, int now_hour, int now_min,
                                 rr_next_routine_t *out);
+
+
+// ── Phase 6b: the cached child (§5 /cache/child.json) ────────────────────────
+
+typedef struct {
+    bool valid;
+    char name[48];
+    char avatar_id[16];   /**< 'lion' | 'fox' | ... — an ID, not an emoji */
+    char language[4];     /**< "el" | "en" */
+    int  level;
+    int  total_xp;
+} rr_child_t;
+
+/** Read the cached child record. ESP_ERR_NOT_FOUND before the first push. */
+esp_err_t rr_store_get_child(rr_child_t *out);

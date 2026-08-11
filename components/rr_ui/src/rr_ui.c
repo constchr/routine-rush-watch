@@ -32,7 +32,7 @@ static const char *TAG = "rr_ui";
 
 // The panel is 410x502. Keep the QR comfortably inside the narrow axis so the
 // quiet zone survives — scanners need the light margin around the symbol.
-#define QR_SIZE 320
+#define QR_SIZE 296   /* + 8px quiet-zone border fits the 320px safe box */
 
 static lv_obj_t *s_screen;
 
@@ -49,6 +49,51 @@ static void log_heap(const char *when)
              (unsigned) esp_get_free_heap_size(),
              (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
 }
+
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SAFE ZONE — the curved-bezel foundation. EVERY screen builds inside this.
+//
+// The 2.06" panel is 410x502 with physically ROUNDED corners (~R44). Glass
+// clips anything near the edge, and the clipping is invisible in any simulator
+// — it only shows on the device. So the inset is a foundation, not a per-screen
+// adjustment: screens that hand-place things near an edge will look fine in
+// development and be sheared in a child's hand.
+//
+// Two mechanisms, deliberately both:
+//   1. clip_corner on the screen root, so anything that does reach the edge is
+//      clipped to a clean radius instead of bleeding raggedly off the curve.
+//   2. a SAFE CONTAINER inset RR_SAFE_INSET on all sides. Screens add
+//      corner/edge content to this container and simply align to its edges —
+//      no magic offsets to get wrong.
+//
+// The CENTRE is unobstructed, so hero content (avatar, QR, countdown ring) is
+// added to the screen ROOT and may exceed the safe box. That is the whole
+// point of separating the two: inset the corners, not the middle.
+// ═════════════════════════════════════════════════════════════════════════════
+
+static lv_obj_t *s_safe;
+
+lv_obj_t *rr_ui_begin_screen(lv_color_t bg)
+{
+    lv_obj_clean(s_screen);
+    s_safe = NULL;
+
+    lv_obj_set_style_bg_color(s_screen, bg, LV_PART_MAIN);
+    lv_obj_set_style_radius(s_screen, RR_CORNER_R, LV_PART_MAIN);
+    lv_obj_set_style_clip_corner(s_screen, true, 0);
+
+    s_safe = lv_obj_create(s_screen);
+    lv_obj_remove_style_all(s_safe);              // no bg, border, or padding
+    lv_obj_set_size(s_safe, RR_SAFE_W, RR_SAFE_H);
+    lv_obj_center(s_safe);
+    lv_obj_remove_flag(s_safe, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(s_safe, LV_OBJ_FLAG_CLICKABLE);
+    return s_safe;
+}
+
+lv_obj_t *rr_ui_screen_root(void) { return s_screen; }
+lv_obj_t *rr_ui_safe_area(void)   { return s_safe; }
 
 esp_err_t rr_ui_init(void)
 {
@@ -92,10 +137,10 @@ esp_err_t rr_ui_show_pairing_qr(const char *payload)
 
     bsp_display_lock(0);
 
-    lv_obj_clean(s_screen);
-    lv_obj_set_style_bg_color(s_screen, lv_color_white(), LV_PART_MAIN);
+    lv_obj_t *root = rr_ui_begin_screen(lv_color_white());
+    
 
-    lv_obj_t *qr = lv_qrcode_create(s_screen);
+    lv_obj_t *qr = lv_qrcode_create(root);
     lv_qrcode_set_size(qr, QR_SIZE);
     // Dark-on-light, the orientation every scanner expects. Inverting these
     // produces a symbol most phones silently refuse to decode.
@@ -110,16 +155,16 @@ esp_err_t rr_ui_show_pairing_qr(const char *payload)
         return ESP_FAIL;
     }
 
-    lv_obj_align(qr, LV_ALIGN_CENTER, 0, -20);
+    lv_obj_align(qr, LV_ALIGN_CENTER, 0, -18);
     // A white border around the symbol IS the quiet zone. Without it the QR
     // runs to the edge of its canvas and scan reliability drops sharply.
     lv_obj_set_style_border_color(qr, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_border_width(qr, 8, LV_PART_MAIN);
 
-    lv_obj_t *hint = lv_label_create(s_screen);
+    lv_obj_t *hint = lv_label_create(root);
     lv_label_set_text(hint, "Scan to pair");
     lv_obj_set_style_text_color(hint, lv_color_black(), LV_PART_MAIN);
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -24);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, 0);
 
     bsp_display_unlock();
 
@@ -136,20 +181,20 @@ esp_err_t rr_ui_show_paired_status(void)
     // take the LVGL lock like any other non-LVGL-task caller.
     bsp_display_lock(0);
 
-    lv_obj_clean(s_screen);
-    lv_obj_set_style_bg_color(s_screen, lv_color_black(), LV_PART_MAIN);
+    lv_obj_t *root = rr_ui_begin_screen(lv_color_black());
+    
 
-    lv_obj_t *tick = lv_label_create(s_screen);
+    lv_obj_t *tick = lv_label_create(root);
     lv_label_set_text(tick, LV_SYMBOL_OK);
     lv_obj_set_style_text_color(tick, lv_color_hex(0x10B981), LV_PART_MAIN);
     lv_obj_align(tick, LV_ALIGN_CENTER, 0, -60);
 
-    lv_obj_t *title = lv_label_create(s_screen);
+    lv_obj_t *title = lv_label_create(root);
     lv_label_set_text(title, "Paired");
     lv_obj_set_style_text_color(title, lv_color_white(), LV_PART_MAIN);
     lv_obj_align(title, LV_ALIGN_CENTER, 0, -10);
 
-    lv_obj_t *sub = lv_label_create(s_screen);
+    lv_obj_t *sub = lv_label_create(root);
     lv_label_set_text(sub, "Routines synced");
     lv_obj_set_style_text_color(sub, lv_color_hex(0x8E8E93), LV_PART_MAIN);
     lv_obj_align(sub, LV_ALIGN_CENTER, 0, 24);
@@ -165,10 +210,10 @@ esp_err_t rr_ui_show_waiting_status(void)
 {
     bsp_display_lock(0);
 
-    lv_obj_clean(s_screen);
-    lv_obj_set_style_bg_color(s_screen, lv_color_black(), LV_PART_MAIN);
+    lv_obj_t *root = rr_ui_begin_screen(lv_color_black());
+    
 
-    lv_obj_t *l = lv_label_create(s_screen);
+    lv_obj_t *l = lv_label_create(root);
     lv_label_set_text(l, "Paired\nwaiting for routines");
     lv_obj_set_style_text_color(l, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
@@ -189,23 +234,23 @@ static bool s_reset_prompt_active;
 esp_err_t rr_ui_show_reset_countdown(int seconds_remaining)
 {
     bsp_display_lock(0);
-    lv_obj_clean(s_screen);
-    lv_obj_set_style_bg_color(s_screen, lv_color_hex(0x7F1D1D), LV_PART_MAIN);
+    lv_obj_t *root = rr_ui_begin_screen(lv_color_hex(0x7F1D1D));
+    
 
-    lv_obj_t *t = lv_label_create(s_screen);
+    lv_obj_t *t = lv_label_create(root);
     lv_label_set_text(t, "Factory reset");
     lv_obj_set_style_text_color(t, lv_color_white(), LV_PART_MAIN);
     lv_obj_align(t, LV_ALIGN_CENTER, 0, -70);
 
     char buf[8];
     snprintf(buf, sizeof(buf), "%d", seconds_remaining);
-    lv_obj_t *n = lv_label_create(s_screen);
+    lv_obj_t *n = lv_label_create(root);
     lv_label_set_text(n, buf);
     lv_obj_set_style_text_color(n, lv_color_white(), LV_PART_MAIN);
     lv_obj_set_style_text_font(n, &lv_font_montserrat_28, LV_PART_MAIN);
     lv_obj_center(n);
 
-    lv_obj_t *h = lv_label_create(s_screen);
+    lv_obj_t *h = lv_label_create(root);
     lv_label_set_text(h, "Release to cancel");
     lv_obj_set_style_text_color(h, lv_color_hex(0xFCA5A5), LV_PART_MAIN);
     lv_obj_align(h, LV_ALIGN_CENTER, 0, 70);
@@ -262,17 +307,17 @@ static bool to_lv_path(const char *posix_path, char *out, size_t cap)
 esp_err_t rr_ui_font_selftest(void)
 {
     bsp_display_lock(0);
-    lv_obj_clean(s_screen);
-    lv_obj_set_style_bg_color(s_screen, RR_BG, LV_PART_MAIN);
+    lv_obj_t *root = rr_ui_begin_screen(RR_BG);
+    
 
     // The gate: Greek and Latin in the SAME font, both legible, no boxes.
-    lv_obj_t *el = lv_label_create(s_screen);
+    lv_obj_t *el = lv_label_create(root);
     lv_label_set_text(el, "Πρωινή ρουτίνα");
     lv_obj_set_style_text_font(el, &rr_font_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(el, RR_TEXT, LV_PART_MAIN);
     lv_obj_align(el, LV_ALIGN_CENTER, 0, -60);
 
-    lv_obj_t *en = lv_label_create(s_screen);
+    lv_obj_t *en = lv_label_create(root);
     lv_label_set_text(en, "Morning routine");
     lv_obj_set_style_text_font(en, &rr_font_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(en, RR_ACCENT, LV_PART_MAIN);
@@ -280,7 +325,7 @@ esp_err_t rr_ui_font_selftest(void)
 
     // Mixed in one string — the real case, since a bilingual family's routine
     // names and step labels are not guaranteed to be single-script.
-    lv_obj_t *mix = lv_label_create(s_screen);
+    lv_obj_t *mix = lv_label_create(root);
     lv_label_set_text(mix, "Βούρτσισμα · brush · 1/3");
     lv_obj_set_style_text_font(mix, &rr_font_20, LV_PART_MAIN);
     lv_obj_set_style_text_color(mix, RR_MUTED, LV_PART_MAIN);
@@ -318,56 +363,56 @@ esp_err_t rr_ui_show_step(const rr_step_view_t *v,
     if (v == NULL) return ESP_ERR_INVALID_ARG;
 
     bsp_display_lock(0);
-    lv_obj_clean(s_screen);
+    lv_obj_t *root = rr_ui_begin_screen(RR_BG);
     s_arc = NULL;
     s_mmss = NULL;
-    lv_obj_set_style_bg_color(s_screen, RR_BG, LV_PART_MAIN);
+    
 
     const bool timed = v->time_limit_s > 0;
 
     // ── position "1 / 3" ────────────────────────────────────────────────────
     char pos[24];
     snprintf(pos, sizeof(pos), "%d / %d", v->position + 1, v->step_count);
-    lv_obj_t *lpos = lv_label_create(s_screen);
+    lv_obj_t *lpos = lv_label_create(root);
     lv_label_set_text(lpos, pos);
     lv_obj_set_style_text_font(lpos, &rr_font_20, LV_PART_MAIN);
     lv_obj_set_style_text_color(lpos, RR_MUTED, LV_PART_MAIN);
-    lv_obj_align(lpos, LV_ALIGN_TOP_MID, 0, 12);
+    lv_obj_align(lpos, LV_ALIGN_TOP_MID, 0, 0);
 
     // ── emoji, 96px, streamed from littlefs ─────────────────────────────────
     char lvpath[96];
     const char *posix_path = rr_emoji_path(v->emoji);
     bool drew_emoji = false;
     if (posix_path != NULL && to_lv_path(posix_path, lvpath, sizeof(lvpath))) {
-        lv_obj_t *img = lv_image_create(s_screen);
+        lv_obj_t *img = lv_image_create(root);
         lv_image_set_src(img, lvpath);
-        lv_obj_align(img, LV_ALIGN_TOP_MID, 0, 40);
+        lv_obj_align(img, LV_ALIGN_TOP_MID, 0, 34);
         drew_emoji = true;
     } else {
-        lv_obj_t *dot = lv_obj_create(s_screen);
+        lv_obj_t *dot = lv_obj_create(root);
         lv_obj_set_size(dot, 96, 96);
         lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
         lv_obj_set_style_bg_color(dot, RR_SURFACE, LV_PART_MAIN);
         lv_obj_set_style_border_width(dot, 0, LV_PART_MAIN);
-        lv_obj_align(dot, LV_ALIGN_TOP_MID, 0, 40);
+        lv_obj_align(dot, LV_ALIGN_TOP_MID, 0, 34);
         ESP_LOGW(TAG, "emoji '%s' unmapped — fallback dot", v->emoji);
     }
 
     // ── step label ──────────────────────────────────────────────────────────
-    lv_obj_t *llabel = lv_label_create(s_screen);
+    lv_obj_t *llabel = lv_label_create(root);
     lv_label_set_long_mode(llabel, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(llabel, 370);
+    lv_obj_set_width(llabel, RR_SAFE_W);
     lv_label_set_text(llabel, v->label);
     lv_obj_set_style_text_font(llabel, &rr_font_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(llabel, RR_TEXT, LV_PART_MAIN);
     lv_obj_set_style_text_align(llabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(llabel, LV_ALIGN_TOP_MID, 0, 148);
+    lv_obj_align(llabel, LV_ALIGN_TOP_MID, 0, 140);
 
     // ── countdown ring — only for TIMED steps ───────────────────────────────
     // §8 screen 3: an untimed step has no ring at all. Showing an empty or
     // full ring that never moves would imply a timer that is broken.
     if (timed) {
-        s_arc = lv_arc_create(s_screen);
+        s_arc = lv_arc_create(root);
         lv_obj_set_size(s_arc, 150, 150);
         lv_arc_set_rotation(s_arc, 270);
         lv_arc_set_bg_angles(s_arc, 0, 360);
@@ -379,11 +424,11 @@ esp_err_t rr_ui_show_step(const rr_step_view_t *v,
         lv_obj_set_style_arc_width(s_arc, 12, LV_PART_INDICATOR);
         lv_obj_set_style_arc_color(s_arc, RR_SURFACE, LV_PART_MAIN);
         lv_obj_set_style_arc_color(s_arc, RR_ACCENT, LV_PART_INDICATOR);
-        lv_obj_align(s_arc, LV_ALIGN_TOP_MID, 0, 240);
+        lv_obj_align(s_arc, LV_ALIGN_TOP_MID, 0, 224);
 
         char buf[16];
         mmss_str(v->time_limit_s, buf, sizeof(buf));
-        s_mmss = lv_label_create(s_screen);
+        s_mmss = lv_label_create(root);
         lv_label_set_text(s_mmss, buf);
         lv_obj_set_style_text_font(s_mmss, &rr_font_28, LV_PART_MAIN);
         lv_obj_set_style_text_color(s_mmss, RR_TEXT, LV_PART_MAIN);
@@ -391,9 +436,9 @@ esp_err_t rr_ui_show_step(const rr_step_view_t *v,
     }
 
     // ── Done: the primary action, deliberately the biggest thing on screen ──
-    lv_obj_t *bdone = lv_button_create(s_screen);
-    lv_obj_set_size(bdone, 300, 68);
-    lv_obj_align(bdone, LV_ALIGN_BOTTOM_MID, 0, -62);
+    lv_obj_t *bdone = lv_button_create(root);
+    lv_obj_set_size(bdone, RR_SAFE_W, 68);
+    lv_obj_align(bdone, LV_ALIGN_BOTTOM_MID, 0, -48);
     lv_obj_set_style_bg_color(bdone, RR_ACCENT, LV_PART_MAIN);
     lv_obj_set_style_radius(bdone, 34, LV_PART_MAIN);
     lv_obj_add_event_cb(bdone, done_event_cb, LV_EVENT_CLICKED, (void *) on_done);
@@ -404,9 +449,9 @@ esp_err_t rr_ui_show_step(const rr_step_view_t *v,
     lv_obj_center(ldone);
 
     // ── Skip: present but visually quiet, so it is not the obvious tap ──────
-    lv_obj_t *bskip = lv_button_create(s_screen);
+    lv_obj_t *bskip = lv_button_create(root);
     lv_obj_set_size(bskip, 140, 40);
-    lv_obj_align(bskip, LV_ALIGN_BOTTOM_MID, 0, -14);
+    lv_obj_align(bskip, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(bskip, RR_BG, LV_PART_MAIN);
     lv_obj_set_style_border_width(bskip, 1, LV_PART_MAIN);
     lv_obj_set_style_border_color(bskip, RR_MUTED, LV_PART_MAIN);
@@ -455,12 +500,12 @@ void rr_ui_set_countdown(int remaining_s, int total_s)
 esp_err_t rr_ui_show_routine_complete(const char *routine_name, int done, int skipped)
 {
     bsp_display_lock(0);
-    lv_obj_clean(s_screen);
+    lv_obj_t *root = rr_ui_begin_screen(RR_BG);
     s_arc = NULL;
     s_mmss = NULL;
-    lv_obj_set_style_bg_color(s_screen, RR_BG, LV_PART_MAIN);
+    
 
-    lv_obj_t *tick = lv_label_create(s_screen);
+    lv_obj_t *tick = lv_label_create(root);
     lv_label_set_text(tick, LV_SYMBOL_OK);
     lv_obj_set_style_text_font(tick, &rr_font_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(tick, RR_SUCCESS, LV_PART_MAIN);
@@ -469,15 +514,15 @@ esp_err_t rr_ui_show_routine_complete(const char *routine_name, int done, int sk
     // Greek, because the cached routine is Greek and this proves the font on a
     // second screen. child.language is not cached yet (Phase 5), so this is
     // not yet locale-driven — noted in rr_routine.h.
-    lv_obj_t *big = lv_label_create(s_screen);
+    lv_obj_t *big = lv_label_create(root);
     lv_label_set_text(big, "Τέλος!");
     lv_obj_set_style_text_font(big, &rr_font_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(big, RR_TEXT, LV_PART_MAIN);
     lv_obj_align(big, LV_ALIGN_CENTER, 0, -50);
 
-    lv_obj_t *name = lv_label_create(s_screen);
+    lv_obj_t *name = lv_label_create(root);
     lv_label_set_long_mode(name, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(name, 360);
+    lv_obj_set_width(name, RR_SAFE_W);
     lv_label_set_text(name, routine_name ? routine_name : "");
     lv_obj_set_style_text_font(name, &rr_font_20, LV_PART_MAIN);
     lv_obj_set_style_text_color(name, RR_MUTED, LV_PART_MAIN);
@@ -486,7 +531,7 @@ esp_err_t rr_ui_show_routine_complete(const char *routine_name, int done, int sk
 
     char summary[48];
     snprintf(summary, sizeof(summary), "%d done  ·  %d skipped", done, skipped);
-    lv_obj_t *sum = lv_label_create(s_screen);
+    lv_obj_t *sum = lv_label_create(root);
     lv_label_set_text(sum, summary);
     lv_obj_set_style_text_font(sum, &rr_font_20, LV_PART_MAIN);
     lv_obj_set_style_text_color(sum, RR_MUTED, LV_PART_MAIN);
@@ -518,6 +563,9 @@ static const char *MONTH_EN[12] = { "Jan", "Feb", "Mar", "Apr", "May", "Jun",
                                     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
 static const char *MONTH_EL[12] = { "Ιαν", "Φεβ", "Μαρ", "Απρ", "Μαΐ", "Ιουν",
                                     "Ιουλ", "Αυγ", "Σεπ", "Οκτ", "Νοε", "Δεκ" };
+// Short forms for the corner block — a full "Παρασκευή" would crowd the avatar.
+static const char *WEEKDAY_EN_SHORT[7] = { "MON","TUE","WED","THU","FRI","SAT","SUN" };
+static const char *WEEKDAY_EL_SHORT[7] = { "ΔΕΥ","ΤΡΙ","ΤΕΤ","ΠΕΜ","ΠΑΡ","ΣΑΒ","ΚΥΡ" };
 
 // ISO weekday (1=Mon..7=Sun) from a civil date — Sakamoto's method.
 int rr_ui_iso_weekday(int y, int m, int d)
@@ -528,108 +576,144 @@ int rr_ui_iso_weekday(int y, int m, int d)
     return dow == 0 ? 7 : dow;
 }
 
+// avatar_id -> hero image. The child record stores an ID ('lion'), not an
+// emoji, so the mapping lives here rather than going through the step-emoji
+// manifest (which does not contain the avatar set at all).
+static const struct { const char *id; const char *file; } AVATAR_FILES[] = {
+    { "lion",   "1f981" }, { "fox",    "1f98a" }, { "bear", "1f43b" },
+    { "rabbit", "1f430" }, { "panda",  "1f43c" }, { "owl",  "1f989" },
+};
+
+static bool avatar_lv_path(const char *avatar_id, char *out, size_t cap)
+{
+    if (avatar_id == NULL || avatar_id[0] == '\0') return false;
+    for (size_t i = 0; i < sizeof(AVATAR_FILES) / sizeof(AVATAR_FILES[0]); i++) {
+        if (strcmp(avatar_id, AVATAR_FILES[i].id) == 0) {
+            int n = snprintf(out, cap, "%c:/lfs/avatars/%s.bin",
+                             (char) CONFIG_LV_FS_POSIX_LETTER, AVATAR_FILES[i].file);
+            return n > 0 && (size_t) n < cap;
+        }
+    }
+    return false;
+}
+
 esp_err_t rr_ui_show_watchface(const rr_watchface_t *w)
 {
     if (w == NULL) return ESP_ERR_INVALID_ARG;
 
     bsp_display_lock(0);
-    lv_obj_clean(s_screen);
+    lv_obj_t *root = rr_ui_begin_screen(lv_color_black());
     s_arc = NULL;
     s_mmss = NULL;
-    lv_obj_set_style_bg_color(s_screen, RR_BG, LV_PART_MAIN);
+    // Pure black, not the app's #0D1117: on AMOLED an unlit pixel draws nothing,
+    // and this screen is mostly background. The avatar supplies the colour.
+    
 
     const bool el = (w->language[0] == 'e' && w->language[1] == 'l');
     const int wd = rr_ui_iso_weekday(w->year, w->month, w->day);
 
-    // ── time: the watch is a watch first (§9B.1) ────────────────────────────
-    char hhmm[8];
-    snprintf(hhmm, sizeof(hhmm), "%02d:%02d", w->hour, w->minute);
-    lv_obj_t *ltime = lv_label_create(s_screen);
-    lv_label_set_text(ltime, hhmm);
-    lv_obj_set_style_text_font(ltime, &rr_font_36, LV_PART_MAIN);
-    lv_obj_set_style_text_color(ltime, RR_TEXT, LV_PART_MAIN);
-    lv_obj_align(ltime, LV_ALIGN_TOP_MID, 0, 96);
+    // ── top-LEFT: battery ───────────────────────────────────────────────────
+    // Tertiary grey normally — it is ambient information, not something a child
+    // should be reading. Red ONLY when low: the one case where an alert beats
+    // the palette's data-colour rule, because a dead watch fails silently.
+    if (w->batt_valid) {
+        char b[24];
+        snprintf(b, sizeof(b), "%s%d%%", w->charging ? LV_SYMBOL_CHARGE : "", w->batt_percent);
+        lv_obj_t *lb = lv_label_create(root);
+        lv_label_set_text(lb, b);
+        lv_obj_set_style_text_font(lb, &rr_font_20, LV_PART_MAIN);
+        lv_obj_set_style_text_color(lb,
+            (w->batt_percent < RR_BATT_LOW_PCT && !w->charging) ? RR_DANGER : RR_MUTED,
+            LV_PART_MAIN);
+        lv_obj_align(lb, LV_ALIGN_TOP_LEFT, 0, 0);
+    }
 
-    // ── date, localized from the child's cached language ────────────────────
-    char date[64];
-    snprintf(date, sizeof(date), "%s %d %s",
-             el ? WEEKDAY_EL[wd - 1] : WEEKDAY_EN[wd - 1],
-             w->day,
-             el ? MONTH_EL[w->month - 1] : MONTH_EN[w->month - 1]);
-    lv_obj_t *ldate = lv_label_create(s_screen);
+    // ── top-RIGHT: date over time, right-aligned so they form one block ─────
+    char date[48];
+    snprintf(date, sizeof(date), "%s %d",
+             el ? WEEKDAY_EL_SHORT[wd - 1] : WEEKDAY_EN_SHORT[wd - 1], w->day);
+    lv_obj_t *ldate = lv_label_create(root);
     lv_label_set_text(ldate, date);
     lv_obj_set_style_text_font(ldate, &rr_font_20, LV_PART_MAIN);
     lv_obj_set_style_text_color(ldate, RR_MUTED, LV_PART_MAIN);
-    lv_obj_align(ldate, LV_ALIGN_TOP_MID, 0, 156);
+    lv_obj_align(ldate, LV_ALIGN_TOP_RIGHT, 0, 0);
 
-    // ── steps: the SLOT, with a placeholder value ───────────────────────────
-    // Phase 9 owns the pedometer. Showing a real-looking number now would be
-    // a lie the child would believe, so it reads "—" until it is real.
-    lv_obj_t *lsteps = lv_label_create(s_screen);
-    if (w->steps_valid) {
-        char sbuf[32];
-        snprintf(sbuf, sizeof(sbuf), "%d", w->steps_today);
-        lv_label_set_text(lsteps, sbuf);
+    char hhmm[8];
+    snprintf(hhmm, sizeof(hhmm), "%02d:%02d", w->hour, w->minute);
+    lv_obj_t *ltime = lv_label_create(root);
+    lv_label_set_text(ltime, hhmm);
+    lv_obj_set_style_text_font(ltime, &rr_font_28, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ltime, RR_TEXT, LV_PART_MAIN);
+    lv_obj_align(ltime, LV_ALIGN_TOP_RIGHT, 0, 26);
+
+    // ── THE HERO: the child's avatar, filling the lower two-thirds ──────────
+    char apath[80];
+    bool drew_avatar = false;
+    if (avatar_lv_path(w->avatar_id, apath, sizeof(apath))) {
+        // Screen root, not the safe container: the centre is unobstructed, so
+        // the hero is allowed to be larger than the safe box.
+        lv_obj_t *av = lv_image_create(rr_ui_screen_root());
+        lv_image_set_src(av, apath);
+        lv_obj_align(av, LV_ALIGN_CENTER, 0, 24);
+        drew_avatar = true;
     } else {
-        lv_label_set_text(lsteps, "—");
+        // No avatar yet (never pushed, or an unknown id). Say so quietly
+        // rather than leaving a void the size of the screen.
+        lv_obj_t *ph = lv_label_create(root);
+        lv_label_set_text(ph, LV_SYMBOL_IMAGE);
+        lv_obj_set_style_text_font(ph, &rr_font_36, LV_PART_MAIN);
+        lv_obj_set_style_text_color(ph, RR_SURFACE, LV_PART_MAIN);
+        lv_obj_align(ph, LV_ALIGN_CENTER, 0, 26);
+        ESP_LOGW(TAG, "no hero avatar for id '%s'", w->avatar_id);
     }
-    lv_obj_set_style_text_font(lsteps, &rr_font_28, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lsteps, RR_ACCENT, LV_PART_MAIN);   // data = orange
-    lv_obj_align(lsteps, LV_ALIGN_TOP_MID, -34, 216);
 
-    lv_obj_t *lsteplbl = lv_label_create(s_screen);
-    lv_label_set_text(lsteplbl, el ? "βήματα" : "steps");
-    lv_obj_set_style_text_font(lsteplbl, &rr_font_20, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lsteplbl, RR_MUTED, LV_PART_MAIN);
-    lv_obj_align(lsteplbl, LV_ALIGN_TOP_MID, 34, 224);
-
-    // ── next routine, or an all-done state ──────────────────────────────────
+    // ── bottom: next routine, deliberately quiet ────────────────────────────
+    // A thin line under the avatar. It matters, but it must not compete with
+    // the character for attention.
     char hint[96];
     if (w->next.found) {
-        snprintf(hint, sizeof(hint), "%s %02d:%02d  %s",
-                 el ? "Επόμενο:" : "Next:",
-                 w->next.hour, w->next.minute, w->next.routine_name);
+        snprintf(hint, sizeof(hint), "%02d:%02d  %s", w->next.hour, w->next.minute,
+                 w->next.routine_name);
     } else {
-        snprintf(hint, sizeof(hint), "%s", el ? "Όλα έτοιμα ✓" : "All done ✓");
+        snprintf(hint, sizeof(hint), "%s", el ? "Όλα έτοιμα" : "All done");
     }
-    lv_obj_t *lnext = lv_label_create(s_screen);
-    lv_label_set_long_mode(lnext, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(lnext, 370);
+    lv_obj_t *lnext = lv_label_create(root);
+    lv_label_set_long_mode(lnext, LV_LABEL_LONG_DOT);
+    lv_obj_set_width(lnext, RR_SAFE_W);
     lv_label_set_text(lnext, hint);
     lv_obj_set_style_text_font(lnext, &rr_font_20, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lnext, w->next.found ? RR_TEXT : RR_SUCCESS, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lnext, w->next.found ? RR_MUTED : RR_SUCCESS, LV_PART_MAIN);
     lv_obj_set_style_text_align(lnext, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(lnext, LV_ALIGN_TOP_MID, 0, 286);
+    lv_obj_align(lnext, LV_ALIGN_BOTTOM_MID, 0, -28);
 
-    // ── XP / level, deliberately subtle (§9B.1 "optional") ──────────────────
-    if (w->level > 0) {
-        char xp[32];
-        snprintf(xp, sizeof(xp), "L%d", w->level);
-        lv_obj_t *lxp = lv_label_create(s_screen);
-        lv_label_set_text(lxp, xp);
-        lv_obj_set_style_text_font(lxp, &rr_font_20, LV_PART_MAIN);
-        lv_obj_set_style_text_color(lxp, RR_MUTED, LV_PART_MAIN);
-        lv_obj_align(lxp, LV_ALIGN_BOTTOM_MID, 0, -26);
-    }
+    // ── steps: the slot, still a placeholder until Phase 9 ──────────────────
+    char sline[32];
+    if (w->steps_valid) snprintf(sline, sizeof(sline), "%d %s", w->steps_today, el ? "βήματα" : "steps");
+    else                snprintf(sline, sizeof(sline), "—  %s", el ? "βήματα" : "steps");
+    lv_obj_t *lst = lv_label_create(root);
+    lv_label_set_text(lst, sline);
+    lv_obj_set_style_text_font(lst, &rr_font_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lst, RR_MUTED, LV_PART_MAIN);
+    lv_obj_align(lst, LV_ALIGN_BOTTOM_MID, 0, 0);
 
-    // A queued-but-unsynced marker: the child completed routines the parent
-    // has not seen yet. Small, but it makes an invisible state visible.
+    // Unsynced completions — small, top-centre, only when non-zero.
     if (w->queued_runs > 0) {
-        char q[32];
+        char q[24];
         snprintf(q, sizeof(q), LV_SYMBOL_UPLOAD " %d", w->queued_runs);
-        lv_obj_t *lq = lv_label_create(s_screen);
+        lv_obj_t *lq = lv_label_create(root);
         lv_label_set_text(lq, q);
         lv_obj_set_style_text_font(lq, &rr_font_20, LV_PART_MAIN);
-        lv_obj_set_style_text_color(lq, RR_MUTED, LV_PART_MAIN);
-        lv_obj_align(lq, LV_ALIGN_TOP_RIGHT, -18, 18);
+        lv_obj_set_style_text_color(lq, RR_ACCENT, LV_PART_MAIN);
+        lv_obj_align(lq, LV_ALIGN_TOP_MID, 0, 0);
     }
 
     bsp_display_unlock();
 
     s_last_screen = RR_SCREEN_WATCHFACE;
-    ESP_LOGI(TAG, "watchface: %s  %s  next=%s  steps=%s",
-             hhmm, date, w->next.found ? w->next.routine_name : "(none)",
-             w->steps_valid ? "real" : "placeholder");
+    ESP_LOGI(TAG, "watchface: %s %s | avatar=%s(%s) | batt=%d%%%s | next=%s",
+             hhmm, date, w->avatar_id, drew_avatar ? "hero" : "MISSING",
+             w->batt_percent, w->charging ? "+" : "",
+             w->next.found ? w->next.routine_name : "(none)");
     return ESP_OK;
 }
 

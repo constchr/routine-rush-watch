@@ -594,11 +594,15 @@ static int routine_push_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    // v2: PURE ROUTINE DATA. The payload is the routines array itself — no
-    // nonce, no command. Authorisation happened earlier on this connection
-    // (RR_CONTROL nonce_auth, or a recognised paired peer).
-    if (!cJSON_IsArray(env)) {
-        ESP_LOGE(TAG, "ROUTINE_PUSH: payload must be a JSON array of routines — rejecting");
+    // v2: PURE routine DATA — never a command. Two data shapes are accepted:
+    //   [ ...routines ]                — the original document
+    //   { child: {...}, routines: [] } — the same, plus the child it belongs
+    //                                    to (§5 caches child.json too)
+    // Both are data, so this does not reopen the v2 problem of commands riding
+    // a data characteristic. rr_store does the real validation and splits the
+    // document into its two cache files.
+    if (!cJSON_IsArray(env) && !cJSON_IsObject(env)) {
+        ESP_LOGE(TAG, "ROUTINE_PUSH: payload must be a routines array or {child,routines} — rejecting");
         cJSON_Delete(env);
         rx_reset();
         return BLE_ATT_ERR_UNLIKELY;

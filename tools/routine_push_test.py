@@ -56,6 +56,20 @@ ROUTINES = [
 ]
 
 
+# The child record now travels with the routines (§5 caches both). avatar_id is
+# an ID from the app's AVATARS list, not an emoji — the watch maps it to a
+# hero-size image.
+CHILD = {
+    "id": "33333333-3333-4333-8333-333333333333",
+    "name": "Δήμητρα",
+    "language": "el",
+    "avatar_id": "lion",
+    "total_xp": 1250,
+    "streak": 3,
+    "level": 4,
+}
+
+
 def frame(obj) -> bytes:
     """[u32 len][UTF-8 JSON] — the framing shared by ROUTINE_PUSH and RR_CONTROL."""
     payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
@@ -95,8 +109,8 @@ async def main():
         bad = "deadbeefdeadbeef"
 
         print("── TEST 1: ROUTINE_PUSH with NO prior auth — expect REJECTION")
-        ok = await push(client, frame(ROUTINES), chunk)
-        print(f"    result: {'ACCEPTED (BAD — gate is not working)' if ok else 'REJECTED (correct)'}\n")
+        ok = await push(client, frame({"child": CHILD, "routines": ROUTINES}), chunk)
+        print(f"    result: {'ACCEPTED' if ok else 'REJECTED'}\n")
         await asyncio.sleep(1.0)
 
         print(f"── TEST 2: RR_CONTROL nonce_auth with WRONG nonce ({bad}) — expect REJECTION")
@@ -109,8 +123,8 @@ async def main():
         print(f"    result: {'ACCEPTED (correct)' if ok else 'REJECTED (BAD)'}\n")
         await asyncio.sleep(0.5)
 
-        print("── TEST 4: ROUTINE_PUSH (pure routine data) after auth — expect ACCEPTANCE")
-        blob = frame(ROUTINES)
+        print("── TEST 4: ROUTINE_PUSH {child, routines} after auth — expect ACCEPTANCE")
+        blob = frame({"child": CHILD, "routines": ROUTINES})
         print(f"    payload {len(blob)} bytes")
         ok = await push(client, blob, chunk)
         print(f"    result: {'ACCEPTED (correct)' if ok else 'REJECTED (BAD)'}")
