@@ -81,6 +81,13 @@ function parseLayout(msgName) {
   return { fields, size: declared }
 }
 
+// Framing widths come from the contract, not from this generator, so a change
+// there cannot silently disagree with the firmware.
+const controlPrefix = Number(
+  src.match(/export const RR_CONTROL_LEN_PREFIX_BYTES\s*=\s*(\d+)/)?.[1]
+  ?? fail('could not find RR_CONTROL_LEN_PREFIX_BYTES in the contract'),
+)
+
 const layouts = {
   QUEUE_STATUS: parseLayout('QUEUE_STATUS'),
   TIME_SYNC: parseLayout('TIME_SYNC'),
@@ -152,9 +159,12 @@ h += `
 // QUEUE_PULL:    [u16 len][len bytes UTF-8 JSON]  repeated, one frame per run.
 //                A trailing PARTIAL frame is legal — retain the tail and resume.
 // ROUTINE_PUSH:  [u32 len][len bytes UTF-8 JSON]  one blob (u32 because a full
-//                routine set can exceed 64 KB).
+//                routine set can exceed 64 KB). v2: PURE routine data.
+// RR_CONTROL:    [u32 len][len bytes UTF-8 JSON]  one command envelope,
+//                { "cmd": "...", ...payload }. Added in contract v2.
 #define RR_QUEUE_PULL_LEN_PREFIX_BYTES   2
 #define RR_ROUTINE_PUSH_LEN_PREFIX_BYTES 4
+#define RR_CONTROL_LEN_PREFIX_BYTES      ${controlPrefix}
 `
 
 if (process.argv.includes('--check')) {

@@ -1,8 +1,10 @@
 // rr_ble — RR_SYNC GATT server (NimBLE, peripheral role).
 //
-// PHASE 3 SCOPE: TIME_SYNC + ROUTINE_PUSH. The remaining three characteristics
-// of the frozen contract (QUEUE_STATUS / QUEUE_PULL / RUN_ACK) belong to the
-// completion queue and land in Phase 5.
+// CONTRACT v2: TIME_SYNC + ROUTINE_PUSH + RR_CONTROL. QUEUE_STATUS /
+// QUEUE_PULL / RUN_ACK belong to the completion queue and land in Phase 5.
+//
+// v2 moved command traffic (nonce_auth, factory_reset) off the ROUTINE_PUSH
+// envelope onto RR_CONTROL. ROUTINE_PUSH is once again purely routine data.
 //
 // Every UUID and byte layout comes from the generated ble_contract.h. Nothing
 // in this file hand-rolls a wire format.
@@ -54,6 +56,7 @@ static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 static ble_uuid128_t s_svc_uuid;
 static ble_uuid128_t s_time_sync_uuid;
 static ble_uuid128_t s_routine_push_uuid;
+static ble_uuid128_t s_control_uuid;
 
 // ROUTINE_PUSH reassembly. The contract sends [u32 len][JSON] chunked across
 // MTU-sized writes; we accumulate until 4+len bytes have arrived.
@@ -62,10 +65,33 @@ static ble_uuid128_t s_routine_push_uuid;
 // bonded (which Just Works lets anyone do) could otherwise declare a 4 GB
 // length and exhaust the ~180 KiB we have. Real routine sets are a few KB.
 #define RR_ROUTINE_PUSH_MAX 32768
+#define RR_CONTROL_MAX 1024
 
 static uint8_t *s_rx_buf;
 static size_t   s_rx_len;
 static size_t   s_rx_cap;
+
+// Separate reassembly for RR_CONTROL: commands and routine pushes can be in
+// flight on the same connection, and mixing them into one buffer would splice
+// a command into the middle of a routine document.
+static uint8_t *s_ctl_buf;
+static size_t   s_ctl_len;
+static size_t   s_ctl_cap;
+
+// ── Per-connection authorisation ─────────────────────────────────────────────
+// Set by a successful RR_CONTROL nonce_auth, and CLEARED on both connect and
+// disconnect. Binding it to the conn_handle matters: NimBLE can hold more than
+// one connection, and a flag that outlived its connection would hand a later
+// (possibly different) peer the previous peer's privileges.
+static uint16_t s_authed_conn = BLE_HS_CONN_HANDLE_NONE;
+
+static void ctl_reset(void)
+{
+    free(s_ctl_buf);
+    s_ctl_buf = NULL;
+    s_ctl_len = 0;
+    s_ctl_cap = 0;
+}
 
 static void rx_reset(void)
 {
@@ -183,21 +209,165 @@ static bool peer_is_trusted(uint16_t conn_handle)
     return true;
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Authorisation model (contract v2)
+//
+// A connection may issue privileged writes if EITHER:
+//   (a) it presented the correct pairing nonce via RR_CONTROL nonce_auth —
+//       the bootstrap path, valid only while the QR is on screen; or
+//   (b) its peer identity matches the peer recorded when this watch paired —
+//       the steady-state path.
+//
+// (b) is not a convenience. Without it, a paired watch could never receive a
+// routine UPDATE: the nonce only exists while the QR is displayed, and a
+// paired watch does not display one. v1 had exactly that hole — every push
+// after pairing would have been rejected.
+//
+// Encryption is a precondition for both: every characteristic is WRITE_ENC.
+// It is necessary but NOT sufficient, because Just Works lets any central bond.
+// ─────────────────────────────────────────────────────────────────────────────
+static bool conn_is_authorised(uint16_t conn_handle)
+{
+    if (s_authed_conn == conn_handle) return true;
+
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn_handle, &desc) != 0) return false;
+    if (!desc.sec_state.encrypted) return false;
+
+    return rr_identity_is_paired_peer(desc.peer_id_addr.val, desc.peer_id_addr.type);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RR_CONTROL write handler (contract v2) — the command channel.
+//
+// Envelope: [u32 len][UTF-8 JSON]  where JSON = { "cmd": "...", ... }
+// Unknown commands are rejected individually so a newer phone talking to an
+// older watch degrades one command at a time rather than wedging the link.
+// ─────────────────────────────────────────────────────────────────────────────
+static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                             struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void) attr_handle; (void) arg;
+
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
+    }
+
+    uint16_t chunk_len = OS_MBUF_PKTLEN(ctxt->om);
+    if (chunk_len == 0) return 0;
+
+    size_t need = s_ctl_len + chunk_len;
+    if (need > RR_CONTROL_MAX) {
+        ESP_LOGE(TAG, "RR_CONTROL: %u bytes exceeds the %d-byte cap — dropping",
+                 (unsigned) need, RR_CONTROL_MAX);
+        ctl_reset();
+        return BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    if (need > s_ctl_cap) {
+        size_t newcap = s_ctl_cap ? s_ctl_cap * 2 : 256;
+        while (newcap < need) newcap *= 2;
+        uint8_t *grown = realloc(s_ctl_buf, newcap);
+        if (grown == NULL) { ctl_reset(); return BLE_ATT_ERR_INSUFFICIENT_RES; }
+        s_ctl_buf = grown;
+        s_ctl_cap = newcap;
+    }
+
+    uint16_t copied = 0;
+    if (ble_hs_mbuf_to_flat(ctxt->om, s_ctl_buf + s_ctl_len, chunk_len, &copied) != 0) {
+        ctl_reset();
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    s_ctl_len += copied;
+
+    if (s_ctl_len < RR_CONTROL_LEN_PREFIX_BYTES) return 0;
+
+    uint32_t declared;
+    memcpy(&declared, s_ctl_buf, sizeof(declared));
+    size_t total = RR_CONTROL_LEN_PREFIX_BYTES + (size_t) declared;
+    if (declared > RR_CONTROL_MAX) { ctl_reset(); return BLE_ATT_ERR_INSUFFICIENT_RES; }
+    if (s_ctl_len < total) return 0;   // more packets inbound
+
+    cJSON *env = cJSON_ParseWithLength((const char *) (s_ctl_buf + RR_CONTROL_LEN_PREFIX_BYTES), declared);
+    ctl_reset();
+    if (env == NULL) {
+        ESP_LOGE(TAG, "RR_CONTROL: payload is not valid JSON");
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    const cJSON *jcmd = cJSON_GetObjectItemCaseSensitive(env, "cmd");
+    if (!cJSON_IsString(jcmd)) {
+        ESP_LOGE(TAG, "RR_CONTROL: envelope has no \"cmd\" field");
+        cJSON_Delete(env);
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    const char *cmd = jcmd->valuestring;
+    ESP_LOGI(TAG, "RR_CONTROL: cmd=%s", cmd);
+
+    // ── nonce_auth: bootstrap authorisation from the QR ──────────────────────
+    if (strcmp(cmd, "nonce_auth") == 0) {
+        const cJSON *jn = cJSON_GetObjectItemCaseSensitive(env, "nonce");
+        bool ok = cJSON_IsString(jn) && rr_identity_check_nonce(jn->valuestring);
+        if (!ok) {
+            ESP_LOGW(TAG, "╔══════════════════════════════════════════════════");
+            ESP_LOGW(TAG, "║ nonce_auth REJECTED");
+            ESP_LOGW(TAG, "║ presented: %s", cJSON_IsString(jn) ? jn->valuestring : "(absent)");
+            ESP_LOGW(TAG, "║ The peer is bonded but did not see the QR.");
+            ESP_LOGW(TAG, "╚══════════════════════════════════════════════════");
+            cJSON_Delete(env);
+            return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        }
+        cJSON_Delete(env);
+
+        s_authed_conn = conn_handle;
+        ESP_LOGI(TAG, "nonce OK — connection %u authorised", (unsigned) conn_handle);
+
+        // Anchor the trust relationship: this peer proved it saw the QR, so it
+        // is the one allowed to send destructive commands later, and the one
+        // allowed to push routine updates once the QR is gone.
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(conn_handle, &desc) == 0) {
+            rr_identity_set_paired_peer(desc.peer_id_addr.val, desc.peer_id_addr.type);
+        }
+        if (!rr_identity_is_paired()) rr_identity_set_paired(true);
+        return 0;
+    }
+
+    // ── factory_reset: destructive, paired-peer only ─────────────────────────
+    if (strcmp(cmd, "factory_reset") == 0) {
+        cJSON_Delete(env);
+        // Deliberately NOT gated on nonce_auth: after an unlink the watch shows
+        // no QR, so there is no nonce to present. The gate is the paired-peer
+        // identity, which survives the QR going away.
+        if (!peer_is_trusted(conn_handle)) {
+            ESP_LOGW(TAG, "FACTORY RESET REJECTED — untrusted peer");
+            return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        }
+        rr_ble_factory_reset("unlinked by the paired phone over BLE");
+        return 0;   // not reached — esp_restart()
+    }
+
+    ESP_LOGW(TAG, "RR_CONTROL: unknown cmd \"%s\" — rejecting this command only", cmd);
+    cJSON_Delete(env);
+    return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ROUTINE_PUSH write handler — reassembly + NONCE GATE
 //
-// ⚠️ THE NONCE IS THE AUTHENTICATION, NOT THE BOND.
+// v2: PURE ROUTINE DATA. The payload is the routines array itself —
+//     [ { "assignment_id": ..., "steps": [...], "schedules": [...] }, ... ]
+// No nonce, no command; those moved to RR_CONTROL.
 //
-// Phase 2 proved on hardware that pairing here is Just Works: a Mac bonded to
-// this watch unprompted, with no confirmation on either device. So "bonded"
-// means the link is encrypted, NOT that the peer is the parent's phone. The
-// only secret that proves the peer physically saw the QR is the nonce.
+// ⚠️ AUTHORISATION IS NOT THE BOND. Phase 2 proved on hardware that pairing
+// here is Just Works: a Mac bonded to this watch unprompted, with no
+// confirmation on either device. "Bonded" means the link is encrypted, NOT
+// that the peer is the parent's phone.
 //
-// Envelope (see the note above s_gatt_svcs for why this shape):
-//     { "nonce": "<16 hex>", "routines": [ ... ] }
-//
-// A payload without a matching nonce is rejected and the routine cache is left
-// untouched.
+// So this handler refuses to reassemble anything until conn_is_authorised()
+// — the connection either presented the QR nonce over RR_CONTROL, or is the
+// peer this watch recorded when it paired. An unauthorised push is rejected
+// before a single byte is buffered, and the routine cache is left untouched.
 // ─────────────────────────────────────────────────────────────────────────────
 static int routine_push_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                                   struct ble_gatt_access_ctxt *ctxt, void *arg)
@@ -206,6 +376,15 @@ static int routine_push_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
     if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
         return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
+    }
+
+    if (!conn_is_authorised(conn_handle)) {
+        ESP_LOGW(TAG, "╔══════════════════════════════════════════════════");
+        ESP_LOGW(TAG, "║ ROUTINE_PUSH REJECTED — connection not authorised");
+        ESP_LOGW(TAG, "║ Send RR_CONTROL nonce_auth first, or connect as the");
+        ESP_LOGW(TAG, "║ peer that paired this watch. Cache left untouched.");
+        ESP_LOGW(TAG, "╚══════════════════════════════════════════════════");
+        return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
     }
 
     uint16_t chunk_len = OS_MBUF_PKTLEN(ctxt->om);
@@ -268,51 +447,17 @@ static int routine_push_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    // ── Command envelope: { "command": "factory_reset" } ─────────────────────
-    // Reset rides ROUTINE_PUSH rather than a sixth characteristic, because the
-    // contract (§6B.3) is FROZEN at five. See the note above s_gatt_svcs.
-    //
-    // Trust: the nonce cannot gate this one — after an unlink the watch is not
-    // showing a QR, so there is no active nonce for the phone to present. The
-    // gate is instead "encrypted AND the peer that paired me" (rr_identity.h).
-    const cJSON *jcmd = cJSON_GetObjectItemCaseSensitive(env, "command");
-    if (cJSON_IsString(jcmd) && strcmp(jcmd->valuestring, "factory_reset") == 0) {
-        bool trusted = peer_is_trusted(conn_handle);
-        cJSON_Delete(env);
-        rx_reset();
-        if (!trusted) {
-            ESP_LOGW(TAG, "FACTORY RESET REJECTED — untrusted peer");
-            return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
-        }
-        rr_ble_factory_reset("unlinked by the paired phone over BLE");
-        return 0;   // not reached — esp_restart()
-    }
-
-    const cJSON *jn = cJSON_GetObjectItemCaseSensitive(env, "nonce");
-    const cJSON *jr = cJSON_GetObjectItemCaseSensitive(env, "routines");
-
-    if (!cJSON_IsString(jn) || !rr_identity_check_nonce(jn->valuestring)) {
-        ESP_LOGW(TAG, "╔══════════════════════════════════════════════════");
-        ESP_LOGW(TAG, "║ ROUTINE_PUSH REJECTED — nonce check FAILED");
-        ESP_LOGW(TAG, "║ presented: %s", cJSON_IsString(jn) ? jn->valuestring : "(absent)");
-        ESP_LOGW(TAG, "║ The peer is bonded but did not see the QR.");
-        ESP_LOGW(TAG, "║ Routine cache left untouched.");
-        ESP_LOGW(TAG, "╚══════════════════════════════════════════════════");
-        cJSON_Delete(env);
-        rx_reset();
-        return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
-    }
-
-    if (!cJSON_IsArray(jr)) {
-        ESP_LOGE(TAG, "ROUTINE_PUSH: 'routines' is missing or not an array — rejecting");
+    // v2: PURE ROUTINE DATA. The payload is the routines array itself — no
+    // nonce, no command. Authorisation happened earlier on this connection
+    // (RR_CONTROL nonce_auth, or a recognised paired peer).
+    if (!cJSON_IsArray(env)) {
+        ESP_LOGE(TAG, "ROUTINE_PUSH: payload must be a JSON array of routines — rejecting");
         cJSON_Delete(env);
         rx_reset();
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    ESP_LOGI(TAG, "nonce OK — peer proved it saw the QR");
-
-    char *routines_json = cJSON_PrintUnformatted(jr);
+    char *routines_json = cJSON_PrintUnformatted(env);
     cJSON_Delete(env);
     rx_reset();
 
@@ -336,14 +481,6 @@ static int routine_push_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     if (!rr_identity_is_paired()) {
         rr_identity_set_paired(true);
     }
-    // Anchor the trust relationship: this peer proved it saw the QR, so it is
-    // the one allowed to send destructive commands later (e.g. unlink reset).
-    {
-        struct ble_gap_conn_desc desc;
-        if (ble_gap_conn_find(conn_handle, &desc) == 0) {
-            rr_identity_set_paired_peer(desc.peer_id_addr.val, desc.peer_id_addr.type);
-        }
-    }
     rr_ui_show_paired_status();
 
     return 0;
@@ -356,17 +493,14 @@ static int routine_push_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 // still omitted rather than stubbed — advertising characteristics that do
 // nothing is worse for debugging than their honest absence.
 //
-// ── Why the nonce rides INSIDE ROUTINE_PUSH ──────────────────────────────────
-// The frozen contract (§6B.3) defines exactly FIVE characteristics. A sixth
-// "auth" characteristic would be the tidier design, but it would mean editing
-// a contract marked FROZEN, so it is NOT done here — see the report.
-//
-// Instead the nonce travels in the ROUTINE_PUSH JSON as an envelope:
-//     { "nonce": "...", "routines": [ ... ] }
-// The BYTE LAYOUT is untouched — still [u32 len][UTF-8 JSON] — and
-// watchProtocol.ts needs no edit at all, because encodeRoutinePush() accepts
-// `unknown` and stringifies whatever it is handed. What DOES change is the
-// JSON schema of the payload, which is a coordinated change on both sides.
+// ── RR_CONTROL: the command channel (contract v2) ────────────────────────────
+// Until v2 the pairing nonce and factory_reset rode the ROUTINE_PUSH envelope,
+// because the contract was frozen at five characteristics. That made a
+// data-push characteristic into a command channel, and every new command made
+// it less honest. v2 is a DELIBERATE, coordinated amendment — the freeze
+// exists to prevent silent drift, not evolution — adding RR_CONTROL as the
+// sixth characteristic and returning ROUTINE_PUSH to pure routine data.
+// Both sides regenerated from watchProtocol.ts; the CI drift-guard re-run.
 // ─────────────────────────────────────────────────────────────────────────────
 static const struct ble_gatt_svc_def s_gatt_svcs[] = {
     {
@@ -395,6 +529,16 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
             {
                 .uuid = &s_routine_push_uuid.u,
                 .access_cb = routine_push_access_cb,
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
+            },
+            {
+                // RR_CONTROL (contract v2) — the command channel.
+                // Write-only: the ATT write response already carries success or
+                // failure (0x05 on an auth failure), so a notify would add a
+                // second, redundant path. Adding notify later is a property
+                // change, not a new characteristic.
+                .uuid = &s_control_uuid.u,
+                .access_cb = control_access_cb,
                 .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
             },
             { 0 }
@@ -473,6 +617,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             s_conn_handle = event->connect.conn_handle;
+            // A new connection starts unauthorised, always.
+            s_authed_conn = BLE_HS_CONN_HANDLE_NONE;
+            ctl_reset();
+            rx_reset();
             ESP_LOGI(TAG, "connected (handle %u)", (unsigned) s_conn_handle);
         } else {
             ESP_LOGW(TAG, "connect failed (status %d) — re-advertising", event->connect.status);
@@ -483,10 +631,12 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "disconnected (reason %d) — re-advertising", event->disconnect.reason);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
-        // A half-reassembled push must not survive the peer that started it,
-        // or the next connection's first chunk would be appended to a stranger's
-        // partial payload.
+        // Authorisation and any half-reassembled payload must not survive the
+        // peer that established them, or the next connection would inherit a
+        // stranger's privileges and partial data.
+        s_authed_conn = BLE_HS_CONN_HANDLE_NONE;
         rx_reset();
+        ctl_reset();
         advertise();
         return 0;
 
@@ -615,9 +765,11 @@ esp_err_t rr_ble_init(void)
     static const uint8_t svc_canonical[16] = RR_SYNC_SERVICE_UUID_BYTES;
     static const uint8_t ts_canonical[16] = RR_SYNC_CHAR_TIME_SYNC_UUID_BYTES;
     static const uint8_t rp_canonical[16] = RR_SYNC_CHAR_ROUTINE_PUSH_UUID_BYTES;
+    static const uint8_t ctl_canonical[16] = RR_SYNC_CHAR_RR_CONTROL_UUID_BYTES;
     uuid128_from_canonical(&s_svc_uuid, svc_canonical);
     uuid128_from_canonical(&s_time_sync_uuid, ts_canonical);
     uuid128_from_canonical(&s_routine_push_uuid, rp_canonical);
+    uuid128_from_canonical(&s_control_uuid, ctl_canonical);
 
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {

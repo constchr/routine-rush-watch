@@ -20,6 +20,7 @@ from bleak import BleakScanner, BleakClient
 
 SERVICE = "fc19364a-c250-4477-928d-28c55ac1c2bd"
 ROUTINE_PUSH = "8f0956d2-1818-4961-b6ed-a88844f40933"
+RR_CONTROL   = "73c4f178-0884-4db4-9624-ff443355763b"
 
 ROUTINES = [
     {
@@ -51,17 +52,17 @@ ROUTINES = [
 ]
 
 
-def frame(nonce: str) -> bytes:
-    payload = json.dumps({"nonce": nonce, "routines": ROUTINES},
-                         ensure_ascii=False).encode("utf-8")
+def frame(obj) -> bytes:
+    """[u32 len][UTF-8 JSON] — the framing shared by ROUTINE_PUSH and RR_CONTROL."""
+    payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
     return struct.pack("<I", len(payload)) + payload
 
 
-async def push(client, blob: bytes, chunk: int) -> bool:
+async def push(client, blob: bytes, chunk: int, char: str = ROUTINE_PUSH) -> bool:
     """Returns True if the peripheral accepted every chunk."""
     try:
         for i in range(0, len(blob), chunk):
-            await client.write_gatt_char(ROUTINE_PUSH, blob[i:i + chunk], response=True)
+            await client.write_gatt_char(char, blob[i:i + chunk], response=True)
         return True
     except Exception as e:
         print(f"    peripheral rejected the write: {type(e).__name__}: {e}")
@@ -88,19 +89,31 @@ async def main():
         print(f"connected; ATT MTU={mtu}, chunk={chunk} bytes\n")
 
         bad = "deadbeefdeadbeef"
-        print(f"── TEST 1: WRONG nonce ({bad}) — expect REJECTION")
-        blob = frame(bad)
-        print(f"    payload {len(blob)} bytes")
-        ok = await push(client, blob, chunk)
-        print(f"    result: {'ACCEPTED (BAD — gate is not working)' if ok else 'REJECTED (correct)'}\n")
 
+        print("── TEST 1: ROUTINE_PUSH with NO prior auth — expect REJECTION")
+        ok = await push(client, frame(ROUTINES), chunk)
+        print(f"    result: {'ACCEPTED (BAD — gate is not working)' if ok else 'REJECTED (correct)'}\n")
         await asyncio.sleep(1.0)
 
-        print(f"── TEST 2: CORRECT nonce ({nonce}) — expect ACCEPTANCE")
-        blob = frame(nonce)
+        print(f"── TEST 2: RR_CONTROL nonce_auth with WRONG nonce ({bad}) — expect REJECTION")
+        ok = await push(client, frame({"cmd": "nonce_auth", "nonce": bad}), chunk, RR_CONTROL)
+        print(f"    result: {'ACCEPTED (BAD)' if ok else 'REJECTED (correct)'}\n")
+        await asyncio.sleep(1.0)
+
+        print(f"── TEST 3: RR_CONTROL nonce_auth with CORRECT nonce ({nonce})")
+        ok = await push(client, frame({"cmd": "nonce_auth", "nonce": nonce}), chunk, RR_CONTROL)
+        print(f"    result: {'ACCEPTED (correct)' if ok else 'REJECTED (BAD)'}\n")
+        await asyncio.sleep(0.5)
+
+        print("── TEST 4: ROUTINE_PUSH (pure routine data) after auth — expect ACCEPTANCE")
+        blob = frame(ROUTINES)
         print(f"    payload {len(blob)} bytes")
         ok = await push(client, blob, chunk)
-        print(f"    result: {'ACCEPTED (correct)' if ok else 'REJECTED (BAD — good nonce refused)'}")
+        print(f"    result: {'ACCEPTED (correct)' if ok else 'REJECTED (BAD)'}")
+
+        print("\n── TEST 5: RR_CONTROL unknown command — expect per-command rejection")
+        ok = await push(client, frame({"cmd": "not_a_real_command"}), chunk, RR_CONTROL)
+        print(f"    result: {'ACCEPTED (BAD)' if ok else 'REJECTED (correct)'}")
 
     print("\ndone — check the watch monitor for the rejection banner and the readback")
     return 0

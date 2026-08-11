@@ -1,5 +1,13 @@
 // ─────────────────────────────────────────────────────────────
 // RR_SYNC — GATT contract for the Routine Rush watch companion
+//
+// CONTRACT VERSION 2 — re-frozen 2026-08-11.
+//   v2 adds RR_CONTROL (6th characteristic) and moves command traffic
+//   (nonce_auth, factory_reset) off the ROUTINE_PUSH envelope onto it.
+//   ROUTINE_PUSH is once again PURELY routine data.
+//   This was a deliberate, coordinated amendment — the freeze exists to
+//   prevent SILENT drift, not to prevent evolution. Both sides regenerated.
+//
 // Firmware spec §6B.3.  THIS FILE IS THE CONTRACT between two codebases:
 // the phone (TypeScript, here) and the watch firmware (C, elsewhere) implement
 // opposite ends of these exact byte layouts. Change nothing here without
@@ -38,6 +46,8 @@ export const RR_SYNC_CHARACTERISTICS = {
   ROUTINE_PUSH: '8f0956d2-1818-4961-b6ed-a88844f40933',
   /** write — fixed 4-byte epoch. */
   TIME_SYNC: '3c5a115d-61a0-4104-9883-ebe780044eb5',
+  /** write (multi-packet) — length-prefixed command envelope. v2. */
+  RR_CONTROL: '73c4f178-0884-4db4-9624-ff443355763b',
 } as const
 
 export type RrSyncCharacteristic = keyof typeof RR_SYNC_CHARACTERISTICS
@@ -288,6 +298,61 @@ export function decodeRoutinePush<T = unknown>(bytes: Uint8Array): RoutinePushDe
   const end = 4 + len
   if (end > bytes.byteLength) return null // not fully reassembled yet
   return { routines: JSON.parse(utf8Decode(bytes.subarray(4, end))) as T, bytesConsumed: end }
+}
+
+// ─────────────────────────────────────────────────────────────
+// RR_CONTROL  (write, multi-packet) — command envelope.  ADDED IN v2.
+//
+//   offset  size  field   type   notes
+//   0       4     len     u32    byte length of the JSON that follows (LE)
+//   4       len   json    utf8   { "cmd": "...", ...payload }
+//
+// Same framing as ROUTINE_PUSH (u32-prefixed JSON) so the watch reuses one
+// reassembly path, and so a command can outgrow a single ATT write later.
+// Commands today are well under 100 bytes and arrive in one packet.
+//
+// WHY THIS EXISTS: before v2, ROUTINE_PUSH carried routine data, the pairing
+// nonce AND factory_reset — a command channel wearing a data-push name. Each
+// new command made the envelope less honest. RR_CONTROL is the command
+// channel; ROUTINE_PUSH went back to being routine data.
+//
+// Commands are additive: a watch that does not recognise a `cmd` rejects that
+// one command and keeps working, so new commands do not need a version bump.
+// ─────────────────────────────────────────────────────────────
+
+export type RrControlCommand =
+  /** Present the pairing nonce from the QR. Authenticates the CONNECTION for
+   *  subsequent privileged writes (notably ROUTINE_PUSH). */
+  | { cmd: 'nonce_auth'; nonce: string }
+  /** Wipe pairing state, bonds and cache; the watch reboots to its QR. */
+  | { cmd: 'factory_reset' }
+
+export const RR_CONTROL_LEN_PREFIX_BYTES = 4
+
+export function encodeControl(command: RrControlCommand): Uint8Array {
+  const json = utf8Encode(JSON.stringify(command))
+  const out = new Uint8Array(RR_CONTROL_LEN_PREFIX_BYTES + json.byteLength)
+  view(out).setUint32(0, json.byteLength, true)
+  out.set(json, RR_CONTROL_LEN_PREFIX_BYTES)
+  return out
+}
+
+export interface ControlDecode {
+  command: RrControlCommand
+  bytesConsumed: number
+}
+
+/** Returns null if the full envelope has not arrived yet (multi-packet write). */
+export function decodeControl(bytes: Uint8Array): ControlDecode | null {
+  if (bytes.byteLength < RR_CONTROL_LEN_PREFIX_BYTES) return null
+  const len = view(bytes).getUint32(0, true)
+  const end = RR_CONTROL_LEN_PREFIX_BYTES + len
+  if (end > bytes.byteLength) return null
+  const command = JSON.parse(utf8Decode(bytes.subarray(RR_CONTROL_LEN_PREFIX_BYTES, end))) as RrControlCommand
+  if (typeof (command as { cmd?: unknown })?.cmd !== 'string') {
+    throw new TypeError('RR_CONTROL envelope has no "cmd" field')
+  }
+  return { command, bytesConsumed: end }
 }
 
 // ── UUID ↔ 16 bytes (canonical order) ────────────────────────────────────────
