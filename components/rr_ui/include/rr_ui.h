@@ -77,8 +77,15 @@ esp_err_t rr_ui_show_reset_countdown(int seconds_remaining);
 /** Restore whatever status screen was showing before the countdown. */
 esp_err_t rr_ui_restore_after_reset_prompt(void);
 
-/** Re-render the last status screen (paired / waiting / QR). */
+/** Re-render the last status screen (paired / waiting / QR / watch face). */
 esp_err_t rr_ui_show_last_status(void);
+
+/**
+ * Register how to rebuild the watch face. rr_ui cannot do it itself — the face
+ * needs the clock, battery, child record and schedule that rr_idle assembles —
+ * so restoring it after a transient screen goes through this callback.
+ */
+void rr_ui_set_watchface_repaint(void (*fn)(void));
 
 // ── Phase 4 ──────────────────────────────────────────────────────────────────
 

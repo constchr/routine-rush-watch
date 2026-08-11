@@ -13,6 +13,7 @@
 
 #include "rr_store.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -626,5 +627,42 @@ esp_err_t rr_store_get_child(rr_child_t *out)
     cJSON_Delete(j);
 
     out->valid = true;
+    return ESP_OK;
+}
+
+// ── Factory reset: every file that makes this "someone's watch" ──────────────
+//
+// rr_store_clear_routines() alone is NOT a reset. It leaves child.json (name,
+// avatar, language, level) and the queue, so a "reset" watch still carried the
+// previous child's identity and their unrelayed completions into its next
+// pairing — and the surviving avatar is what the watch face drew.
+//
+// The queue goes too, deliberately, even though §5 calls it the one
+// non-disposable thing here. That rule protects a run from being lost while
+// its watch is still the child's. A reset is the parent explicitly severing
+// that link: after it there is no paired phone authorised to receive those
+// records and no server-side pairing to attribute them to, so keeping them
+// would mean holding a child's data on a device that is no longer theirs.
+//
+// Best-effort per file: a missing file is the desired end state, not a failure.
+esp_err_t rr_store_factory_reset(void)
+{
+    if (!s_mounted) return ESP_ERR_INVALID_STATE;
+
+    static const char *const PATHS[] = {
+        ROUTINES_PATH, CHILD_PATH, RUNS_PATH, CURSOR_PATH,
+    };
+
+    for (size_t i = 0; i < sizeof(PATHS) / sizeof(PATHS[0]); i++) {
+        if (unlink(PATHS[i]) == 0) {
+            ESP_LOGW(TAG, "wiped %s", PATHS[i]);
+        } else if (errno != ENOENT) {
+            // Report it, but keep going: leaving the REMAINING files behind
+            // because one unlink failed would be strictly worse.
+            ESP_LOGE(TAG, "could not wipe %s (errno %d)", PATHS[i], errno);
+        }
+    }
+
+    ESP_LOGW(TAG, "littlefs wiped — no routines, no child, no queue");
     return ESP_OK;
 }

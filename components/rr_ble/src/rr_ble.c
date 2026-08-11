@@ -171,10 +171,16 @@ static int time_sync_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 // Factory reset — the mirror of pairing.
 //
 // Wipes everything that makes this watch "someone's watch": the paired flag,
-// the paired-peer anchor, the device_id, the BLE bonds, and the routine cache.
-// Then reboots, because a fresh device_id must be re-derived into a fresh BLE
-// address and the QR path re-entered from a clean state — far safer than
-// trying to unwind live LVGL/NimBLE state in place.
+// the paired-peer anchor, the device_id, the BLE bonds, the routine cache, the
+// cached child, and the completion queue. Then reboots, because a fresh
+// device_id must be re-derived into a fresh BLE address and the QR path
+// re-entered from a clean state — far safer than trying to unwind live
+// LVGL/NimBLE state in place.
+//
+// Store wipe FIRST, identity second: if power is lost mid-reset, a watch with
+// orphaned files but no paired flag re-pairs cleanly (the next push overwrites
+// them), whereas a watch that kept its files but lost its identity would boot
+// paired-looking with another child's data. Fail toward the QR.
 // ─────────────────────────────────────────────────────────────────────────────
 void rr_ble_factory_reset(const char *reason)
 {
@@ -182,7 +188,7 @@ void rr_ble_factory_reset(const char *reason)
     ESP_LOGW(TAG, "║ FACTORY RESET — %s", reason);
     ESP_LOGW(TAG, "╚══════════════════════════════════════════════════");
 
-    rr_store_clear_routines();
+    rr_store_factory_reset();
     rr_identity_factory_reset();
 
     // Drop every bond, so the phone that unlinked us cannot silently reconnect

@@ -24,3 +24,24 @@ bool rr_idle_is_awake(void);
  */
 void rr_idle_set_suspend_check(bool (*fn)(void));
 bool rr_idle_is_suspended(void);
+
+/**
+ * Register the predicate that decides whether the watch face may be drawn AT
+ * ALL. It must answer "is this watch genuinely paired, with a child record" —
+ * NOT "is there anything in the cache".
+ *
+ * Without it rr_idle renders the face on boot and on every wake regardless of
+ * state, which is what painted the face over the pairing QR ~1 s into a
+ * factory-reset boot. When the gate is false, rr_idle leaves whatever screen
+ * the caller put up (the QR) alone.
+ *
+ * Set this BEFORE rr_idle_init(). Absent, the gate is closed and no face is
+ * ever drawn — the safe default: a watch stuck on the QR is recoverable, a
+ * reset watch showing a stranger's face is not.
+ *
+ * rr_idle also POLLS this to notice pairing: the gate going false->true is the
+ * pairing event, and rr_idle promotes the "Paired" confirmation to the live
+ * face when it does. It is polled rather than pushed from rr_ble because
+ * rr_power already depends on rr_ble.
+ */
+void rr_idle_set_face_gate(bool (*fn)(void));

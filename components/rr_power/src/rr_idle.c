@@ -50,10 +50,17 @@ static const char *TAG = "rr_idle";
 // the child decides the watch is broken. Flagged for Phase 10.
 #define WOM_THRESHOLD 96
 
+// How long the "Paired ✓" confirmation holds before the face replaces it.
+// Long enough to read, short enough that the pairing flow ends on the face
+// rather than on a status screen the child has no use for.
+#define PAIRED_HOLD_MS 2000
+
 static bool s_awake = true;
 static int  s_shown_minute = -1;
 static bool s_enabled;
 static int64_t s_last_activity_ms;
+static int64_t s_paired_at_ms;      // 0 = no pending promote-to-face
+static bool s_gate_open;            // last observed face-gate state
 static lv_timer_t *s_idle_timer;
 
 static int64_t now_ms(void)
@@ -61,8 +68,23 @@ static int64_t now_ms(void)
     return (int64_t) xTaskGetTickCount() * portTICK_PERIOD_MS;
 }
 
-static void build_and_show_face(void)
+// ── The face gate ───────────────────────────────────────────────────────────
+// The watch face is the "this watch belongs to a child" screen. Drawing it is
+// a claim about pairing state, so it asks the owner of that state rather than
+// inferring it from whatever happens to be on flash.
+static bool (*s_face_gate)(void);
+
+static bool face_allowed(void)
 {
+    // Closed by default — see rr_idle.h on why the unset case must not render.
+    return s_face_gate != NULL && s_face_gate();
+}
+
+// Returns false when the gate refused, leaving the current screen untouched.
+static bool build_and_show_face(void)
+{
+    if (!face_allowed()) return false;
+
     rr_watchface_t w;
     memset(&w, 0, sizeof(w));
 
@@ -104,6 +126,7 @@ static void build_and_show_face(void)
 
     rr_ui_show_watchface(&w);
     s_shown_minute = w.minute;
+    return true;
 }
 
 static void go_to_sleep(void)
@@ -133,7 +156,9 @@ static void wake_up(const char *reason)
     // normal sampling mode anyway.
     rr_imu_disarm_wake_on_motion();
 
-    build_and_show_face();
+    // Unpaired: there is no face to wake to. Put back exactly what was there —
+    // the pairing QR — instead of inventing a face out of leftover cache.
+    if (!build_and_show_face()) rr_ui_show_last_status();
     bsp_display_backlight_on();
 
     ESP_LOGI(TAG, "awake (%s) — heap %u", reason, (unsigned) esp_get_free_heap_size());
@@ -174,6 +199,27 @@ static void idle_tick(lv_timer_t *t)
         indev = lv_indev_get_next(indev);
     }
 
+    // ── the gate OPENING is the pairing event ───────────────────────────────
+    // Polled here rather than pushed from rr_ble, because rr_power already
+    // depends on rr_ble and a call back the other way would be a cycle. The
+    // gate is derived state, so watching it needs no new plumbing: it goes
+    // true the moment the first authenticated push has persisted both the
+    // paired flag and the child record.
+    //
+    // Then hold the "Paired ✓" confirmation briefly before the face replaces
+    // it, so the flow ends where the child will actually use the watch.
+    const bool gate_open = face_allowed();
+    if (gate_open && !s_gate_open) {
+        s_paired_at_ms = now_ms();
+        ESP_LOGI(TAG, "pairing complete — face in %d ms", PAIRED_HOLD_MS);
+    }
+    s_gate_open = gate_open;
+
+    if (s_paired_at_ms != 0 && now_ms() - s_paired_at_ms >= PAIRED_HOLD_MS) {
+        s_paired_at_ms = 0;
+        if (build_and_show_face()) s_last_activity_ms = now_ms();
+    }
+
     if (s_awake) {
         if (now_ms() - s_last_activity_ms >= AWAKE_MS) { go_to_sleep(); return; }
 
@@ -202,12 +248,31 @@ bool rr_idle_is_suspended(void)
     return s_suspend_fn != NULL && s_suspend_fn();
 }
 
+void rr_idle_set_face_gate(bool (*fn)(void))
+{
+    s_face_gate = fn;
+}
+
+// Lets rr_ui rebuild the face after a transient screen (the reset countdown)
+// without rr_ui needing to know how a face is assembled.
+static void repaint_face(void)
+{
+    build_and_show_face();
+}
+
 esp_err_t rr_idle_init(void)
 {
     s_last_activity_ms = now_ms();
     s_awake = true;
     s_enabled = true;
+    // Seed the edge detector, so a paired boot does not read as a fresh
+    // pairing and re-promote a face that is already up.
+    s_gate_open = face_allowed();
+    rr_ui_set_watchface_repaint(repaint_face);
 
+    // NOT unconditional. app_main has already decided what this boot shows —
+    // the face for a paired watch, the pairing QR for a reset one — and the
+    // gate is what stops this call from overwriting the latter.
     build_and_show_face();
     bsp_display_backlight_on();
 

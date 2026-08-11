@@ -260,12 +260,28 @@ esp_err_t rr_ui_show_reset_countdown(int seconds_remaining)
     return ESP_OK;
 }
 
+// The face is the one screen rr_ui cannot rebuild from its own state — it
+// needs the clock, battery, child and schedule that rr_idle assembles. So
+// rr_idle hands us a repaint callback rather than rr_ui reaching across to
+// pull all of that together itself.
+static void (*s_repaint_face)(void);
+
+void rr_ui_set_watchface_repaint(void (*fn)(void))
+{
+    s_repaint_face = fn;
+}
+
 esp_err_t rr_ui_show_last_status(void)
 {
     switch (s_last_screen) {
     case RR_SCREEN_QR:      return rr_ui_show_pairing_qr(s_last_qr_payload);
     case RR_SCREEN_PAIRED:  return rr_ui_show_paired_status();
     case RR_SCREEN_WAITING: return rr_ui_show_waiting_status();
+    case RR_SCREEN_WATCHFACE:
+        // Without this an ABORTED reset hold left the red countdown on screen
+        // until the next minute tick happened to repaint it.
+        if (s_repaint_face) s_repaint_face();
+        return ESP_OK;
     default:                return ESP_OK;
     }
 }

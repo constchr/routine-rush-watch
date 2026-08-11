@@ -52,8 +52,19 @@ esp_err_t rr_store_has_routines(void);
  */
 esp_err_t rr_store_log_routines(void);
 
-/** Delete the cached routines (part of a factory reset). */
+/** Delete the cached routines. NOT a factory reset — see below. */
 esp_err_t rr_store_clear_routines(void);
+
+/**
+ * Wipe EVERYTHING on littlefs that constitutes "this watch belongs to a
+ * child": routines, the child record, and the completion queue.
+ *
+ * This — not rr_store_clear_routines() — is the store half of a factory
+ * reset. The identity half (device_id, paired flag, peer anchor) is
+ * rr_identity_factory_reset(); the two are always called together from
+ * rr_ble_factory_reset().
+ */
+esp_err_t rr_store_factory_reset(void);
 
 // ── Phase 4: reading one step out of the cache ───────────────────────────────
 

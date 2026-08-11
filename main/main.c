@@ -49,6 +49,37 @@ static const char *TAG = "rr_watch";
 // payload outright if either is missing.
 #define PAIRING_PAYLOAD_FMT "{\"device_id\":\"%s\",\"nonce\":\"%s\"}"
 
+// ── What "paired" means, in one place ────────────────────────────────────────
+//
+// The watch face is a claim that this watch belongs to a child, so it is
+// gated on PAIRING STATE — never on "is there anything in the cache". Those
+// came apart after a factory reset: the reset cleared the paired flag but left
+// child.json behind, so a cache-based check would still have drawn a face,
+// wearing the previous child's avatar, over the pairing QR.
+//
+// Both conditions are required. Paired-but-no-child is a real intermediate
+// state (bonded, first ROUTINE_PUSH not yet arrived) and it gets the honest
+// "waiting for routines" screen instead of a face with an empty avatar slot.
+static bool watchface_allowed(void)
+{
+    if (!rr_identity_is_paired()) return false;
+
+    rr_child_t child;
+    return rr_store_get_child(&child) == ESP_OK;
+}
+
+// Idle-sleep suspension. Two unrelated reasons, both "the screen is doing a
+// job right now":
+//   - a routine is running: a child reading a countdown must not be blanked;
+//   - the watch is unpaired: the pairing QR has to stay lit to be scannable.
+//     Blanking it after 8 s makes a reset watch look bricked, and the wrist
+//     raise that would wake it is not something you do while holding a phone
+//     up to scan.
+static bool idle_suspended(void)
+{
+    return rr_routine_is_active() || !rr_identity_is_paired();
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "Routine Rush Watch — Phase 6 (watch face + raise-to-wake)");
@@ -146,8 +177,10 @@ void app_main(void)
     ESP_ERROR_CHECK_WITHOUT_ABORT(rr_imu_init(bsp_i2c_get_handle()));
     ESP_ERROR_CHECK_WITHOUT_ABORT(rr_battery_init(bsp_i2c_get_handle()));
 
-    // A running routine must not be blanked mid-step.
-    rr_idle_set_suspend_check(rr_routine_is_active);
+    // Both gates MUST be set before rr_idle_init(): it renders on entry, and
+    // an ungated render there is exactly what painted the face over the QR.
+    rr_idle_set_face_gate(watchface_allowed);
+    rr_idle_set_suspend_check(idle_suspended);
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(rr_idle_init());
 
