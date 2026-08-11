@@ -5,5 +5,5 @@
 idf_component_register(
     SRCS "src/rr_ble.c"
     INCLUDE_DIRS "include"
-    REQUIRES bt nvs_flash rr_power
+    REQUIRES bt nvs_flash json rr_power rr_store rr_ui
 )

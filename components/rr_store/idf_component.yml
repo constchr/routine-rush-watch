@@ -1,0 +1,8 @@
+dependencies:
+  idf:
+    version: ">=5.5.0"
+  ## LittleFS: power-fail-safe wear-levelled FS. Chosen over SPIFFS because the
+  ## completion queue (Phase 5) is an append-only log that must survive a dead
+  ## battery mid-write; SPIFFS has no such guarantee.
+  joltwallet/littlefs:
+    version: "^1.16.0"

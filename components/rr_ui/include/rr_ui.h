@@ -37,3 +37,9 @@ esp_err_t rr_ui_init(void);
  * the parent app's scanner parses), plus a caption.
  */
 esp_err_t rr_ui_show_pairing_qr(const char *payload);
+
+/** Post-pairing confirmation: paired + routines synced. */
+esp_err_t rr_ui_show_paired_status(void);
+
+/** Already paired (from NVS) but no routine cache yet — awaiting a push. */
+esp_err_t rr_ui_show_waiting_status(void);

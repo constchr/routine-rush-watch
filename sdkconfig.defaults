@@ -88,7 +88,6 @@ CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
 # measurement in hand, and never to the point of a full frame.
 # ═════════════════════════════════════════════════════════════════════════════
 CONFIG_BSP_DISPLAY_LVGL_BUF_HEIGHT=50
-CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR=n
 
 CONFIG_LV_USE_CLIB_MALLOC=y
 CONFIG_LV_USE_CLIB_STRING=y

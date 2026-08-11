@@ -1,8 +1,8 @@
 // rr_ble — RR_SYNC GATT server (NimBLE, peripheral role).
 //
-// PHASE 1 SCOPE: TIME_SYNC only. The other four characteristics of the frozen
-// contract (QUEUE_STATUS / QUEUE_PULL / RUN_ACK / ROUTINE_PUSH) are
-// deliberately NOT registered yet — see the note above s_gatt_svcs.
+// PHASE 3 SCOPE: TIME_SYNC + ROUTINE_PUSH. The remaining three characteristics
+// of the frozen contract (QUEUE_STATUS / QUEUE_PULL / RUN_ACK) belong to the
+// completion queue and land in Phase 5.
 //
 // Every UUID and byte layout comes from the generated ble_contract.h. Nothing
 // in this file hand-rolls a wire format.
@@ -22,8 +22,13 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
+#include "cJSON.h"
+
 #include "ble_contract.h"
 #include "rr_rtc.h"
+#include "rr_identity.h"
+#include "rr_store.h"
+#include "rr_ui.h"
 
 static const char *TAG = "rr_ble";
 
@@ -45,6 +50,27 @@ static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
 // ─────────────────────────────────────────────────────────────────────────────
 static ble_uuid128_t s_svc_uuid;
 static ble_uuid128_t s_time_sync_uuid;
+static ble_uuid128_t s_routine_push_uuid;
+
+// ROUTINE_PUSH reassembly. The contract sends [u32 len][JSON] chunked across
+// MTU-sized writes; we accumulate until 4+len bytes have arrived.
+//
+// The cap is a denial-of-service guard, not a protocol limit: a peer that has
+// bonded (which Just Works lets anyone do) could otherwise declare a 4 GB
+// length and exhaust the ~180 KiB we have. Real routine sets are a few KB.
+#define RR_ROUTINE_PUSH_MAX 32768
+
+static uint8_t *s_rx_buf;
+static size_t   s_rx_len;
+static size_t   s_rx_cap;
+
+static void rx_reset(void)
+{
+    free(s_rx_buf);
+    s_rx_buf = NULL;
+    s_rx_len = 0;
+    s_rx_cap = 0;
+}
 
 static void uuid128_from_canonical(ble_uuid128_t *out, const uint8_t canonical[16])
 {
@@ -104,14 +130,163 @@ static int time_sync_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     return 0;
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ROUTINE_PUSH write handler — reassembly + NONCE GATE
+//
+// ⚠️ THE NONCE IS THE AUTHENTICATION, NOT THE BOND.
+//
+// Phase 2 proved on hardware that pairing here is Just Works: a Mac bonded to
+// this watch unprompted, with no confirmation on either device. So "bonded"
+// means the link is encrypted, NOT that the peer is the parent's phone. The
+// only secret that proves the peer physically saw the QR is the nonce.
+//
+// Envelope (see the note above s_gatt_svcs for why this shape):
+//     { "nonce": "<16 hex>", "routines": [ ... ] }
+//
+// A payload without a matching nonce is rejected and the routine cache is left
+// untouched.
+// ─────────────────────────────────────────────────────────────────────────────
+static int routine_push_access_cb(uint16_t conn_handle, uint16_t attr_handle,
+                                  struct ble_gatt_access_ctxt *ctxt, void *arg)
+{
+    (void) conn_handle; (void) attr_handle; (void) arg;
+
+    if (ctxt->op != BLE_GATT_ACCESS_OP_WRITE_CHR) {
+        return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
+    }
+
+    uint16_t chunk_len = OS_MBUF_PKTLEN(ctxt->om);
+    if (chunk_len == 0) return 0;
+
+    // Grow the reassembly buffer.
+    size_t need = s_rx_len + chunk_len;
+    if (need > RR_ROUTINE_PUSH_MAX) {
+        ESP_LOGE(TAG, "ROUTINE_PUSH: %u bytes exceeds the %d-byte cap — dropping",
+                 (unsigned) need, RR_ROUTINE_PUSH_MAX);
+        rx_reset();
+        return BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    if (need > s_rx_cap) {
+        size_t newcap = s_rx_cap ? s_rx_cap * 2 : 512;
+        while (newcap < need) newcap *= 2;
+        uint8_t *grown = realloc(s_rx_buf, newcap);
+        if (grown == NULL) {
+            ESP_LOGE(TAG, "ROUTINE_PUSH: out of memory growing to %u bytes", (unsigned) newcap);
+            rx_reset();
+            return BLE_ATT_ERR_INSUFFICIENT_RES;
+        }
+        s_rx_buf = grown;
+        s_rx_cap = newcap;
+    }
+
+    uint16_t copied = 0;
+    int rc = ble_hs_mbuf_to_flat(ctxt->om, s_rx_buf + s_rx_len, chunk_len, &copied);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "ROUTINE_PUSH: mbuf flatten failed (rc=%d)", rc);
+        rx_reset();
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+    s_rx_len += copied;
+
+    // Need the u32 length prefix before we can know how much is coming.
+    if (s_rx_len < RR_ROUTINE_PUSH_LEN_PREFIX_BYTES) return 0;
+
+    uint32_t declared;
+    memcpy(&declared, s_rx_buf, sizeof(declared));   // little-endian per contract
+    size_t total = RR_ROUTINE_PUSH_LEN_PREFIX_BYTES + (size_t) declared;
+
+    if (declared > RR_ROUTINE_PUSH_MAX) {
+        ESP_LOGE(TAG, "ROUTINE_PUSH: declared length %" PRIu32 " exceeds cap — dropping", declared);
+        rx_reset();
+        return BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    if (s_rx_len < total) {
+        ESP_LOGI(TAG, "ROUTINE_PUSH: %u/%u bytes reassembled", (unsigned) s_rx_len, (unsigned) total);
+        return 0;   // more packets inbound
+    }
+
+    ESP_LOGI(TAG, "ROUTINE_PUSH: complete — %" PRIu32 " byte payload", declared);
+
+    const char *json = (const char *) (s_rx_buf + RR_ROUTINE_PUSH_LEN_PREFIX_BYTES);
+    cJSON *env = cJSON_ParseWithLength(json, declared);
+    if (env == NULL) {
+        ESP_LOGE(TAG, "ROUTINE_PUSH: payload is not valid JSON — rejecting");
+        rx_reset();
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    const cJSON *jn = cJSON_GetObjectItemCaseSensitive(env, "nonce");
+    const cJSON *jr = cJSON_GetObjectItemCaseSensitive(env, "routines");
+
+    if (!cJSON_IsString(jn) || !rr_identity_check_nonce(jn->valuestring)) {
+        ESP_LOGW(TAG, "╔══════════════════════════════════════════════════");
+        ESP_LOGW(TAG, "║ ROUTINE_PUSH REJECTED — nonce check FAILED");
+        ESP_LOGW(TAG, "║ presented: %s", cJSON_IsString(jn) ? jn->valuestring : "(absent)");
+        ESP_LOGW(TAG, "║ The peer is bonded but did not see the QR.");
+        ESP_LOGW(TAG, "║ Routine cache left untouched.");
+        ESP_LOGW(TAG, "╚══════════════════════════════════════════════════");
+        cJSON_Delete(env);
+        rx_reset();
+        return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+    }
+
+    if (!cJSON_IsArray(jr)) {
+        ESP_LOGE(TAG, "ROUTINE_PUSH: 'routines' is missing or not an array — rejecting");
+        cJSON_Delete(env);
+        rx_reset();
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    ESP_LOGI(TAG, "nonce OK — peer proved it saw the QR");
+
+    char *routines_json = cJSON_PrintUnformatted(jr);
+    cJSON_Delete(env);
+    rx_reset();
+
+    if (routines_json == NULL) {
+        ESP_LOGE(TAG, "ROUTINE_PUSH: could not re-serialise routines");
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    esp_err_t err = rr_store_put_routines(routines_json, strlen(routines_json));
+    free(routines_json);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "ROUTINE_PUSH: caching failed: %s", esp_err_to_name(err));
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    // Prove the round trip by reading it straight back off flash.
+    rr_store_log_routines();
+
+    // First successful authenticated push == paired. Persist so the QR does
+    // not reappear on reboot, and leave the pairing screen.
+    if (!rr_identity_is_paired()) {
+        rr_identity_set_paired(true);
+    }
+    rr_ui_show_paired_status();
+
+    return 0;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GATT service definition.
 //
-// PHASE 1: only TIME_SYNC is registered. The other four characteristics exist
-// in the frozen contract (§6B.3) and their UUIDs are already in
-// ble_contract.h, but declaring them here without backing behaviour would make
-// the phone's discovery report characteristics that silently do nothing —
-// worse for debugging than their honest absence. They land in Phases 3/5.
+// PHASE 3: TIME_SYNC + ROUTINE_PUSH. QUEUE_STATUS / QUEUE_PULL / RUN_ACK are
+// still omitted rather than stubbed — advertising characteristics that do
+// nothing is worse for debugging than their honest absence.
+//
+// ── Why the nonce rides INSIDE ROUTINE_PUSH ──────────────────────────────────
+// The frozen contract (§6B.3) defines exactly FIVE characteristics. A sixth
+// "auth" characteristic would be the tidier design, but it would mean editing
+// a contract marked FROZEN, so it is NOT done here — see the report.
+//
+// Instead the nonce travels in the ROUTINE_PUSH JSON as an envelope:
+//     { "nonce": "...", "routines": [ ... ] }
+// The BYTE LAYOUT is untouched — still [u32 len][UTF-8 JSON] — and
+// watchProtocol.ts needs no edit at all, because encodeRoutinePush() accepts
+// `unknown` and stringifies whatever it is handed. What DOES change is the
+// JSON schema of the payload, which is a coordinated change on both sides.
 // ─────────────────────────────────────────────────────────────────────────────
 static const struct ble_gatt_svc_def s_gatt_svcs[] = {
     {
@@ -135,6 +310,11 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
                 // Every characteristic added from here on gets _ENC too — the
                 // watch carries a child's routine data and must not hand it to
                 // an arbitrary central.
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
+            },
+            {
+                .uuid = &s_routine_push_uuid.u,
+                .access_cb = routine_push_access_cb,
                 .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
             },
             { 0 }
@@ -190,6 +370,11 @@ static void advertise(void)
     // invisible. (Phase 1 passed NULL; a GATT write still worked, which is
     // why it went unnoticed until -Wunused-function flagged the dead handler.)
     rc = ble_gap_adv_start(s_addr_type, NULL, BLE_HS_FOREVER, &params, gap_event_cb, NULL);
+    if (rc == BLE_HS_EALREADY) {
+        // Benign: a failed connection raises both CONNECT(status!=0) and
+        // DISCONNECT, and each re-advertises. Not an error worth logging red.
+        return;
+    }
     if (rc != 0) {
         ESP_LOGE(TAG, "adv_start failed: %d", rc);
         return;
@@ -218,6 +403,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_DISCONNECT:
         ESP_LOGI(TAG, "disconnected (reason %d) — re-advertising", event->disconnect.reason);
         s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+        // A half-reassembled push must not survive the peer that started it,
+        // or the next connection's first chunk would be appended to a stranger's
+        // partial payload.
+        rx_reset();
         advertise();
         return 0;
 
@@ -261,6 +450,36 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 // ─────────────────────────────────────────────────────────────────────────────
 // Host lifecycle
 // ─────────────────────────────────────────────────────────────────────────────
+// Derive a RANDOM STATIC BLE address from the device_id.
+//
+// Why not the factory public address: a factory reset regenerates device_id
+// but would leave the public address unchanged, so every previously-bonded
+// phone still sees the same BLE identity with different keys. iOS/macOS then
+// refuse to reconnect ("Peer removed pairing information", CBError 14) and the
+// only recovery is the user manually forgetting the device in system settings
+// — which for a BLE-only peripheral is often not even offered in the UI.
+// Observed for real against macOS during Phase 3 bring-up.
+//
+// Tying the address to device_id makes a factory reset produce a genuinely new
+// BLE identity, which is what it should be. The address is STABLE across
+// normal reboots because device_id is, so bonds and reconnection survive.
+static void derive_static_addr(ble_addr_t *out)
+{
+    // FNV-1a over the device_id, then folded to 6 bytes.
+    const char *id = rr_identity_device_id();
+    uint64_t h = 1469598103934665603ULL;
+    for (const char *p = id; *p; p++) {
+        h ^= (unsigned char) *p;
+        h *= 1099511628211ULL;
+    }
+    for (int i = 0; i < 6; i++) {
+        out->val[i] = (uint8_t) (h >> (i * 8));
+    }
+    // A random STATIC address requires the two most significant bits set.
+    out->val[5] |= 0xC0;
+    out->type = BLE_ADDR_RANDOM;
+}
+
 static void on_sync(void)
 {
     int rc = ble_hs_util_ensure_addr(0);
@@ -268,16 +487,26 @@ static void on_sync(void)
         ESP_LOGE(TAG, "ensure_addr failed: %d", rc);
         return;
     }
-    rc = ble_hs_id_infer_auto(0, &s_addr_type);
+
+    ble_addr_t addr;
+    derive_static_addr(&addr);
+    rc = ble_hs_id_set_rnd(addr.val);
     if (rc != 0) {
-        ESP_LOGE(TAG, "infer_auto failed: %d", rc);
-        return;
+        ESP_LOGE(TAG, "set_rnd failed: %d — falling back to the public address", rc);
+        rc = ble_hs_id_infer_auto(0, &s_addr_type);
+        if (rc != 0) {
+            ESP_LOGE(TAG, "infer_auto failed: %d", rc);
+            return;
+        }
+    } else {
+        s_addr_type = BLE_OWN_ADDR_RANDOM;
     }
 
-    uint8_t addr[6] = { 0 };
-    ble_hs_id_copy_addr(s_addr_type, addr, NULL);
-    ESP_LOGI(TAG, "BLE address %02x:%02x:%02x:%02x:%02x:%02x",
-             addr[5], addr[4], addr[3], addr[2], addr[1], addr[0]);
+    uint8_t cur[6] = { 0 };
+    ble_hs_id_copy_addr(s_addr_type, cur, NULL);
+    ESP_LOGI(TAG, "BLE address %02x:%02x:%02x:%02x:%02x:%02x (%s, derived from device_id)",
+             cur[5], cur[4], cur[3], cur[2], cur[1], cur[0],
+             s_addr_type == BLE_OWN_ADDR_RANDOM ? "random-static" : "public");
 
     advertise();
 }
@@ -305,8 +534,10 @@ esp_err_t rr_ble_init(void)
     // Build NimBLE-order UUIDs from the generated canonical bytes.
     static const uint8_t svc_canonical[16] = RR_SYNC_SERVICE_UUID_BYTES;
     static const uint8_t ts_canonical[16] = RR_SYNC_CHAR_TIME_SYNC_UUID_BYTES;
+    static const uint8_t rp_canonical[16] = RR_SYNC_CHAR_ROUTINE_PUSH_UUID_BYTES;
     uuid128_from_canonical(&s_svc_uuid, svc_canonical);
     uuid128_from_canonical(&s_time_sync_uuid, ts_canonical);
+    uuid128_from_canonical(&s_routine_push_uuid, rp_canonical);
 
     esp_err_t err = nimble_port_init();
     if (err != ESP_OK) {
@@ -349,7 +580,7 @@ esp_err_t rr_ble_init(void)
     ble_store_config_init();
     nimble_port_freertos_init(host_task);
 
-    ESP_LOGI(TAG, "NimBLE host started (peripheral, TIME_SYNC only)");
+    ESP_LOGI(TAG, "NimBLE host started (peripheral: TIME_SYNC + ROUTINE_PUSH)");
     return ESP_OK;
 }
 

@@ -37,3 +37,37 @@ bool rr_identity_was_first_boot(void);
  * Call once per pairing attempt; do not persist it.
  */
 void rr_identity_new_nonce(char *out, size_t out_len);
+
+// ── Phase 3: pairing state + the BLE nonce gate ──────────────────────────────
+//
+// Phase 2 confirmed the bond is Just Works: ANY central can pair unprompted,
+// so a bond proves encryption, not authentication. The nonce is the only
+// secret that proves the peer physically saw the QR, so it — not the bond —
+// is what gates privileged operations.
+
+/**
+ * Record the nonce currently displayed in the QR. Called once per pairing
+ * screen; the value is deliberately NOT persisted.
+ */
+void rr_identity_set_active_nonce(const char *nonce);
+
+/**
+ * Constant-time-ish comparison of a presented nonce against the active one.
+ * False if no nonce is active (i.e. the watch is not showing a QR).
+ */
+bool rr_identity_check_nonce(const char *presented);
+
+/** True once a phone has completed the nonce handshake. Persisted in NVS. */
+bool rr_identity_is_paired(void);
+
+/**
+ * Mark the watch paired (NVS key "paired"). Survives reboot so the QR does
+ * not reappear on a watch that is already in service.
+ *
+ * FUTURE (not built): a re-pair path. Options are a long-press on the PWR
+ * button, or a parent-initiated unpair over BLE that clears this flag and the
+ * bond store. Until one exists, `idf.py erase-flash` (or erasing the NVS
+ * region) is the only reset — which also regenerates the device_id and so
+ * requires a fresh claim server-side.
+ */
+esp_err_t rr_identity_set_paired(bool paired);

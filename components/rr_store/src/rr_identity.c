@@ -89,3 +89,66 @@ void rr_identity_new_nonce(char *out, size_t out_len)
         snprintf(out + i * 2, out_len - i * 2, "%02x", b[i]);
     }
 }
+
+// ── Phase 3: pairing state + nonce gate ──────────────────────────────────────
+
+#define NVS_KEY_PAIRED "paired"
+
+static char s_active_nonce[RR_NONCE_LEN];
+static bool s_has_active_nonce;
+static bool s_paired;
+static bool s_paired_loaded;
+
+void rr_identity_set_active_nonce(const char *nonce)
+{
+    if (nonce == NULL) { s_has_active_nonce = false; return; }
+    strlcpy(s_active_nonce, nonce, sizeof(s_active_nonce));
+    s_has_active_nonce = true;
+}
+
+bool rr_identity_check_nonce(const char *presented)
+{
+    if (!s_has_active_nonce || presented == NULL) return false;
+
+    // Length-independent compare over the fixed nonce width so a wrong nonce
+    // costs the same time as a right one. The nonce is short-lived and the
+    // attacker needs BLE proximity, so this is belt-and-braces — but a
+    // byte-by-byte early return here would be a gratuitous oracle.
+    size_t n = strlen(s_active_nonce);
+    if (strlen(presented) != n) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < n; i++) {
+        diff |= (unsigned char) (s_active_nonce[i] ^ presented[i]);
+    }
+    return diff == 0;
+}
+
+bool rr_identity_is_paired(void)
+{
+    if (!s_paired_loaded) {
+        nvs_handle_t h;
+        if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+            uint8_t v = 0;
+            if (nvs_get_u8(h, NVS_KEY_PAIRED, &v) == ESP_OK) s_paired = (v != 0);
+            nvs_close(h);
+        }
+        s_paired_loaded = true;
+    }
+    return s_paired;
+}
+
+esp_err_t rr_identity_set_paired(bool paired)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(h, NVS_KEY_PAIRED, paired ? 1 : 0);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err == ESP_OK) {
+        s_paired = paired;
+        s_paired_loaded = true;
+        ESP_LOGI(TAG, "paired state persisted: %s", paired ? "PAIRED" : "unpaired");
+    }
+    return err;
+}

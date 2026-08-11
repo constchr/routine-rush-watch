@@ -117,3 +117,52 @@ esp_err_t rr_ui_show_pairing_qr(const char *payload)
     ESP_LOGI(TAG, "pairing QR rendered (%u bytes, %dpx)", (unsigned) strlen(payload), QR_SIZE);
     return ESP_OK;
 }
+
+esp_err_t rr_ui_show_paired_status(void)
+{
+    // Called from the NimBLE host task on a successful ROUTINE_PUSH, so it must
+    // take the LVGL lock like any other non-LVGL-task caller.
+    bsp_display_lock(0);
+
+    lv_obj_clean(s_screen);
+    lv_obj_set_style_bg_color(s_screen, lv_color_black(), LV_PART_MAIN);
+
+    lv_obj_t *tick = lv_label_create(s_screen);
+    lv_label_set_text(tick, LV_SYMBOL_OK);
+    lv_obj_set_style_text_color(tick, lv_color_hex(0x10B981), LV_PART_MAIN);
+    lv_obj_align(tick, LV_ALIGN_CENTER, 0, -60);
+
+    lv_obj_t *title = lv_label_create(s_screen);
+    lv_label_set_text(title, "Paired");
+    lv_obj_set_style_text_color(title, lv_color_white(), LV_PART_MAIN);
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, -10);
+
+    lv_obj_t *sub = lv_label_create(s_screen);
+    lv_label_set_text(sub, "Routines synced");
+    lv_obj_set_style_text_color(sub, lv_color_hex(0x8E8E93), LV_PART_MAIN);
+    lv_obj_align(sub, LV_ALIGN_CENTER, 0, 24);
+
+    bsp_display_unlock();
+
+    ESP_LOGI(TAG, "paired status screen shown");
+    return ESP_OK;
+}
+
+esp_err_t rr_ui_show_waiting_status(void)
+{
+    bsp_display_lock(0);
+
+    lv_obj_clean(s_screen);
+    lv_obj_set_style_bg_color(s_screen, lv_color_black(), LV_PART_MAIN);
+
+    lv_obj_t *l = lv_label_create(s_screen);
+    lv_label_set_text(l, "Paired\nwaiting for routines");
+    lv_obj_set_style_text_color(l, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_center(l);
+
+    bsp_display_unlock();
+
+    ESP_LOGI(TAG, "waiting-for-routines screen shown");
+    return ESP_OK;
+}

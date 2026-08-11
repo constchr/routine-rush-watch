@@ -24,3 +24,30 @@
 //
 // client_local_id is the idempotency key the backend dedupes on — generate it
 // on the watch at completion time and never regenerate it on retry.
+
+// ── Phase 3 surface (implemented) ────────────────────────────────────────────
+
+#include <stdbool.h>
+#include <stddef.h>
+#include "esp_err.h"
+
+/** Mount the littlefs partition (formats it on first boot). Logs free space. */
+esp_err_t rr_store_init(void);
+
+bool rr_store_is_mounted(void);
+
+/**
+ * Validate and persist the denormalized routine set (spec §5).
+ * Rejects anything that is not a JSON array — a bad cache is worse than none,
+ * because the runtime would show a child the wrong steps.
+ */
+esp_err_t rr_store_put_routines(const char *json, size_t len);
+
+/** ESP_OK if a non-empty routines cache exists on flash. */
+esp_err_t rr_store_has_routines(void);
+
+/**
+ * Read the cache back off flash and log its contents (names, step counts,
+ * schedules). Proves the round trip — "received N bytes" proves nothing.
+ */
+esp_err_t rr_store_log_routines(void);
