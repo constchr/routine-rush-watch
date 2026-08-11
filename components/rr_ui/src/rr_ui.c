@@ -32,6 +32,12 @@ static const char *TAG = "rr_ui";
 
 static lv_obj_t *s_screen;
 
+// Last non-transient screen, so an aborted reset countdown can restore exactly
+// what the watch was showing instead of guessing at pairing state.
+typedef enum { RR_SCREEN_NONE, RR_SCREEN_QR, RR_SCREEN_PAIRED, RR_SCREEN_WAITING } rr_screen_t;
+static rr_screen_t s_last_screen;
+static char s_last_qr_payload[128];
+
 static void log_heap(const char *when)
 {
     ESP_LOGI(TAG, "heap %s: free=%u largest_block=%u",
@@ -115,6 +121,8 @@ esp_err_t rr_ui_show_pairing_qr(const char *payload)
 
     log_heap("after QR render");
     ESP_LOGI(TAG, "pairing QR rendered (%u bytes, %dpx)", (unsigned) strlen(payload), QR_SIZE);
+    s_last_screen = RR_SCREEN_QR;
+    strlcpy(s_last_qr_payload, payload, sizeof(s_last_qr_payload));
     return ESP_OK;
 }
 
@@ -145,6 +153,7 @@ esp_err_t rr_ui_show_paired_status(void)
     bsp_display_unlock();
 
     ESP_LOGI(TAG, "paired status screen shown");
+    s_last_screen = RR_SCREEN_PAIRED;
     return ESP_OK;
 }
 
@@ -164,5 +173,57 @@ esp_err_t rr_ui_show_waiting_status(void)
     bsp_display_unlock();
 
     ESP_LOGI(TAG, "waiting-for-routines screen shown");
+    s_last_screen = RR_SCREEN_WAITING;
     return ESP_OK;
+}
+
+// ── Factory-reset countdown ──────────────────────────────────────────────────
+// Remembers what was on screen so an aborted hold restores it rather than
+// leaving the watch on a stale warning.
+static bool s_reset_prompt_active;
+
+esp_err_t rr_ui_show_reset_countdown(int seconds_remaining)
+{
+    bsp_display_lock(0);
+    lv_obj_clean(s_screen);
+    lv_obj_set_style_bg_color(s_screen, lv_color_hex(0x7F1D1D), LV_PART_MAIN);
+
+    lv_obj_t *t = lv_label_create(s_screen);
+    lv_label_set_text(t, "Factory reset");
+    lv_obj_set_style_text_color(t, lv_color_white(), LV_PART_MAIN);
+    lv_obj_align(t, LV_ALIGN_CENTER, 0, -70);
+
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%d", seconds_remaining);
+    lv_obj_t *n = lv_label_create(s_screen);
+    lv_label_set_text(n, buf);
+    lv_obj_set_style_text_color(n, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_font(n, &lv_font_montserrat_28, LV_PART_MAIN);
+    lv_obj_center(n);
+
+    lv_obj_t *h = lv_label_create(s_screen);
+    lv_label_set_text(h, "Release to cancel");
+    lv_obj_set_style_text_color(h, lv_color_hex(0xFCA5A5), LV_PART_MAIN);
+    lv_obj_align(h, LV_ALIGN_CENTER, 0, 70);
+
+    bsp_display_unlock();
+    s_reset_prompt_active = true;
+    return ESP_OK;
+}
+
+esp_err_t rr_ui_show_last_status(void)
+{
+    switch (s_last_screen) {
+    case RR_SCREEN_QR:      return rr_ui_show_pairing_qr(s_last_qr_payload);
+    case RR_SCREEN_PAIRED:  return rr_ui_show_paired_status();
+    case RR_SCREEN_WAITING: return rr_ui_show_waiting_status();
+    default:                return ESP_OK;
+    }
+}
+
+esp_err_t rr_ui_restore_after_reset_prompt(void)
+{
+    if (!s_reset_prompt_active) return ESP_OK;
+    s_reset_prompt_active = false;
+    return rr_ui_show_last_status();
 }

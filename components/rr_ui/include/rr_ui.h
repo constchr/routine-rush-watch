@@ -43,3 +43,12 @@ esp_err_t rr_ui_show_paired_status(void);
 
 /** Already paired (from NVS) but no routine cache yet — awaiting a push. */
 esp_err_t rr_ui_show_waiting_status(void);
+
+/** Red hold-to-reset countdown. Release aborts. */
+esp_err_t rr_ui_show_reset_countdown(int seconds_remaining);
+
+/** Restore whatever status screen was showing before the countdown. */
+esp_err_t rr_ui_restore_after_reset_prompt(void);
+
+/** Re-render the last status screen (paired / waiting / QR). */
+esp_err_t rr_ui_show_last_status(void);

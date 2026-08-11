@@ -212,3 +212,14 @@ esp_err_t rr_store_log_routines(void)
     free(buf);
     return ESP_OK;
 }
+
+esp_err_t rr_store_clear_routines(void)
+{
+    if (!s_mounted) return ESP_ERR_INVALID_STATE;
+    if (unlink(ROUTINES_PATH) == 0) {
+        ESP_LOGW(TAG, "routine cache deleted (%s)", ROUTINES_PATH);
+        return ESP_OK;
+    }
+    ESP_LOGI(TAG, "no routine cache to delete");
+    return ESP_ERR_NOT_FOUND;
+}

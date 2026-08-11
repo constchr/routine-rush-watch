@@ -51,3 +51,6 @@ esp_err_t rr_store_has_routines(void);
  * schedules). Proves the round trip — "received N bytes" proves nothing.
  */
 esp_err_t rr_store_log_routines(void);
+
+/** Delete the cached routines (part of a factory reset). */
+esp_err_t rr_store_clear_routines(void);

@@ -152,3 +152,63 @@ esp_err_t rr_identity_set_paired(bool paired)
     }
     return err;
 }
+
+// ── Phase 3B: paired-peer trust anchor + factory reset ───────────────────────
+
+#define NVS_KEY_PEER "peer"
+
+typedef struct __attribute__((packed)) {
+    uint8_t type;
+    uint8_t addr[6];
+} paired_peer_t;
+
+esp_err_t rr_identity_set_paired_peer(const uint8_t addr[6], uint8_t addr_type)
+{
+    paired_peer_t p = { .type = addr_type };
+    memcpy(p.addr, addr, 6);
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_blob(h, NVS_KEY_PEER, &p, sizeof(p));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "paired peer recorded: %02x:%02x:%02x:%02x:%02x:%02x (type %u)",
+                 addr[5], addr[4], addr[3], addr[2], addr[1], addr[0], addr_type);
+    }
+    return err;
+}
+
+bool rr_identity_is_paired_peer(const uint8_t addr[6], uint8_t addr_type)
+{
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return false;
+
+    paired_peer_t p;
+    size_t len = sizeof(p);
+    esp_err_t err = nvs_get_blob(h, NVS_KEY_PEER, &p, &len);
+    nvs_close(h);
+
+    if (err != ESP_OK || len != sizeof(p)) return false;
+    return p.type == addr_type && memcmp(p.addr, addr, 6) == 0;
+}
+
+esp_err_t rr_identity_factory_reset(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_erase_all(h);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+
+    if (err == ESP_OK) {
+        s_paired = false;
+        s_paired_loaded = true;
+        s_has_active_nonce = false;
+        ESP_LOGW(TAG, "NVS namespace '%s' erased — device_id will be regenerated", NVS_NAMESPACE);
+    }
+    return err;
+}

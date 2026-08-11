@@ -71,3 +71,37 @@ bool rr_identity_is_paired(void);
  * requires a fresh claim server-side.
  */
 esp_err_t rr_identity_set_paired(bool paired);
+
+// ── Phase 3B: reset + the paired-peer trust anchor ───────────────────────────
+//
+// TRUST MODEL for destructive commands (factory reset over BLE):
+//   1. the link must be ENCRYPTED (characteristic is WRITE_ENC), and
+//   2. the peer's BLE *identity* address must match one recorded when this
+//      watch was paired.
+//
+// (1) alone is NOT sufficient: pairing is Just Works, so any central can bond
+// unprompted — proven on hardware in Phase 2 when a Mac bonded with no prompt.
+// A bond-only gate would let any passer-by wipe a child's watch. (2) is what
+// makes it "the phone that actually paired me".
+//
+// The identity address (not the connection address) is used deliberately:
+// iOS advertises a rotating resolvable private address, but because we exchange
+// ID keys (BLE_SM_PAIR_KEY_DIST_ID) NimBLE resolves it to a stable identity.
+
+/** Record the peer that completed the nonce handshake. Persisted in NVS. */
+esp_err_t rr_identity_set_paired_peer(const uint8_t addr[6], uint8_t addr_type);
+
+/** True if this peer is the one that paired us. False if none is recorded. */
+bool rr_identity_is_paired_peer(const uint8_t addr[6], uint8_t addr_type);
+
+/**
+ * Factory reset: erase the whole rr_watch NVS namespace (device_id, paired
+ * flag, paired peer). The caller is responsible for clearing the routine cache
+ * and the BLE bond store, then rebooting.
+ *
+ * A reset watch is genuinely a NEW DEVICE: on the next boot it mints a fresh
+ * device_id, which in turn derives a fresh BLE address, so previously-bonded
+ * phones see a new peripheral rather than "same identity, different keys"
+ * (the CBError 14 trap found in Phase 3).
+ */
+esp_err_t rr_identity_factory_reset(void);

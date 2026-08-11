@@ -13,6 +13,9 @@
 #include <inttypes.h>
 
 #include "esp_log.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "nvs_flash.h"
 
 #include "nimble/nimble_port.h"
@@ -131,6 +134,55 @@ static int time_sync_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 }
 
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Factory reset — the mirror of pairing.
+//
+// Wipes everything that makes this watch "someone's watch": the paired flag,
+// the paired-peer anchor, the device_id, the BLE bonds, and the routine cache.
+// Then reboots, because a fresh device_id must be re-derived into a fresh BLE
+// address and the QR path re-entered from a clean state — far safer than
+// trying to unwind live LVGL/NimBLE state in place.
+// ─────────────────────────────────────────────────────────────────────────────
+void rr_ble_factory_reset(const char *reason)
+{
+    ESP_LOGW(TAG, "╔══════════════════════════════════════════════════");
+    ESP_LOGW(TAG, "║ FACTORY RESET — %s", reason);
+    ESP_LOGW(TAG, "╚══════════════════════════════════════════════════");
+
+    rr_store_clear_routines();
+    rr_identity_factory_reset();
+
+    // Drop every bond, so the phone that unlinked us cannot silently reconnect
+    // to what is now a different device.
+    int rc = ble_store_clear();
+    ESP_LOGW(TAG, "bond store cleared (rc=%d)", rc);
+
+    ESP_LOGW(TAG, "rebooting into first-boot state...");
+    vTaskDelay(pdMS_TO_TICKS(400));   // let the log drain over USB-JTAG
+    esp_restart();
+}
+
+// Is this connection both encrypted AND from the peer that paired us?
+static bool peer_is_trusted(uint16_t conn_handle)
+{
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn_handle, &desc) != 0) return false;
+
+    if (!desc.sec_state.encrypted) {
+        ESP_LOGW(TAG, "reset refused: link is not encrypted");
+        return false;
+    }
+    if (!rr_identity_is_paired_peer(desc.peer_id_addr.val, desc.peer_id_addr.type)) {
+        ESP_LOGW(TAG, "reset refused: peer %02x:%02x:%02x:%02x:%02x:%02x is bonded "
+                      "but is NOT the peer that paired this watch",
+                 desc.peer_id_addr.val[5], desc.peer_id_addr.val[4], desc.peer_id_addr.val[3],
+                 desc.peer_id_addr.val[2], desc.peer_id_addr.val[1], desc.peer_id_addr.val[0]);
+        return false;
+    }
+    return true;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ROUTINE_PUSH write handler — reassembly + NONCE GATE
 //
@@ -216,6 +268,26 @@ static int routine_push_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
+    // ── Command envelope: { "command": "factory_reset" } ─────────────────────
+    // Reset rides ROUTINE_PUSH rather than a sixth characteristic, because the
+    // contract (§6B.3) is FROZEN at five. See the note above s_gatt_svcs.
+    //
+    // Trust: the nonce cannot gate this one — after an unlink the watch is not
+    // showing a QR, so there is no active nonce for the phone to present. The
+    // gate is instead "encrypted AND the peer that paired me" (rr_identity.h).
+    const cJSON *jcmd = cJSON_GetObjectItemCaseSensitive(env, "command");
+    if (cJSON_IsString(jcmd) && strcmp(jcmd->valuestring, "factory_reset") == 0) {
+        bool trusted = peer_is_trusted(conn_handle);
+        cJSON_Delete(env);
+        rx_reset();
+        if (!trusted) {
+            ESP_LOGW(TAG, "FACTORY RESET REJECTED — untrusted peer");
+            return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        }
+        rr_ble_factory_reset("unlinked by the paired phone over BLE");
+        return 0;   // not reached — esp_restart()
+    }
+
     const cJSON *jn = cJSON_GetObjectItemCaseSensitive(env, "nonce");
     const cJSON *jr = cJSON_GetObjectItemCaseSensitive(env, "routines");
 
@@ -263,6 +335,14 @@ static int routine_push_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     // not reappear on reboot, and leave the pairing screen.
     if (!rr_identity_is_paired()) {
         rr_identity_set_paired(true);
+    }
+    // Anchor the trust relationship: this peer proved it saw the QR, so it is
+    // the one allowed to send destructive commands later (e.g. unlink reset).
+    {
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(conn_handle, &desc) == 0) {
+            rr_identity_set_paired_peer(desc.peer_id_addr.val, desc.peer_id_addr.type);
+        }
     }
     rr_ui_show_paired_status();
 

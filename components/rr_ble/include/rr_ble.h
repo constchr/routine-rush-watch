@@ -46,3 +46,10 @@ esp_err_t rr_ble_init(void);
 
 /** True while a central is connected. */
 bool rr_ble_is_connected(void);
+
+/**
+ * Wipe all pairing state (NVS identity, bonds, routine cache) and reboot into
+ * first-boot state. Used by both the BLE unlink command and the local
+ * long-press reset. `reason` is logged.
+ */
+void rr_ble_factory_reset(const char *reason);

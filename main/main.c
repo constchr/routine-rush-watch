@@ -29,6 +29,7 @@
 #include "rr_store.h"
 #include "rr_rtc.h"
 #include "rr_ui.h"
+#include "rr_reset_button.h"
 
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 5, 0)
 #error "Routine Rush Watch requires ESP-IDF v5.5+ (board BSP declares idf >=5.5.0)."
@@ -87,6 +88,10 @@ void app_main(void)
         rr_rtc_format(&now, tbuf, sizeof(tbuf));
         ESP_LOGI(TAG, "RTC at boot: %s (osc_ok=%d)", tbuf, (int) now.osc_ok);
     }
+
+    // Local factory reset (hold BOOT 10 s). Armed early and unconditionally:
+    // it is the ONLY recovery for a watch unlinked while out of BLE range.
+    ESP_ERROR_CHECK(rr_reset_button_init());
 
     // LittleFS: the routine cache lives here (spec §5). Mount before BLE, since
     // a ROUTINE_PUSH can arrive as soon as we advertise and its handler writes
