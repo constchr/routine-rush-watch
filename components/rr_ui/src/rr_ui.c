@@ -597,6 +597,36 @@ static bool avatar_lv_path(const char *avatar_id, char *out, size_t cap)
     return false;
 }
 
+
+// ── Legibility scrim ────────────────────────────────────────────────────────
+// White text over a full-bleed avatar is unreadable wherever the avatar is
+// bright — the lion's mane was the worst case on the real panel.
+//
+// A vertical gradient from black to fully transparent, at the top and bottom
+// edges only. It darkens exactly where the text lives and vanishes over the
+// avatar's face, so the hero still reads as the hero. On AMOLED the darkened
+// band also costs less power than the pixels it covers.
+//
+// Chosen over a per-glyph shadow/outline because it is independent of what is
+// behind it: an outline still fails against a mid-tone, whereas the scrim
+// guarantees a known-dark backdrop no matter what avatar the child picks.
+static void add_scrim(lv_obj_t *parent, bool top, int height)
+{
+    lv_obj_t *sc = lv_obj_create(parent);
+    lv_obj_remove_style_all(sc);
+    lv_obj_set_size(sc, RR_SCREEN_W, height);
+    lv_obj_align(sc, top ? LV_ALIGN_TOP_MID : LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_remove_flag(sc, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_remove_flag(sc, LV_OBJ_FLAG_CLICKABLE);
+
+    lv_obj_set_style_bg_color(sc, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_grad_color(sc, lv_color_black(), LV_PART_MAIN);
+    lv_obj_set_style_bg_grad_dir(sc, LV_GRAD_DIR_VER, LV_PART_MAIN);
+    // Opaque at the screen edge, transparent where it meets the avatar.
+    lv_obj_set_style_bg_opa(sc, top ? 225 : LV_OPA_TRANSP, LV_PART_MAIN);
+    lv_obj_set_style_bg_grad_opa(sc, top ? LV_OPA_TRANSP : 235, LV_PART_MAIN);
+}
+
 esp_err_t rr_ui_show_watchface(const rr_watchface_t *w)
 {
     if (w == NULL) return ESP_ERR_INVALID_ARG;
@@ -611,6 +641,31 @@ esp_err_t rr_ui_show_watchface(const rr_watchface_t *w)
 
     const bool el = (w->language[0] == 'e' && w->language[1] == 'l');
     const int wd = rr_ui_iso_weekday(w->year, w->month, w->day);
+
+    // ── THE HERO first, so everything after it draws ON TOP ─────────────────
+    // Ordering matters: the safe container is created by begin_screen(), so an
+    // avatar added to the root afterwards would overdraw all of the text. The
+    // avatar goes down first, then the scrims, then the container is moved to
+    // the foreground — z-order guaranteed rather than incidental.
+    char apath[80];
+    bool drew_avatar = false;
+    if (avatar_lv_path(w->avatar_id, apath, sizeof(apath))) {
+        lv_obj_t *av = lv_image_create(rr_ui_screen_root());
+        lv_image_set_src(av, apath);
+        lv_obj_align(av, LV_ALIGN_CENTER, 0, 24);
+        drew_avatar = true;
+    } else {
+        lv_obj_t *ph = lv_label_create(rr_ui_screen_root());
+        lv_label_set_text(ph, LV_SYMBOL_IMAGE);
+        lv_obj_set_style_text_font(ph, &rr_font_36, LV_PART_MAIN);
+        lv_obj_set_style_text_color(ph, RR_SURFACE, LV_PART_MAIN);
+        lv_obj_align(ph, LV_ALIGN_CENTER, 0, 24);
+        ESP_LOGW(TAG, "no hero avatar for id '%s'", w->avatar_id);
+    }
+
+    add_scrim(rr_ui_screen_root(), true, 168);
+    add_scrim(rr_ui_screen_root(), false, 190);
+    lv_obj_move_foreground(root);   // all text above the avatar AND the scrims
 
     // ── top-LEFT: battery ───────────────────────────────────────────────────
     // Tertiary grey normally — it is ambient information, not something a child
@@ -642,30 +697,11 @@ esp_err_t rr_ui_show_watchface(const rr_watchface_t *w)
     snprintf(hhmm, sizeof(hhmm), "%02d:%02d", w->hour, w->minute);
     lv_obj_t *ltime = lv_label_create(root);
     lv_label_set_text(ltime, hhmm);
-    lv_obj_set_style_text_font(ltime, &rr_font_28, LV_PART_MAIN);
+    // Largest text on the face: the time is what a glance is FOR. Everything
+    // else on this screen is secondary to it.
+    lv_obj_set_style_text_font(ltime, &rr_font_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(ltime, RR_TEXT, LV_PART_MAIN);
-    lv_obj_align(ltime, LV_ALIGN_TOP_RIGHT, 0, 26);
-
-    // ── THE HERO: the child's avatar, filling the lower two-thirds ──────────
-    char apath[80];
-    bool drew_avatar = false;
-    if (avatar_lv_path(w->avatar_id, apath, sizeof(apath))) {
-        // Screen root, not the safe container: the centre is unobstructed, so
-        // the hero is allowed to be larger than the safe box.
-        lv_obj_t *av = lv_image_create(rr_ui_screen_root());
-        lv_image_set_src(av, apath);
-        lv_obj_align(av, LV_ALIGN_CENTER, 0, 24);
-        drew_avatar = true;
-    } else {
-        // No avatar yet (never pushed, or an unknown id). Say so quietly
-        // rather than leaving a void the size of the screen.
-        lv_obj_t *ph = lv_label_create(root);
-        lv_label_set_text(ph, LV_SYMBOL_IMAGE);
-        lv_obj_set_style_text_font(ph, &rr_font_36, LV_PART_MAIN);
-        lv_obj_set_style_text_color(ph, RR_SURFACE, LV_PART_MAIN);
-        lv_obj_align(ph, LV_ALIGN_CENTER, 0, 26);
-        ESP_LOGW(TAG, "no hero avatar for id '%s'", w->avatar_id);
-    }
+    lv_obj_align(ltime, LV_ALIGN_TOP_RIGHT, 0, 22);
 
     // ── bottom: next routine, deliberately quiet ────────────────────────────
     // A thin line under the avatar. It matters, but it must not compete with
@@ -682,7 +718,9 @@ esp_err_t rr_ui_show_watchface(const rr_watchface_t *w)
     lv_obj_set_width(lnext, RR_SAFE_W);
     lv_label_set_text(lnext, hint);
     lv_obj_set_style_text_font(lnext, &rr_font_20, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lnext, w->next.found ? RR_MUTED : RR_SUCCESS, LV_PART_MAIN);
+    // White, not grey: this line sits over the avatar's lower edge, where grey
+    // on a mid-tone was the least readable thing on the face.
+    lv_obj_set_style_text_color(lnext, w->next.found ? RR_TEXT : RR_SUCCESS, LV_PART_MAIN);
     lv_obj_set_style_text_align(lnext, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
     lv_obj_align(lnext, LV_ALIGN_BOTTOM_MID, 0, -28);
 
