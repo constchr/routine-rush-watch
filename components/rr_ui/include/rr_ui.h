@@ -20,3 +20,20 @@
 // Watch face (§9B) is connection-independent: time from the RTC, steps from
 // the IMU, next-routine from cache. It must render identically whether or not
 // a phone has ever connected.
+
+// ── Phase 2 surface (implemented) ────────────────────────────────────────────
+
+#include "esp_err.h"
+
+/**
+ * Bring up the display (SH8601 QSPI), touch, and LVGL in partial-render mode,
+ * and draw a boot label to prove the path. Logs free heap either side of LVGL
+ * init — that delta is the RAM budget check.
+ */
+esp_err_t rr_ui_init(void);
+
+/**
+ * Replace the screen with the pairing QR encoding `payload` (the exact JSON
+ * the parent app's scanner parses), plus a caption.
+ */
+esp_err_t rr_ui_show_pairing_qr(const char *payload);

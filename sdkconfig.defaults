@@ -116,3 +116,9 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 # proven on the IMU interrupt lines (see console warning above).
 CONFIG_PM_ENABLE=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+
+# ── LVGL QR code widget (Phase 2 pairing screen) ────────────────────────────
+# lv_qrcode renders into an LV_COLOR_FORMAT_I1 (1 bpp) canvas, so a 320x320
+# symbol costs ~12.8 KiB — not the ~205 KiB a 16bpp canvas would need. That is
+# what makes it affordable without PSRAM.
+CONFIG_LV_USE_QRCODE=y

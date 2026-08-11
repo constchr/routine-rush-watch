@@ -124,7 +124,18 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
                 // Write WITH response — the phone uses
                 // writeCharacteristicWithResponseForDevice, so it waits for our
                 // ATT ack and surfaces a real error if we reject the value.
-                .flags = BLE_GATT_CHR_F_WRITE,
+                //
+                // PHASE 2: _ENC makes the bond LOAD-BEARING. An unbonded peer
+                // now gets ATT error 0x05 (Insufficient Authentication) and the
+                // central must pair before the write is accepted. Phase 1 left
+                // this off deliberately so a bonding failure could not
+                // masquerade as a transport failure; the transport is proven,
+                // so the guard belongs here now.
+                //
+                // Every characteristic added from here on gets _ENC too — the
+                // watch carries a child's routine data and must not hand it to
+                // an arbitrary central.
+                .flags = BLE_GATT_CHR_F_WRITE | BLE_GATT_CHR_F_WRITE_ENC,
             },
             { 0 }
         },

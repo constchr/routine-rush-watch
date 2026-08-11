@@ -1,13 +1,19 @@
 // Routine Rush Watch — application entry point.
 //
-// PHASE 1: BLE uplink bring-up, TIME_SYNC only.
+// PHASE 2: QR pairing.
 //
-// The watch advertises RR_SYNC, accepts a connection from the parent app, and
-// sets its PCF85063 RTC from the epoch the phone writes. That single path
-// exercises advertising, connection, a characteristic write, and a verified
-// hardware side effect — everything else in §6B.3 is the same transport again.
+// The watch mints a persistent device_id, generates an ephemeral pairing
+// nonce, renders both as a QR on the AMOLED, and waits. The parent app scans
+// it and performs the Supabase register+claim under its own authenticated
+// session — the watch itself never talks to Supabase, because wifi is off and
+// BLE is the only uplink (spec §2.2, §6B).
 //
-// Nothing else is implemented: no queue, no routines, no UI, no audio.
+// Phase 1's TIME_SYNC path is still here and is now bond-gated (WRITE_ENC).
+//
+// Not implemented: routine pull, sync engine, queue, routine UI, watch face,
+// audio.
+
+#include <stdio.h>
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
@@ -18,7 +24,9 @@
 #include "bsp/esp-bsp.h"
 
 #include "rr_ble.h"
+#include "rr_identity.h"
 #include "rr_rtc.h"
+#include "rr_ui.h"
 
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 5, 0)
 #error "Routine Rush Watch requires ESP-IDF v5.5+ (board BSP declares idf >=5.5.0)."
@@ -26,42 +34,65 @@
 
 static const char *TAG = "rr_watch";
 
+// The exact shape apps/parent/app/watch/scan.tsx parses. It accepts either
+// this JSON object or a routinerushparent:// URL with the same two query
+// params; JSON is shorter, so the QR stays a lower version and scans faster.
+//
+// Both fields are strings and both are REQUIRED — the scanner rejects the
+// payload outright if either is missing.
+#define PAIRING_PAYLOAD_FMT "{\"device_id\":\"%s\",\"nonce\":\"%s\"}"
+
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Routine Rush Watch — Phase 1 (BLE TIME_SYNC)");
+    ESP_LOGI(TAG, "Routine Rush Watch — Phase 2 (QR pairing)");
     ESP_LOGI(TAG, "ESP-IDF %s", esp_get_idf_version());
 
-    // Shared board I2C bus (GPIO 7/8) — RTC, PMIC, IMU, touch and codec all
-    // hang off it. Must come before rr_rtc_init().
-    ESP_ERROR_CHECK(bsp_i2c_init());
+    // Identity first: the QR cannot be built without it, and a failure here is
+    // fatal to pairing (see rr_identity.c on why we refuse a volatile id).
+    ESP_ERROR_CHECK(rr_identity_init());
+
+    // Display + LVGL. Also brings up the shared I2C bus via the BSP.
+    ESP_ERROR_CHECK(rr_ui_init());
+
     ESP_ERROR_CHECK(rr_rtc_init(bsp_i2c_get_handle()));
 
-    // Report the RTC before any sync. A factory board reads 2000-01-19 with
-    // osc_ok=0 — that is the "before" the test is looking for.
     rr_rtc_time_t now;
-    char buf[24];
+    char tbuf[24];
     if (rr_rtc_get(&now) == ESP_OK) {
-        rr_rtc_format(&now, buf, sizeof(buf));
-        ESP_LOGI(TAG, "RTC at boot: %s (osc_ok=%d)", buf, (int) now.osc_ok);
-        if (!now.osc_ok) {
-            ESP_LOGW(TAG, "RTC has never been set — waiting for TIME_SYNC over BLE");
-        }
+        rr_rtc_format(&now, tbuf, sizeof(tbuf));
+        ESP_LOGI(TAG, "RTC at boot: %s (osc_ok=%d)", tbuf, (int) now.osc_ok);
     }
 
-    // RTC must be live before the radio: a TIME_SYNC write can land the moment
-    // advertising starts.
+    // Radio up before the QR is shown: the phone bonds over BLE as part of the
+    // same pairing moment, so the peripheral must already be advertising by
+    // the time the parent scans the code.
     ESP_ERROR_CHECK(rr_ble_init());
 
-    ESP_LOGI(TAG, "free heap after BLE init: %u bytes", (unsigned) esp_get_free_heap_size());
+    char nonce[RR_NONCE_LEN];
+    rr_identity_new_nonce(nonce, sizeof(nonce));
 
-    // Heartbeat: prints the RTC every 5 s so the jump is visible in the
-    // monitor whether or not you catch the write itself.
+    char payload[128];
+    int n = snprintf(payload, sizeof(payload), PAIRING_PAYLOAD_FMT,
+                     rr_identity_device_id(), nonce);
+    if (n < 0 || n >= (int) sizeof(payload)) {
+        ESP_LOGE(TAG, "pairing payload truncated (%d bytes) — refusing to show a bad QR", n);
+        return;
+    }
+
+    ESP_LOGI(TAG, "──────── PAIRING ────────");
+    ESP_LOGI(TAG, "device_id: %s", rr_identity_device_id());
+    ESP_LOGI(TAG, "nonce:     %s", nonce);
+    ESP_LOGI(TAG, "payload:   %s", payload);
+    ESP_LOGI(TAG, "─────────────────────────");
+
+    ESP_ERROR_CHECK(rr_ui_show_pairing_qr(payload));
+
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
         if (rr_rtc_get(&now) == ESP_OK) {
-            rr_rtc_format(&now, buf, sizeof(buf));
-            ESP_LOGI(TAG, "RTC %s | osc_ok=%d | ble=%s | heap %u",
-                     buf, (int) now.osc_ok,
+            rr_rtc_format(&now, tbuf, sizeof(tbuf));
+            ESP_LOGI(TAG, "RTC %s | ble=%s | heap %u",
+                     tbuf,
                      rr_ble_is_connected() ? "CONNECTED" : "advertising",
                      (unsigned) esp_get_free_heap_size());
         }

@@ -1,0 +1,119 @@
+// rr_ui — LVGL bring-up + pairing QR screen.
+//
+// PHASE 2 SCOPE: display init and the pairing screen only. No watch face, no
+// routine screens.
+//
+// ⚠️ PARTIAL RENDER. The BSP is configured (sdkconfig.defaults:
+// CONFIG_BSP_DISPLAY_LVGL_BUF_HEIGHT=50) to render in 50-line bands rather
+// than a full framebuffer. A full 410x502 16bpp frame is ~400 KiB and there is
+// no PSRAM — it does not fit. Nothing in this file may allocate a full-screen
+// buffer.
+//
+// The QR widget is affordable despite its size because lv_qrcode's canvas is
+// LV_COLOR_FORMAT_I1 (1 bit per pixel): a 320x320 code is ~12.8 KiB, not the
+// ~205 KiB a 16bpp canvas would need.
+
+#include "rr_ui.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "bsp/esp-bsp.h"
+#include "bsp/display.h"
+#include "lvgl.h"
+
+static const char *TAG = "rr_ui";
+
+// The panel is 410x502. Keep the QR comfortably inside the narrow axis so the
+// quiet zone survives — scanners need the light margin around the symbol.
+#define QR_SIZE 320
+
+static lv_obj_t *s_screen;
+
+static void log_heap(const char *when)
+{
+    ESP_LOGI(TAG, "heap %s: free=%u largest_block=%u",
+             when,
+             (unsigned) esp_get_free_heap_size(),
+             (unsigned) heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+}
+
+esp_err_t rr_ui_init(void)
+{
+    log_heap("before LVGL init");
+
+    // bsp_display_start() brings up the SH8601 panel over QSPI, the FT3168
+    // touch controller, and the LVGL port task. It also calls bsp_i2c_init()
+    // internally, which is idempotent.
+    lv_display_t *disp = bsp_display_start();
+    if (disp == NULL) {
+        ESP_LOGE(TAG, "bsp_display_start() failed");
+        return ESP_FAIL;
+    }
+    bsp_display_backlight_on();
+
+    log_heap("after LVGL init");
+
+    // Prove the render path with a trivial label before anything complex is
+    // put on screen. If this does not appear, the problem is the display
+    // pipeline, not the QR encoder.
+    bsp_display_lock(0);
+    s_screen = lv_screen_active();
+    lv_obj_set_style_bg_color(s_screen, lv_color_black(), LV_PART_MAIN);
+
+    lv_obj_t *label = lv_label_create(s_screen);
+    lv_label_set_text(label, "Routine Rush\nstarting...");
+    lv_obj_set_style_text_color(label, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_center(label);
+    bsp_display_unlock();
+
+    ESP_LOGI(TAG, "LVGL up — boot label rendered");
+    return ESP_OK;
+}
+
+esp_err_t rr_ui_show_pairing_qr(const char *payload)
+{
+    if (payload == NULL) return ESP_ERR_INVALID_ARG;
+
+    log_heap("before QR render");
+
+    bsp_display_lock(0);
+
+    lv_obj_clean(s_screen);
+    lv_obj_set_style_bg_color(s_screen, lv_color_white(), LV_PART_MAIN);
+
+    lv_obj_t *qr = lv_qrcode_create(s_screen);
+    lv_qrcode_set_size(qr, QR_SIZE);
+    // Dark-on-light, the orientation every scanner expects. Inverting these
+    // produces a symbol most phones silently refuse to decode.
+    lv_qrcode_set_dark_color(qr, lv_color_black());
+    lv_qrcode_set_light_color(qr, lv_color_white());
+
+    lv_result_t res = lv_qrcode_update(qr, payload, strlen(payload));
+    if (res != LV_RESULT_OK) {
+        bsp_display_unlock();
+        ESP_LOGE(TAG, "lv_qrcode_update failed (payload %u bytes) — too long, or out of memory",
+                 (unsigned) strlen(payload));
+        return ESP_FAIL;
+    }
+
+    lv_obj_align(qr, LV_ALIGN_CENTER, 0, -20);
+    // A white border around the symbol IS the quiet zone. Without it the QR
+    // runs to the edge of its canvas and scan reliability drops sharply.
+    lv_obj_set_style_border_color(qr, lv_color_white(), LV_PART_MAIN);
+    lv_obj_set_style_border_width(qr, 8, LV_PART_MAIN);
+
+    lv_obj_t *hint = lv_label_create(s_screen);
+    lv_label_set_text(hint, "Scan to pair");
+    lv_obj_set_style_text_color(hint, lv_color_black(), LV_PART_MAIN);
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, -24);
+
+    bsp_display_unlock();
+
+    log_heap("after QR render");
+    ESP_LOGI(TAG, "pairing QR rendered (%u bytes, %dpx)", (unsigned) strlen(payload), QR_SIZE);
+    return ESP_OK;
+}
