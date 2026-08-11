@@ -30,3 +30,19 @@
 //
 // Phase 1 exit criteria: phone connects, TIME_SYNC write lands, and the RTC is
 // set from it. Nothing else needs to work yet.
+
+// ── Phase 1 surface (implemented) ────────────────────────────────────────────
+
+#include <stdbool.h>
+#include "esp_err.h"
+
+/**
+ * Bring up NimBLE as a peripheral, register RR_SYNC, and start advertising.
+ *
+ * Requires rr_rtc_init() to have run first — a TIME_SYNC write can arrive as
+ * soon as advertising starts, and its handler writes the RTC.
+ */
+esp_err_t rr_ble_init(void);
+
+/** True while a central is connected. */
+bool rr_ble_is_connected(void);

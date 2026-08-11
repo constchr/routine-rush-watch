@@ -1,6 +1,9 @@
-# rr_ble — RR_SYNC GATT server — the sole uplink (spec Phase 1)
-# SCAFFOLD: no sources yet. Add them to SRCS as the module is implemented.
+# rr_ble — RR_SYNC GATT server, the sole uplink (spec Phase 1)
+#
+# Phase 1 implements TIME_SYNC only. ble_contract.h is GENERATED into
+# include/ by tools/gen-ble-contract.mjs — run it before building.
 idf_component_register(
+    SRCS "src/rr_ble.c"
     INCLUDE_DIRS "include"
-    REQUIRES bt nvs_flash
+    REQUIRES bt nvs_flash rr_power
 )
