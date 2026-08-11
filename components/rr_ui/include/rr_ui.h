@@ -60,5 +60,23 @@ esp_err_t rr_ui_show_last_status(void);
 /** Gate check: Greek + Latin in one font, no boxes. */
 esp_err_t rr_ui_font_selftest(void);
 
-/** §8 screen 2, static (no timer): emoji + label + full ring + position. */
-esp_err_t rr_ui_show_step(const rr_step_view_t *v);
+/** Tap handler for the Done / Skip buttons. */
+typedef void (*rr_ui_step_cb_t)(void);
+
+/**
+ * §8 screen 2/3: emoji + label + (ring if timed) + Done/Skip.
+ * An UNTIMED step (time_limit_s <= 0) gets no ring at all.
+ */
+esp_err_t rr_ui_show_step(const rr_step_view_t *v,
+                          rr_ui_step_cb_t on_done,
+                          rr_ui_step_cb_t on_skip);
+
+/**
+ * Update the ring + mm:ss in place. Safe to call from an lv_timer callback
+ * (the LVGL port mutex is recursive). Updating these two widgets invalidates
+ * only their own areas, so the emoji is NOT re-read from flash each tick.
+ */
+void rr_ui_set_countdown(int remaining_s, int total_s);
+
+/** §8 screen 5, minimal: a tick, the routine name, and a done/skipped count. */
+esp_err_t rr_ui_show_routine_complete(const char *routine_name, int done, int skipped);

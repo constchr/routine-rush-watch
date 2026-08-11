@@ -28,12 +28,16 @@ ROUTINES = [
         "name": "Πρωινή ρουτίνα",
         "emoji": "🌅",
         "steps": [
+            # 15 s (not 120) purely so a full countdown-to-expiry can be
+            # observed in one monitor capture without tapping.
             {"id": "a1", "position": 0, "label": "Βούρτσισμα", "emoji": "🪥",
-             "time_limit_s": 120, "base_xp": 10, "is_required": True},
+             "time_limit_s": 15, "base_xp": 10, "is_required": True},
             {"id": "a2", "position": 1, "label": "Ντύσιμο", "emoji": "👕",
              "time_limit_s": 300, "base_xp": 15, "is_required": True},
+            # UNTIMED: time_limit_s == 0 is the sentinel. No ring, no timer,
+            # Done/Skip only (§8 screen 3).
             {"id": "a3", "position": 2, "label": "Πρωινό", "emoji": "🥣",
-             "time_limit_s": 600, "base_xp": 20, "is_required": False},
+             "time_limit_s": 0, "base_xp": 20, "is_required": False},
         ],
         "schedules": [{"days": [1, 2, 3, 4, 5], "trigger_time": "07:15"}],
     },

@@ -244,6 +244,8 @@ esp_err_t rr_ui_restore_after_reset_prompt(void)
 #define RR_MUTED   lv_color_hex(0x8B949E)
 #define RR_ACCENT  lv_color_hex(0xFF6B35)
 #define RR_SURFACE lv_color_hex(0x161B22)
+#define RR_SUCCESS lv_color_hex(0x3FB950)
+#define RR_DANGER  lv_color_hex(0xFF453A)
 
 // LVGL addresses files as "<LETTER>:<path>". The emoji manifest is generated in
 // the app repo and emits bare POSIX paths ("/lfs/emoji/x.bin"), so we prepend
@@ -290,15 +292,38 @@ esp_err_t rr_ui_font_selftest(void)
     return ESP_OK;
 }
 
-esp_err_t rr_ui_show_step(const rr_step_view_t *v)
+// Handles retained so the 1 Hz tick can update the ring and clock WITHOUT
+// rebuilding the screen. Rebuilding every second would re-read the emoji from
+// flash and thrash the heap; updating two widgets invalidates only their own
+// areas, so the emoji is never redrawn while the step runs.
+static lv_obj_t *s_arc;
+static lv_obj_t *s_mmss;
+
+static void mmss_str(int secs, char *out, size_t cap)
+{
+    if (secs < 0) secs = 0;
+    snprintf(out, cap, "%d:%02d", secs / 60, secs % 60);
+}
+
+static void done_event_cb(lv_event_t *e)
+{
+    rr_ui_step_cb_t cb = (rr_ui_step_cb_t) lv_event_get_user_data(e);
+    if (cb) cb();
+}
+
+esp_err_t rr_ui_show_step(const rr_step_view_t *v,
+                          rr_ui_step_cb_t on_done,
+                          rr_ui_step_cb_t on_skip)
 {
     if (v == NULL) return ESP_ERR_INVALID_ARG;
 
-    log_heap("before step screen");
-
     bsp_display_lock(0);
     lv_obj_clean(s_screen);
+    s_arc = NULL;
+    s_mmss = NULL;
     lv_obj_set_style_bg_color(s_screen, RR_BG, LV_PART_MAIN);
+
+    const bool timed = v->time_limit_s > 0;
 
     // ── position "1 / 3" ────────────────────────────────────────────────────
     char pos[24];
@@ -307,7 +332,7 @@ esp_err_t rr_ui_show_step(const rr_step_view_t *v)
     lv_label_set_text(lpos, pos);
     lv_obj_set_style_text_font(lpos, &rr_font_20, LV_PART_MAIN);
     lv_obj_set_style_text_color(lpos, RR_MUTED, LV_PART_MAIN);
-    lv_obj_align(lpos, LV_ALIGN_TOP_MID, 0, 18);
+    lv_obj_align(lpos, LV_ALIGN_TOP_MID, 0, 12);
 
     // ── emoji, 96px, streamed from littlefs ─────────────────────────────────
     char lvpath[96];
@@ -316,65 +341,159 @@ esp_err_t rr_ui_show_step(const rr_step_view_t *v)
     if (posix_path != NULL && to_lv_path(posix_path, lvpath, sizeof(lvpath))) {
         lv_obj_t *img = lv_image_create(s_screen);
         lv_image_set_src(img, lvpath);
-        lv_obj_align(img, LV_ALIGN_TOP_MID, 0, 52);
+        lv_obj_align(img, LV_ALIGN_TOP_MID, 0, 40);
         drew_emoji = true;
-        ESP_LOGI(TAG, "emoji '%s' -> %s", v->emoji, lvpath);
     } else {
-        // Fallback dot (§8) — an unmapped emoji must not leave a hole.
         lv_obj_t *dot = lv_obj_create(s_screen);
         lv_obj_set_size(dot, 96, 96);
         lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
         lv_obj_set_style_bg_color(dot, RR_SURFACE, LV_PART_MAIN);
         lv_obj_set_style_border_width(dot, 0, LV_PART_MAIN);
-        lv_obj_align(dot, LV_ALIGN_TOP_MID, 0, 52);
-        ESP_LOGW(TAG, "emoji '%s' unmapped — drew fallback dot", v->emoji);
+        lv_obj_align(dot, LV_ALIGN_TOP_MID, 0, 40);
+        ESP_LOGW(TAG, "emoji '%s' unmapped — fallback dot", v->emoji);
     }
 
-    // ── step label, Greek font, wraps ───────────────────────────────────────
+    // ── step label ──────────────────────────────────────────────────────────
     lv_obj_t *llabel = lv_label_create(s_screen);
     lv_label_set_long_mode(llabel, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(llabel, 360);
+    lv_obj_set_width(llabel, 370);
     lv_label_set_text(llabel, v->label);
     lv_obj_set_style_text_font(llabel, &rr_font_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(llabel, RR_TEXT, LV_PART_MAIN);
     lv_obj_set_style_text_align(llabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(llabel, LV_ALIGN_TOP_MID, 0, 168);
+    lv_obj_align(llabel, LV_ALIGN_TOP_MID, 0, 148);
 
-    // ── countdown ring — STATIC at full for now (no timer this session) ─────
-    lv_obj_t *arc = lv_arc_create(s_screen);
-    lv_obj_set_size(arc, 190, 190);
-    lv_arc_set_rotation(arc, 270);
-    lv_arc_set_bg_angles(arc, 0, 360);
-    lv_arc_set_range(arc, 0, 100);
-    lv_arc_set_value(arc, 100);                 // full — a fresh, unstarted step
-    lv_obj_remove_style(arc, NULL, LV_PART_KNOB);
-    lv_obj_remove_flag(arc, LV_OBJ_FLAG_CLICKABLE);
-    lv_obj_set_style_arc_width(arc, 14, LV_PART_MAIN);
-    lv_obj_set_style_arc_width(arc, 14, LV_PART_INDICATOR);
-    lv_obj_set_style_arc_color(arc, RR_SURFACE, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(arc, RR_ACCENT, LV_PART_INDICATOR);
-    lv_obj_align(arc, LV_ALIGN_BOTTOM_MID, 0, -22);
+    // ── countdown ring — only for TIMED steps ───────────────────────────────
+    // §8 screen 3: an untimed step has no ring at all. Showing an empty or
+    // full ring that never moves would imply a timer that is broken.
+    if (timed) {
+        s_arc = lv_arc_create(s_screen);
+        lv_obj_set_size(s_arc, 150, 150);
+        lv_arc_set_rotation(s_arc, 270);
+        lv_arc_set_bg_angles(s_arc, 0, 360);
+        lv_arc_set_range(s_arc, 0, 1000);      // finer than seconds, so the
+        lv_arc_set_value(s_arc, 1000);         // sweep looks continuous
+        lv_obj_remove_style(s_arc, NULL, LV_PART_KNOB);
+        lv_obj_remove_flag(s_arc, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_arc_width(s_arc, 12, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(s_arc, 12, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(s_arc, RR_SURFACE, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(s_arc, RR_ACCENT, LV_PART_INDICATOR);
+        lv_obj_align(s_arc, LV_ALIGN_TOP_MID, 0, 240);
 
-    // mm:ss in the ring centre. Untimed steps show a dash rather than 0:00,
-    // which would read as "already expired".
-    char mmss[16];
-    if (v->time_limit_s > 0) {
-        snprintf(mmss, sizeof(mmss), "%d:%02d", v->time_limit_s / 60, v->time_limit_s % 60);
-    } else {
-        snprintf(mmss, sizeof(mmss), "—");
+        char buf[16];
+        mmss_str(v->time_limit_s, buf, sizeof(buf));
+        s_mmss = lv_label_create(s_screen);
+        lv_label_set_text(s_mmss, buf);
+        lv_obj_set_style_text_font(s_mmss, &rr_font_28, LV_PART_MAIN);
+        lv_obj_set_style_text_color(s_mmss, RR_TEXT, LV_PART_MAIN);
+        lv_obj_align_to(s_mmss, s_arc, LV_ALIGN_CENTER, 0, 0);
     }
-    lv_obj_t *lring = lv_label_create(s_screen);
-    lv_label_set_text(lring, mmss);
-    lv_obj_set_style_text_font(lring, &rr_font_28, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lring, RR_TEXT, LV_PART_MAIN);
-    lv_obj_align_to(lring, arc, LV_ALIGN_CENTER, 0, 0);
+
+    // ── Done: the primary action, deliberately the biggest thing on screen ──
+    lv_obj_t *bdone = lv_button_create(s_screen);
+    lv_obj_set_size(bdone, 300, 68);
+    lv_obj_align(bdone, LV_ALIGN_BOTTOM_MID, 0, -62);
+    lv_obj_set_style_bg_color(bdone, RR_ACCENT, LV_PART_MAIN);
+    lv_obj_set_style_radius(bdone, 34, LV_PART_MAIN);
+    lv_obj_add_event_cb(bdone, done_event_cb, LV_EVENT_CLICKED, (void *) on_done);
+    lv_obj_t *ldone = lv_label_create(bdone);
+    lv_label_set_text(ldone, "OK");
+    lv_obj_set_style_text_font(ldone, &rr_font_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ldone, RR_BG, LV_PART_MAIN);
+    lv_obj_center(ldone);
+
+    // ── Skip: present but visually quiet, so it is not the obvious tap ──────
+    lv_obj_t *bskip = lv_button_create(s_screen);
+    lv_obj_set_size(bskip, 140, 40);
+    lv_obj_align(bskip, LV_ALIGN_BOTTOM_MID, 0, -14);
+    lv_obj_set_style_bg_color(bskip, RR_BG, LV_PART_MAIN);
+    lv_obj_set_style_border_width(bskip, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(bskip, RR_MUTED, LV_PART_MAIN);
+    lv_obj_set_style_radius(bskip, 20, LV_PART_MAIN);
+    lv_obj_add_event_cb(bskip, done_event_cb, LV_EVENT_CLICKED, (void *) on_skip);
+    lv_obj_t *lskip = lv_label_create(bskip);
+    lv_label_set_text(lskip, "Skip");
+    lv_obj_set_style_text_font(lskip, &rr_font_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lskip, RR_MUTED, LV_PART_MAIN);
+    lv_obj_center(lskip);
 
     bsp_display_unlock();
 
-    log_heap("after step screen");
-    ESP_LOGI(TAG, "step screen: [%d/%d] '%s' %s  limit=%ds  emoji=%s",
+    ESP_LOGI(TAG, "step [%d/%d] '%s' %s limit=%ds emoji=%s",
              v->position + 1, v->step_count, v->label, v->emoji,
-             v->time_limit_s, drew_emoji ? "rendered" : "FALLBACK");
+             v->time_limit_s, drew_emoji ? "ok" : "FALLBACK");
     s_last_screen = RR_SCREEN_NONE;
+    return ESP_OK;
+}
+
+void rr_ui_set_countdown(int remaining_s, int total_s)
+{
+    if (s_arc == NULL || s_mmss == NULL || total_s <= 0) return;
+
+    bsp_display_lock(0);   // recursive mutex: safe from an lv_timer callback
+
+    int val = (int) ((int64_t) remaining_s * 1000 / total_s);
+    if (val < 0) val = 0;
+    lv_arc_set_value(s_arc, val);
+
+    char buf[16];
+    mmss_str(remaining_s, buf, sizeof(buf));
+    lv_label_set_text(s_mmss, buf);
+
+    // At zero the step STAYS ACTIVE (§8) — the colour change is the only
+    // signal, deliberately: auto-advancing would take the decision away from
+    // a child who is mid-task.
+    if (remaining_s <= 0) {
+        lv_obj_set_style_arc_color(s_arc, RR_DANGER, LV_PART_INDICATOR);
+        lv_obj_set_style_text_color(s_mmss, RR_DANGER, LV_PART_MAIN);
+    }
+
+    bsp_display_unlock();
+}
+
+esp_err_t rr_ui_show_routine_complete(const char *routine_name, int done, int skipped)
+{
+    bsp_display_lock(0);
+    lv_obj_clean(s_screen);
+    s_arc = NULL;
+    s_mmss = NULL;
+    lv_obj_set_style_bg_color(s_screen, RR_BG, LV_PART_MAIN);
+
+    lv_obj_t *tick = lv_label_create(s_screen);
+    lv_label_set_text(tick, LV_SYMBOL_OK);
+    lv_obj_set_style_text_font(tick, &rr_font_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(tick, RR_SUCCESS, LV_PART_MAIN);
+    lv_obj_align(tick, LV_ALIGN_CENTER, 0, -110);
+
+    // Greek, because the cached routine is Greek and this proves the font on a
+    // second screen. child.language is not cached yet (Phase 5), so this is
+    // not yet locale-driven — noted in rr_routine.h.
+    lv_obj_t *big = lv_label_create(s_screen);
+    lv_label_set_text(big, "Τέλος!");
+    lv_obj_set_style_text_font(big, &rr_font_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(big, RR_TEXT, LV_PART_MAIN);
+    lv_obj_align(big, LV_ALIGN_CENTER, 0, -50);
+
+    lv_obj_t *name = lv_label_create(s_screen);
+    lv_label_set_long_mode(name, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(name, 360);
+    lv_label_set_text(name, routine_name ? routine_name : "");
+    lv_obj_set_style_text_font(name, &rr_font_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(name, RR_MUTED, LV_PART_MAIN);
+    lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(name, LV_ALIGN_CENTER, 0, 10);
+
+    char summary[48];
+    snprintf(summary, sizeof(summary), "%d done  ·  %d skipped", done, skipped);
+    lv_obj_t *sum = lv_label_create(s_screen);
+    lv_label_set_text(sum, summary);
+    lv_obj_set_style_text_font(sum, &rr_font_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(sum, RR_MUTED, LV_PART_MAIN);
+    lv_obj_align(sum, LV_ALIGN_CENTER, 0, 70);
+
+    bsp_display_unlock();
+
+    ESP_LOGI(TAG, "routine complete: %d done, %d skipped", done, skipped);
     return ESP_OK;
 }
