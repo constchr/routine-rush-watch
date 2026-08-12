@@ -197,11 +197,49 @@ ${attCodes.map(c =>
 `
 
 if (process.argv.includes('--check')) {
-  let current = ''
-  try { current = readFileSync(OUT, 'utf8') } catch { /* not generated yet */ }
-  if (current !== h) {
-    fail('ble_contract.h is stale or missing — run: node tools/gen-ble-contract.mjs')
+  // ── ABSENT IS NOT DRIFT ─────────────────────────────────────────────────
+  //
+  // This used to be `if (current !== h) fail(...)`, which conflated two
+  // completely different conditions: a header that DISAGREES with the contract
+  // (a real problem — the firmware would be built against a stale protocol) and
+  // a header that simply is not there yet.
+  //
+  // ble_contract.h is a BUILD ARTEFACT and is gitignored (.gitignore), so on a
+  // clean checkout it can never exist — which meant --check failed by
+  // construction in CI. That is exactly what happened on this repo's first-ever
+  // Actions run (b797d33): the "Header matches vendored contract" step exited 1,
+  // and because it failed, the step that actually matters — the cross-repo drift
+  // check against the app repo — was SKIPPED and never evaluated. A spurious
+  // failure hid a real one.
+  //
+  // Note what --check still protects, regardless of the header: every validation
+  // in this file (layout offsets summing to the exported *_SIZE constants, ATT
+  // codes being byte-sized, the characteristic table parsing at all) runs above
+  // this point and calls fail() on its own. Reaching here already means the
+  // contract is self-consistent. The header comparison is the smaller half.
+  //
+  // Fixed script-side rather than by generating before checking in the workflow:
+  // "generate, then compare the generated file to itself" always passes, so it
+  // would have turned the step into a no-op that still LOOKED like a check —
+  // and it would have left `--check` misleading for anyone running it locally
+  // after switching branches, which is the case it is genuinely useful for.
+  let current = null
+  try { current = readFileSync(OUT, 'utf8') } catch { /* absent — handled below */ }
+
+  if (current === null) {
+    // Produce it, so the caller ends up in the state they were checking for.
+    mkdirSync(dirname(OUT), { recursive: true })
+    writeFileSync(OUT, h)
+    console.log('gen-ble-contract: contract is self-consistent; header was absent '
+                + '(build artefact, gitignored) and has been generated')
+    process.exit(0)
   }
+
+  if (current !== h) {
+    fail('ble_contract.h DISAGREES with tools/watchProtocol.ts — regenerate: '
+         + 'node tools/gen-ble-contract.mjs')
+  }
+
   console.log('gen-ble-contract: header is up to date')
   process.exit(0)
 }

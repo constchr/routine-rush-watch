@@ -20,16 +20,23 @@ jobs:
   ble-contract:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '20'
 
-      # 1. Local consistency: is the committed header what the generator
-      #    produces from the committed contract? Also revalidates that the
-      #    contract's documented offsets sum to its exported sizes.
-      - name: Header matches vendored contract
+      # 1. Local consistency: does the vendored contract parse, do its documented
+      #    offsets sum to its exported *_SIZE constants, and are the ATT codes
+      #    byte-sized? Those validations are what this step is really for — they
+      #    run inside the generator and fail it on their own.
+      #
+      #    ble_contract.h itself is a gitignored BUILD ARTEFACT, so it never
+      #    exists on a clean checkout. --check used to treat that as drift and
+      #    failed here by construction — which is how this repo's first Actions
+      #    run went red while SKIPPING the cross-repo check below. It now
+      #    distinguishes absent (generate it) from disagreeing (fail).
+      - name: Contract is self-consistent (and header in sync if present)
         run: node tools/gen-ble-contract.mjs --check
 
       # 2. Cross-repo drift: has the app repo's contract moved on without us?
@@ -60,9 +67,9 @@ jobs:
     runs-on: ubuntu-latest
     needs: ble-contract
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: '20'
 
@@ -120,7 +127,7 @@ jobs:
           echo "--- app partition usage ---"
           python -m esptool --chip esp32c6 image_info build/routine_rush_watch.bin 2>/dev/null | head -20 || true
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: routine-rush-watch-${{ github.sha }}
           path: |

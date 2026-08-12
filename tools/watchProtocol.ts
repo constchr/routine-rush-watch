@@ -408,6 +408,40 @@ export const AUDIO_VOLUME_MAX_PCT = 100
 /** `quiet_from` / `quiet_to` are LOCAL 24-hour "HH:MM". */
 export const AUDIO_QUIET_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/
 
+/**
+ * Validate a set_audio command before it goes on the wire.
+ *
+ * The firmware rejects a bad field with ATT 0x0E and applies NOTHING (see
+ * rr_ble.c set_audio), so a malformed send is a silent no-op from the parent's
+ * point of view. Failing here instead turns that into a real error with a
+ * reason, which is the difference between "the slider did nothing" and a bug
+ * report someone can act on.
+ */
+export function assertSetAudio(c: Extract<RrControlCommand, { cmd: 'set_audio' }>): void {
+  const pct = (name: string, v: number | undefined) => {
+    if (v === undefined) return
+    if (!Number.isInteger(v) || v < AUDIO_VOLUME_MIN_PCT || v > AUDIO_VOLUME_MAX_PCT) {
+      throw new RangeError(`set_audio.${name} must be an integer 0..100, got ${v}`)
+    }
+  }
+  pct('volume_pct', c.volume_pct)
+  pct('quiet_volume_pct', c.quiet_volume_pct)
+
+  // null is meaningful — it DISABLES the window — and is distinct from omitting
+  // the field, which leaves it alone. Only a string has to look like a time.
+  if (typeof c.quiet_from === 'string' && !AUDIO_QUIET_TIME_RE.test(c.quiet_from)) {
+    throw new RangeError(`set_audio.quiet_from must be LOCAL "HH:MM", got ${c.quiet_from}`)
+  }
+  if (c.quiet_to !== undefined && !AUDIO_QUIET_TIME_RE.test(c.quiet_to)) {
+    throw new RangeError(`set_audio.quiet_to must be LOCAL "HH:MM", got ${c.quiet_to}`)
+  }
+  // A window needs both ends. Sending only quiet_to would silently pair a new
+  // end with whatever start the watch already had.
+  if (typeof c.quiet_from === 'string' && c.quiet_to === undefined) {
+    throw new RangeError('set_audio.quiet_from given without quiet_to')
+  }
+}
+
 // ── RR_CONTROL response codes ────────────────────────────────────────────────
 //
 // RR_CONTROL is write-only with NO notify, by design: "the ATT write response
@@ -438,6 +472,7 @@ export const RR_CONTROL_ATT = {
 } as const
 
 export function encodeControl(command: RrControlCommand): Uint8Array {
+  if (command.cmd === 'set_audio') assertSetAudio(command)
   const json = utf8Encode(JSON.stringify(command))
   const out = new Uint8Array(RR_CONTROL_LEN_PREFIX_BYTES + json.byteLength)
   view(out).setUint32(0, json.byteLength, true)
