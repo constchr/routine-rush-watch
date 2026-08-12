@@ -9,6 +9,6 @@ idf_component_register(
     # the /lfs/audio/... path table. Same arrangement as rr_ui and the emoji
     # manifest — generated tables live with the assets, not in include/.
     INCLUDE_DIRS "include" "../../assets/audio"
-    REQUIRES esp_driver_i2s espressif__esp_codec_dev
+    REQUIRES esp_driver_i2s espressif__esp_codec_dev nvs_flash rr_rtc
              waveshare__esp32_c6_touch_amoled_2_06
 )

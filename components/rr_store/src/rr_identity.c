@@ -217,3 +217,51 @@ void rr_identity_new_uuid(char *out, size_t out_len)
 {
     mint_uuid_v4(out, out_len);
 }
+
+// ── BLE address generation (see rr_identity.h for why this exists) ───────────
+
+#define NVS_KEY_BLE_GEN "ble_gen"
+
+static uint8_t s_ble_gen;
+static bool    s_ble_gen_loaded;
+
+uint8_t rr_identity_ble_generation(void)
+{
+    if (s_ble_gen_loaded) return s_ble_gen;
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, NVS_KEY_BLE_GEN, &v) == ESP_OK) s_ble_gen = v;
+        nvs_close(h);
+    }
+    s_ble_gen_loaded = true;
+    return s_ble_gen;
+}
+
+esp_err_t rr_identity_bump_ble_generation(const char *reason)
+{
+    const uint8_t next = (uint8_t) (rr_identity_ble_generation() + 1);
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        // Without persistence the new address would revert on the next boot and
+        // the watch would drop straight back into the broken state.
+        ESP_LOGE(TAG, "cannot persist BLE generation (%s) — the new address will "
+                      "NOT survive a reboot", esp_err_to_name(err));
+        return err;
+    }
+    err = nvs_set_u8(h, NVS_KEY_BLE_GEN, next);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) return err;
+
+    s_ble_gen = next;
+    s_ble_gen_loaded = true;
+    ESP_LOGW(TAG, "BLE address generation %u -> %u (%s) — the watch will look like "
+                  "a NEW peripheral so the phone can bond again. device_id is "
+                  "unchanged, so the server-side pairing is untouched.",
+             (unsigned) (next - 1), (unsigned) next, reason ? reason : "unspecified");
+    return ESP_OK;
+}

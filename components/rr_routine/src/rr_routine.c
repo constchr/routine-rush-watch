@@ -12,6 +12,7 @@
 #include "lvgl.h"
 #include "cJSON.h"
 
+#include "rr_audio.h"
 #include "rr_store.h"
 #include "rr_identity.h"
 #include "rr_rtc.h"
@@ -205,6 +206,11 @@ static void finish_routine(void)
 
     queue_run_record();
 
+    // Fanfare then chime, in that order — the effect queue is FIFO precisely so
+    // these are two sounds and not one clobbering the other.
+    rr_audio_play_tone(RR_TONE_ROUTINE_COMPLETE);
+    rr_audio_play_tone(RR_TONE_XP_CHIME);
+
     rr_ui_show_routine_complete(s.routine_name, done, skipped);
     log_heap("at routine complete");
 
@@ -224,6 +230,10 @@ static void advance(rr_step_outcome_t outcome)
 
     ESP_LOGI(TAG, "step %d/%d -> %s", s.step_idx + 1, s.step_count,
              outcome == RR_STEP_DONE ? "DONE" : "SKIPPED");
+
+    // A blip for Done only. A skip is not an achievement and should not sound
+    // like one — the kids app makes the same distinction.
+    if (outcome == RR_STEP_DONE) rr_audio_play_tone(RR_TONE_STEP_DONE);
 
     stop_tick();
     s.step_idx++;
@@ -261,6 +271,21 @@ static void show_current_step(void)
     rr_ui_show_step(&v, on_done, on_skip);
     log_heap(s.step_idx == 0 ? "after first step screen" : "after step advance");
 
+    // §10B.4: read the step aloud in the child's language. Genuinely useful for
+    // pre-readers, which is the same audience the emoji are there for.
+    //
+    // A MISS IS NORMAL, not a failure: prompts are pre-rendered for the starter
+    // templates only, and a parent can type any label they like. A custom step
+    // gets the screen and no voice — deliberately silent rather than falling
+    // back to an unrelated tone, which would teach the child that a sound means
+    // nothing in particular.
+    rr_child_t child;
+    const char *lang = (rr_store_get_child(&child) == ESP_OK) ? child.language : "en";
+    esp_err_t voiced = rr_audio_play_voice(v.emoji, v.label, lang);
+    if (voiced == ESP_ERR_NOT_FOUND) {
+        ESP_LOGI(TAG, "no voice clip for '%s' %s (%s) — screen only", v.label, v.emoji, lang);
+    }
+
     if (v.time_limit_s > 0) {
         s.tick = lv_timer_create(tick_cb, 1000, NULL);
         ESP_LOGI(TAG, "countdown started: %d s", v.time_limit_s);
@@ -291,6 +316,7 @@ esp_err_t rr_routine_start(int routine_idx)
     s.clock_uncertain = (rr_rtc_get(&rt) != ESP_OK) || !rt.osc_ok;
 
     ESP_LOGI(TAG, "════ START '%s' — %d step(s) ════", s.routine_name, s.step_count);
+    rr_audio_play_tone(RR_TONE_ROUTINE_START);
     log_heap("at routine start");
 
     show_current_step();

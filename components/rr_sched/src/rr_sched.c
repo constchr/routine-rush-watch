@@ -211,7 +211,9 @@ static void ring(void)
     // The ONLY alerting channel on this board — there is no vibration motor
     // (§2). If this is silent the routine is invisible, so the failure is
     // logged at ERROR rather than swallowed.
-    if (rr_audio_play_tone(RR_TONE_ALARM) != ESP_OK) {
+    // play_alarm, not play_tone: it flushes anything queued so the alarm is
+    // never third in line behind a step blip.
+    if (rr_audio_play_alarm() != ESP_OK) {
         ESP_LOGE(TAG, "ALARM TONE DID NOT PLAY — the fire is visual only");
     }
 

@@ -1,6 +1,6 @@
 // Routine Rush Watch — application entry point.
 //
-// PHASE 9: step counting on the QMI8658's on-chip pedometer.
+// PHASE 8: full audio — ADPCM voice prompts, effects, volume + quiet hours.
 //
 // The watch mints a persistent device_id, generates an ephemeral pairing
 // nonce, renders both as a QR on the AMOLED, and waits. The parent app scans
@@ -10,9 +10,8 @@
 //
 // Phase 1's TIME_SYNC path is still here and is now bond-gated (WRITE_ENC).
 //
-// Not implemented: the sync engine, power tuning (Phase 10), and the full
-// audio subsystem (Phase 8 — only the alarm tone path exists, see rr_audio.h).
-// Steps are local-only by design (§10.1 leaves backend sync to v1.1).
+// Not implemented: the sync engine and power tuning (Phase 10). Steps and the
+// audio policy are local-only by design (§10.1 leaves step sync to v1.1).
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -20,6 +19,7 @@
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
+#include "esp_pm.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
@@ -40,6 +40,7 @@
 #include "rr_sched.h"
 #include "rr_audio.h"
 #include "rr_steps.h"
+#include "rr_powerlog.h"
 
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 5, 0)
 #error "Routine Rush Watch requires ESP-IDF v5.5+ (board BSP declares idf >=5.5.0)."
@@ -66,12 +67,72 @@ static const char *TAG = "rr_watch";
 // Both conditions are required. Paired-but-no-child is a real intermediate
 // state (bonded, first ROUTINE_PUSH not yet arrived) and it gets the honest
 // "waiting for routines" screen instead of a face with an empty avatar slot.
+// ⚠️ CALLED TWICE A SECOND by rr_idle's tick, so it must be cheap.
+//
+// It was not: every call did stat + fopen + malloc + fread + cJSON parse on
+// /lfs/cache/child.json. That is ~172,800 littlefs reads a day to answer a
+// question that changes at most once per pairing, and it kept the SPI flash out
+// of idle around the clock.
+//
+// Cached, and the cache is sound rather than merely convenient:
+//   • Once TRUE it stays true for this boot. The only thing that makes it false
+//     again is a factory reset, and rr_ble_factory_reset() ends in esp_restart()
+//     — so a stale `true` cannot outlive the state it describes.
+//   • While FALSE (unpaired, or paired-but-awaiting-the-first-push) it is
+//     re-checked, because that is the transition rr_idle polls for to promote the
+//     "Paired ✓" screen to the live face. Rate-limited to once a second: the
+//     pairing moment does not need 2 Hz resolution.
+static bool s_face_ok;
+static int64_t s_face_checked_ms;
+
 static bool watchface_allowed(void)
 {
+    if (s_face_ok) return true;
+
+    const int64_t now = (int64_t) xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if (s_face_checked_ms != 0 && now - s_face_checked_ms < 1000) return false;
+    s_face_checked_ms = now;
+
     if (!rr_identity_is_paired()) return false;
 
     rr_child_t child;
-    return rr_store_get_child(&child) == ESP_OK;
+    if (rr_store_get_child(&child) != ESP_OK) return false;
+
+    ESP_LOGI(TAG, "watch face unlocked (paired + child cached) — gate now cached");
+    s_face_ok = true;
+    return true;
+}
+
+// The queue depth changed — a run was just completed, or a phone acked one.
+//
+// Two consumers, wired here because rr_store sits under both of them and must
+// not call either directly (see rr_store_set_queue_changed_hook):
+//   • the watch face, whose "N to upload" badge was otherwise stale for up to a
+//     minute after a successful drain — which reads as a failed sync;
+//   • a connected phone, which previously only ever heard about acks it had
+//     itself caused, so a routine finishing mid-connection went unannounced.
+// ⚠️ THIS RUNS INSIDE rr_queue_append() AND rr_queue_ack(), AND ONE OF THOSE IS
+// ON THE NimBLE HOST TASK. Keep it to flag-setting and cheap calls.
+//
+// The first version called rr_ble_notify_queue_status() here, which reaches
+// rr_queue_oldest_ts(). Both that and rr_queue_ack() then used 1 KB STACK
+// buffers, so an ack nested two 1 KB frames inside nimble_host's ~4 KB stack and
+// the watch panicked on every single RUN_ACK ("Stack protection fault, task
+// nimble_host"). Those buffers are on the heap now, but the lesson stands: this
+// hook is called from a BLE callback and must stay shallow.
+//
+// The notify itself is not lost — run_ack_access_cb() already sends one after
+// rr_queue_ack() returns, which is the correct place for it: outside the frame,
+// with the ATT response already on its way.
+static void queue_changed(void)
+{
+    rr_idle_notify_queue_changed();
+
+    // Advertise briskly for a short window so a phone in the next room finds the
+    // watch quickly. Only on a NON-EMPTY queue, so the ack that empties it does
+    // not buy 30 s of fast advertising nobody needs — and adv_refresh() is a
+    // no-op while connected, which is exactly when acks arrive.
+    if (rr_queue_count() > 0) rr_ble_note_queue_activity();
 }
 
 // rr_routine's finish hook is void(void); rr_sched_rearm carries a reason
@@ -98,8 +159,38 @@ static bool idle_suspended(void)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Routine Rush Watch — Phase 9 (step counting)");
+    ESP_LOGI(TAG, "Routine Rush Watch — Phase 8 (voice prompts + audio policy)");
     ESP_LOGI(TAG, "ESP-IDF %s", esp_get_idf_version());
+
+    // ── Power management: DFS ON, automatic light sleep DELIBERATELY OFF ─────
+    //
+    // sdkconfig has had CONFIG_PM_ENABLE=y and tickless idle set since Phase 0,
+    // but esp_pm_configure() was never called — so none of it was live and the
+    // CPU ran flat out at 160 MHz forever. This turns on dynamic frequency
+    // scaling, which drops the CPU toward the XTAL rate whenever no driver holds
+    // a performance lock. IDF's own drivers take those locks, so this is safe
+    // with QSPI, I2C and I2S in use.
+    //
+    // light_sleep_enable stays FALSE, and that is a hardware conclusion rather
+    // than caution:
+    //   • CONFIG_BT_LE_SLEEP_ENABLE is not set, so the BLE controller holds the
+    //     main XTAL up. Automatic light sleep would therefore buy almost nothing
+    //     while advertising — which is always — and risks BLE timing.
+    //   • Enabling BLE sleep properly wants a 32.768 kHz low-power clock. This
+    //     board cannot give the SoC one: the ESP32-C6's XTAL_32K pins are
+    //     GPIO0/GPIO1, and here those are QSPI_SCL and QSPI_SIO0 for the display
+    //     (vendor pin audit). The 32 kHz crystal on the board belongs to the
+    //     PCF85063. Hence CONFIG_RTC_CLK_SRC_INT_RC.
+    // So light sleep is a separate, measured exercise with the BLE controller
+    // config in scope — not a flag to flip here.
+    const esp_pm_config_t pm = {
+        .max_freq_mhz = 160,
+        .min_freq_mhz = 40,          // the XTAL rate on this part
+        .light_sleep_enable = false,
+    };
+    esp_err_t pm_err = esp_pm_configure(&pm);
+    ESP_LOGI(TAG, "power management: DFS %d-%d MHz, light sleep off (%s)",
+             pm.min_freq_mhz, pm.max_freq_mhz, esp_err_to_name(pm_err));
 
     // NVS first — app_main owns the NVS lifecycle for the whole firmware.
     //
@@ -168,6 +259,11 @@ void app_main(void)
     // a ROUTINE_PUSH can arrive as soon as we advertise and its handler writes
     // straight to the cache.
     ESP_ERROR_CHECK(rr_store_init());
+
+    // Fan queue-depth changes out to the face and the phone. Registered before
+    // rr_ble_init() so a run appended by a very early ROUTINE_PUSH + start still
+    // notifies; both targets no-op safely until their own init has run.
+    rr_store_set_queue_changed_hook(queue_changed);
 
     // Radio up: the phone bonds over BLE as part of the same pairing moment,
     // so the peripheral must be advertising by the time the parent scans.
@@ -273,8 +369,18 @@ void app_main(void)
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(rr_sched_init());
 
+#ifdef RR_POWERLOG
+    // Opt-in: `idf.py -DRR_POWERLOG=1 build`. Off by default so a shipping image
+    // carries no measurement task — see docs/POWER.md for the procedure.
+    rr_powerlog_start(60);
+#endif
+
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        // 30 s, not 5. Each tick reads the RTC over I2C, LINE-SCANS runs.log for
+        // the queue depth, and writes a console line — cheap individually, but it
+        // is pure diagnostics running forever on a battery device. 30 s still
+        // gives a usable trace when a monitor is attached.
+        vTaskDelay(pdMS_TO_TICKS(30000));
         // Both clocks, every tick. The timezone bug survived as long as it did
         // because this line printed one time and the face showed another, with
         // nothing saying which was which or that an offset was missing.
@@ -285,14 +391,29 @@ void app_main(void)
             if (rr_rtc_has_utc_offset() && rr_rtc_get_local(&local) == ESP_OK) {
                 rr_rtc_format(&local, lbuf, sizeof(lbuf));
             }
+            // The live PM config rides the heartbeat, not just the boot banner.
+            // Boot lines are unrecoverable over USB-Serial-JTAG (resetting the
+            // chip tears down the CDC, so the first second is lost), and
+            // docs/POWER.md's before/after procedure depends on knowing whether
+            // DFS and light sleep were actually in force for a given capture.
+            esp_pm_config_t pmc = { 0 };
+            const char *pm_desc = "pm?";
+            char pm_buf[40];
+            if (esp_pm_get_configuration(&pmc) == ESP_OK) {
+                snprintf(pm_buf, sizeof(pm_buf), "%d-%dMHz ls=%d",
+                         pmc.min_freq_mhz, pmc.max_freq_mhz, (int) pmc.light_sleep_enable);
+                pm_desc = pm_buf;
+            }
+
             ESP_LOGI(TAG, "UTC %s | local %s | ble=%s | routine=%s | screen=%s | queued=%d "
-                          "| steps %" PRIu32 "%s | heap %u",
+                          "| steps %" PRIu32 "%s | %s | heap %u",
                      tbuf, lbuf,
                      rr_ble_is_connected() ? "CONNECTED" : "advertising",
                      rr_routine_is_active() ? "RUNNING" : "idle",
                      rr_idle_is_awake() ? "awake" : "asleep",
                      rr_queue_count(),
                      rr_steps_today(), rr_steps_valid() ? "" : "(invalid)",
+                     pm_desc,
                      (unsigned) esp_get_free_heap_size());
         }
     }

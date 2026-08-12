@@ -33,6 +33,37 @@ if(RR_DEV_NONCE)
     message(WARNING "RR_DEV_NONCE is set — dev nonce + alternate BLE address. TEST BUILDS ONLY.")
 endif()
 
+# -DRR_ROTATE_BLE_ADDR=1 gives the watch a fresh BLE identity at boot IF it is
+# paired with zero bonds — the state where the phone holds a key the watch lost,
+# every connection fails encryption, and no iOS app can forget a BLE bond. It
+# keeps device_id (so the server-side pairing survives) and costs one stale entry
+# in the phone's bond list. Opt-in because doing it automatically turned a crash
+# loop into repeated pairing prompts; see on_sync().
+if(RR_ROTATE_BLE_ADDR)
+    idf_build_set_property(COMPILE_DEFINITIONS "RR_ROTATE_BLE_ADDR=1" APPEND)
+    message(WARNING "RR_ROTATE_BLE_ADDR is set — the watch may present a NEW BLE identity.")
+endif()
+
+# -DRR_CLEAR_BONDS=1 wipes the BLE bond store once at boot and nothing else.
+#
+# Recovery for the state where the paired phone's bond has been evicted: the watch
+# advertises and answers scans but every connection fails encryption, which looks
+# like "sync is stuck". Flash this, boot once, connect the phone to re-bond, then
+# flash a normal build. It does NOT touch device_id, pairing state or the cache —
+# a factory reset would, and that costs a QR re-registration.
+if(RR_CLEAR_BONDS)
+    idf_build_set_property(COMPILE_DEFINITIONS "RR_CLEAR_BONDS=1" APPEND)
+    message(WARNING "RR_CLEAR_BONDS is set — this image ERASES ALL BLE BONDS at boot.")
+endif()
+
+# -DRR_POWERLOG=1 compiles in the SOC-drop power measurement task (docs/POWER.md).
+# There is no current-sense hardware on this board and the AXP2101 has no battery
+# current ADC, so timing the fuel gauge is the only real measurement available.
+if(RR_POWERLOG)
+    idf_build_set_property(COMPILE_DEFINITIONS "RR_POWERLOG=1" APPEND)
+    message(STATUS "RR_POWERLOG enabled — battery SOC will be logged every 60 s")
+endif()
+
 # ── littlefs image: the emoji set ────────────────────────────────────────────
 # The manifest expects the images under an "emoji/" directory INSIDE the
 # partition, so stage them into that shape at configure time rather than
@@ -66,24 +97,51 @@ file(COPY ${RR_AVATAR_BINS} DESTINATION "${LFS_STAGE}/avatars")
 # silently. Flashing the app alone (idf.py app-flash) does NOT fix it — the
 # asset image has to go down with it at least once.
 #
-# ⚠️ TONES ONLY — THE VOICE PROMPTS DO NOT FIT, AND PHASE 8 MUST SOLVE THAT.
-# Measured against this partition:
-#     emoji    4.1 MB
-#     avatars  1.4 MB
-#     tones    0.2 MB   (5 clips — staged here)
-#     voices   2.5 MB   (36 clips — NOT staged)
+# Everything fits now, measured against the 6.875 MiB partition:
+#     emoji    4236 KB
+#     avatars  1400 KB
+#     audio     843 KB   (190 KB PCM tones + 653 KB ADPCM voices)
 #     ─────────────────
-#     total    8.2 MB into a 6.9 MB partition
-# The five tones fit in what is left; the voice set is 1.1 MB past the end.
-# Globbing *.wav would silently overflow the image at build time, so the
-# pattern is deliberately narrow rather than "everything, and hope".
+#     total    6479 KB   into 7040 KB — ~560 KB spare
 #
-# Phase 8 owns the fix and has real options: the clips are 22.05 kHz 16-bit
-# PCM, so IMA-ADPCM alone is a 4x saving, and the emoji set is the bigger
-# tenant anyway. Phase 7 does not need to make that call — it needs an alarm
-# tone, and that fits today.
+# Phase 7 could only stage the tones: the voice set was 2546 KB as 16-bit PCM
+# and the whole thing overflowed by 1.4 MB. Phase 8 encodes the voices as IMA
+# ADPCM (4 bits/sample, 4:1), which is the format spec §10B.3 names and which
+# the generator verifies by round-tripping every clip through a reference
+# decoder (mean 22.9 dB, worst 15.9 dB; the build fails below 15 dB).
+#
+# The glob is still explicit about what it takes. If the emoji set or the voice
+# list grows, this is where it will overflow, and a silent overflow at image
+# build time would present as "some clips just do not play".
 file(MAKE_DIRECTORY "${LFS_STAGE}/audio")
-file(GLOB RR_AUDIO_WAVS "${CMAKE_SOURCE_DIR}/assets/audio/tone_*.wav")
+file(GLOB RR_AUDIO_WAVS "${CMAKE_SOURCE_DIR}/assets/audio/tone_*.wav"
+              "${CMAKE_SOURCE_DIR}/assets/audio/voice_*.wav")
 file(COPY ${RR_AUDIO_WAVS} DESTINATION "${LFS_STAGE}/audio")
 
-littlefs_create_partition_image(littlefs "${LFS_STAGE}" FLASH_IN_PROJECT)
+# ⚠️ NOT FLASH_IN_PROJECT — deliberately.
+#
+# THE PROBLEM THIS SOLVES. `idf.py flash` used to rewrite the whole littlefs
+# partition, and that partition holds /lfs/queue/runs.log — the durable queue of
+# completed routines that have not reached the server yet. rr_store.h calls that
+# queue "the ONE thing on the watch that is not disposable", and a routine flash
+# destroyed it. It has already happened in this project: a watch carrying two
+# unsynced runs came back from an asset flash with queued=0, and those two
+# completed routines are simply gone.
+#
+# So the image is still BUILT (assets are staged and packed on every build) but
+# not flashed automatically. Writing it is now an explicit act:
+#
+#     tools/flash-assets.sh [PORT]
+#
+# WHY THIS AND NOT A WARNING: a warning has to know whether unsynced runs exist,
+# and the only thing that knows is the watch — which is not running while esptool
+# has the port. Any check would be a guess, and a guess that says "probably fine"
+# is worse than no check. Making the destructive write opt-in removes the class
+# of accident instead of narrating it.
+#
+# THE COST, STATED: a fresh board flashed with `idf.py flash` alone has no emoji,
+# no avatars and no audio. That fails LOUDLY rather than subtly — rr_audio logs
+# "is the littlefs asset image flashed?", and the face falls back to a dot for
+# every missing emoji — and the fix is one script. Worth it against silently
+# eating a child's completed routines.
+littlefs_create_partition_image(littlefs "${LFS_STAGE}")

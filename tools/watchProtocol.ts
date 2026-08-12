@@ -324,6 +324,7 @@ export function decodeRoutinePush<T = unknown>(bytes: Uint8Array): RoutinePushDe
 //   factory_reset  wipe pairing, bonds, cache; reboot            (v2)
 //   start_routine  start a routine on the watch, now, at step 1  (additive)
 //   set_tz         UTC offset for local wall-clock display       (additive)
+//   set_audio      speaker volume + quiet hours                  (additive)
 // ─────────────────────────────────────────────────────────────
 
 export type RrControlCommand =
@@ -356,6 +357,36 @@ export type RrControlCommand =
    *  goes stale at the next DST boundary; re-sending on every contact is what
    *  makes the watch self-correct without knowing any timezone rules. */
   | { cmd: 'set_tz'; offset_s: number }
+  /** Set the speaker volume and the optional quiet-hours window.
+   *
+   *  WHY THIS EXISTS AT ALL: this board has NO VIBRATION MOTOR, so the watch's
+   *  only way to get a child's attention is to make a noise. That makes volume
+   *  a safety-ish setting rather than a preference — the same alarm that has to
+   *  carry across a room at 07:00 must not go off at full volume in a bedroom
+   *  at 21:30, and a parent is the only one who can judge that.
+   *
+   *  All fields are optional; omitted ones keep their current value, so the app
+   *  can send a volume slider change without restating the quiet window.
+   *
+   *  `volume_pct`        0..100. 0 means visual-only (there is no haptic
+   *                      fallback on this hardware — silent really is silent).
+   *  `quiet_from` /      LOCAL "HH:MM", inclusive start / exclusive end. The
+   *  `quiet_to`          window MAY WRAP MIDNIGHT and normally does
+   *                      ("20:30" -> "06:30"). Send quiet_from: null to disable.
+   *  `quiet_volume_pct`  the cap applied inside the window, 0..100. A cap, not
+   *                      a replacement: outside the window the main volume
+   *                      applies, and inside it the lower of the two wins.
+   *
+   *  Times are LOCAL because a parent sets them against a bedtime, not against
+   *  UTC. The watch resolves them with the set_tz offset — the same rule the
+   *  scheduler's "HH:MM" trigger times follow. */
+  | {
+      cmd: 'set_audio'
+      volume_pct?: number
+      quiet_from?: string | null
+      quiet_to?: string
+      quiet_volume_pct?: number
+    }
 
 export const RR_CONTROL_LEN_PREFIX_BYTES = 4
 
@@ -366,6 +397,16 @@ export const RR_CONTROL_LEN_PREFIX_BYTES = 4
  */
 export const TZ_OFFSET_MIN_S = -12 * 3600
 export const TZ_OFFSET_MAX_S = 14 * 3600
+
+/**
+ * Bounds for `set_audio`. Percentages are 0..100 inclusive; 0 is a legal and
+ * meaningful value (visual-only), not "unset".
+ */
+export const AUDIO_VOLUME_MIN_PCT = 0
+export const AUDIO_VOLUME_MAX_PCT = 100
+
+/** `quiet_from` / `quiet_to` are LOCAL 24-hour "HH:MM". */
+export const AUDIO_QUIET_TIME_RE = /^([01]\d|2[0-3]):([0-5]\d)$/
 
 // ── RR_CONTROL response codes ────────────────────────────────────────────────
 //

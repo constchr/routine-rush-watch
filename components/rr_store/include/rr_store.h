@@ -137,6 +137,27 @@ esp_err_t rr_queue_ack(const char *local_id);
 /** Oldest unacked record's completed_at epoch, or 0 if the queue is empty. */
 uint32_t rr_queue_oldest_ts(void);
 
+/**
+ * Register a callback for "the queue depth changed" — a run was appended, or an
+ * ack dropped one.
+ *
+ * TWO CONSUMERS, both of which were previously wrong:
+ *
+ *   • THE WATCH FACE. Its "N to upload" badge reads rr_queue_count() live, but
+ *     only when the face is rebuilt — on wrist-raise or a minute tick. Draining
+ *     the queue therefore left the badge on screen for up to a minute after the
+ *     records were gone, which reads as "the sync did not work".
+ *   • THE PHONE. QUEUE_STATUS notify was only sent from the RUN_ACK handler, so
+ *     a connected phone was told about acks it had itself caused and nothing
+ *     else. A routine finishing while connected produced no notification at all.
+ *
+ * A hook rather than direct calls because rr_store sits UNDER both rr_power and
+ * rr_ble in the dependency graph; main.c owns both ends and fans this out.
+ * Runs on whichever task changed the queue — the LVGL task for an append, the
+ * NimBLE host task for an ack — so implementations must not block.
+ */
+void rr_store_set_queue_changed_hook(void (*fn)(void));
+
 // ── Phase 6: the next scheduled routine, for the idle face (§9B.1) ───────────
 
 typedef struct {

@@ -63,6 +63,21 @@ static int64_t s_last_activity_ms;
 static int64_t s_paired_at_ms;      // 0 = no pending promote-to-face
 static bool s_gate_open;            // last observed face-gate state
 static lv_timer_t *s_idle_timer;
+static volatile bool s_queue_dirty;   // set by rr_idle_notify_queue_changed()
+
+// Enable/disable every LVGL input device. There is exactly one on this board
+// (the FT3168), but asking LVGL rather than assuming keeps this correct if a
+// second is ever added.
+static void set_touch_enabled(bool on)
+{
+    bsp_display_lock(0);
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    while (indev != NULL) {
+        lv_indev_enable(indev, on);
+        indev = lv_indev_get_next(indev);
+    }
+    bsp_display_unlock();
+}
 
 static int64_t now_ms(void)
 {
@@ -152,6 +167,22 @@ static void go_to_sleep(void)
     // draw nothing, so a dark screen and no screen are nearly the same.
     bsp_display_backlight_off();
 
+    // Stop polling the touch panel.
+    //
+    // LVGL's input device is read on a timer and lvgl_port_touchpad_read() does
+    // an unconditional I2C transaction to the FT3168 every time — ~33 reads a
+    // second, all night, to a controller nobody is touching.
+    //
+    // ⚠️ TRADE-OFF: this removes TOUCH-to-wake. The wake paths that remain are
+    // the ones §9B.2 actually specifies — wrist-raise via the IMU, and the
+    // button as a fallback — so this matches the spec rather than reducing it,
+    // but it IS a behaviour change: tapping a dark screen no longer wakes it.
+    // The proper fix is the FT3168's own INT line (GPIO15, already wired by the
+    // BSP as .int_gpio_num), which would give touch-to-wake for zero idle cost.
+    // That needs the lvgl_port indev driven from the interrupt instead of a
+    // timer, which is a bigger change than this one.
+    set_touch_enabled(false);
+
     // Hand the watching over to the IMU's own hardware.
     rr_imu_arm_wake_on_motion(WOM_THRESHOLD, rr_idle_notify_wake);
 
@@ -164,6 +195,8 @@ static void wake_up(const char *reason)
     s_last_activity_ms = now_ms();
     if (s_awake) return;
     s_awake = true;
+
+    set_touch_enabled(true);
 
     // Disarm first: while awake we do not want a motion interrupt every time
     // the child moves their arm, and Phase 9's pedometer wants the sensor in
@@ -204,7 +237,11 @@ static void idle_tick(lv_timer_t *t)
 
     // Any touch counts as interaction. LVGL tracks this for us, so we do not
     // need a second input path just to notice the screen was poked.
-    lv_indev_t *indev = lv_indev_get_next(NULL);
+    //
+    // Only meaningful while awake now: the indev is disabled on sleep (see
+    // go_to_sleep), so a dark screen reports nothing and this loop would just be
+    // walking a list to find stale state.
+    lv_indev_t *indev = s_awake ? lv_indev_get_next(NULL) : NULL;
     while (indev != NULL) {
         if (lv_indev_get_state(indev) == LV_INDEV_STATE_PRESSED) {
             if (!s_awake) { wake_up("touch"); return; }
@@ -236,6 +273,17 @@ static void idle_tick(lv_timer_t *t)
         // screen would just burn the flash reads — wake_up() builds the face
         // itself, and by then the gate is open.
         if (s_awake && build_and_show_face()) s_last_activity_ms = now_ms();
+    }
+
+    // A queue change (a run completed, or a phone acked one) invalidates the
+    // face's upload badge. Repaint here rather than at the call site — see
+    // rr_idle_notify_queue_changed() on why that must not happen inline.
+    if (s_queue_dirty) {
+        s_queue_dirty = false;
+        if (s_awake && rr_ui_last_screen_is_watchface()) {
+            ESP_LOGI(TAG, "queue changed — refreshing the face badge");
+            build_and_show_face();
+        }
     }
 
     if (s_awake) {
@@ -309,3 +357,5 @@ esp_err_t rr_idle_init(void)
 bool rr_idle_is_awake(void) { return s_awake; }
 
 void rr_idle_wake_manual(void) { wake_up("manual"); }
+
+void rr_idle_notify_queue_changed(void) { s_queue_dirty = true; }

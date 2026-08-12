@@ -108,3 +108,33 @@ esp_err_t rr_identity_factory_reset(void);
 
 /** Mint a fresh RFC-4122 v4 UUID (used for a run's local_id). */
 void rr_identity_new_uuid(char *out, size_t out_len);
+
+// ── BLE address generation — recovering a lost bond without a factory reset ───
+//
+// THE DEAD END THIS ESCAPES. If the watch loses its BLE bond while the phone
+// keeps one — which happens, and happened here — the pair is permanently broken
+// and NEITHER SIDE CAN FIX IT:
+//   • the phone encrypts with a key the watch no longer has, so every connection
+//     fails encryption and iOS drops the link (enc_change status 7, reason 531);
+//   • an iOS app CANNOT remove a BLE bond, and a watch is not listed in
+//     Settings > Bluetooth, so a parent has nothing to "forget".
+// It presents as "sync is stuck" on a watch that advertises perfectly.
+//
+// The only thing that makes iOS bond fresh is a NEW BLE address. Until now the
+// only way to get one was a factory reset, because the address is derived from
+// device_id — and that regenerates device_id, orphaning the server-side pairing
+// and costing a QR re-registration for what is really a link-layer problem.
+//
+// So the BLE address is derived from device_id AND this counter. Bumping it gives
+// the watch a fresh BLE identity while device_id — and therefore everything the
+// backend knows — stays exactly as it was.
+//
+// It survives a factory reset deliberately: a reset already changes device_id, so
+// the address changes anyway, and resetting the counter would risk colliding with
+// an address some phone still holds a stale bond for.
+
+/** Current BLE address generation. 0 on a watch that has never needed one. */
+uint8_t rr_identity_ble_generation(void);
+
+/** Bump and persist. Call only when a fresh BLE identity is genuinely needed. */
+esp_err_t rr_identity_bump_ble_generation(const char *reason);

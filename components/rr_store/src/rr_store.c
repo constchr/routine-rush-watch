@@ -406,9 +406,26 @@ esp_err_t rr_store_find_routine(const char *assignment_id, int *out_idx)
 // Phase 5 — the durable completion queue
 // ═════════════════════════════════════════════════════════════════════════════
 
+static void (*s_queue_changed)(void);
+
+void rr_store_set_queue_changed_hook(void (*fn)(void))
+{
+    s_queue_changed = fn;
+}
+
+static void queue_changed(void)
+{
+    if (s_queue_changed != NULL) s_queue_changed();
+}
+
 #define QUEUE_DIR    MOUNT_POINT "/queue"
 #define RUNS_PATH    QUEUE_DIR "/runs.log"
 #define CURSOR_PATH  QUEUE_DIR "/cursor.json"
+
+// Longest run-record line handled in one read. Records measured ~600 B for a
+// real routine; 1 KB is comfortable. Allocated on the HEAP wherever it is used —
+// see rr_queue_ack() on why a stack buffer this size is not safe here.
+#define QUEUE_LINE_MAX 1024
 
 static long cursor_get(void)
 {
@@ -476,6 +493,7 @@ esp_err_t rr_queue_append(const char *json, size_t len)
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "queued run (%u bytes) — %d now pending", (unsigned) len, rr_queue_count());
+    queue_changed();
     return ESP_OK;
 }
 
@@ -533,8 +551,15 @@ esp_err_t rr_queue_ack(const char *local_id)
     if (f == NULL) return ESP_FAIL;
     fseek(f, off, SEEK_SET);
 
-    char line[1024];
-    if (fgets(line, sizeof(line), f) == NULL) { fclose(f); return ESP_FAIL; }
+    // HEAP, not stack. This runs on the nimble_host task (RUN_ACK arrives as a
+    // GATT write), whose stack is ~4 KB — and a 1 KB frame here nested inside
+    // another 1 KB frame in rr_queue_oldest_ts() overflowed it outright:
+    // "Guru Meditation Error: Core 0 panic'ed (Stack protection fault),
+    //  task nimble_host", reproducibly, on every ack. Two 1 KB stack buffers in
+    // a library reachable from a BLE callback is simply too much to ask.
+    char *line = malloc(QUEUE_LINE_MAX);
+    if (line == NULL) { fclose(f); return ESP_ERR_NO_MEM; }
+    if (fgets(line, QUEUE_LINE_MAX, f) == NULL) { free(line); fclose(f); return ESP_FAIL; }
     long next = ftell(f);
     fclose(f);
 
@@ -542,6 +567,7 @@ esp_err_t rr_queue_ack(const char *local_id)
     const cJSON *lid = j ? cJSON_GetObjectItemCaseSensitive(j, "local_id") : NULL;
     bool match = cJSON_IsString(lid) && strcmp(lid->valuestring, local_id) == 0;
     cJSON_Delete(j);
+    free(line);
 
     if (!match) {
         // Not the head. Either a duplicate ack for a record already advanced
@@ -555,15 +581,20 @@ esp_err_t rr_queue_ack(const char *local_id)
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "acked %s — cursor %ld, %d still pending", local_id, next, rr_queue_count());
         compact_if_drained();
+        queue_changed();
     }
     return err;
 }
 
 uint32_t rr_queue_oldest_ts(void)
 {
-    char buf[1024];
-    int n = rr_queue_read_unacked(buf, sizeof(buf) - 1);
-    if (n <= 0) return 0;
+    // HEAP, for the same reason as rr_queue_ack: QUEUE_STATUS is read from the
+    // nimble_host task, and this used to put 1 KB on a 4 KB stack.
+    char *buf = malloc(QUEUE_LINE_MAX);
+    if (buf == NULL) return 0;
+
+    int n = rr_queue_read_unacked(buf, QUEUE_LINE_MAX - 1);
+    if (n <= 0) { free(buf); return 0; }
     buf[n] = '\0';
     char *nl = strchr(buf, '\n');
     if (nl) *nl = '\0';
@@ -574,6 +605,7 @@ uint32_t rr_queue_oldest_ts(void)
         if (cJSON_IsNumber(e)) ts = (uint32_t) e->valuedouble;
         cJSON_Delete(j);
     }
+    free(buf);
     return ts;
 }
 

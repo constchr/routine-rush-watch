@@ -36,6 +36,7 @@
 #include "rr_store.h"
 #include "rr_routine.h"
 #include "rr_sched.h"
+#include "rr_audio.h"
 #include "rr_ui.h"
 
 static const char *TAG = "rr_ble";
@@ -75,6 +76,10 @@ static uint16_t s_queue_status_handle;
 #define RR_CONTROL_MAX 1024
 #define RR_QUEUE_PULL_MAX 4096
 #define RR_FW_VERSION 6      /**< packed firmware version reported in QUEUE_STATUS */
+
+// No connection-parameter constants: the watch deliberately accepts whatever the
+// central chooses. Requesting a relaxed link made ROUTINE_PUSH 25x slower for a
+// saving worth ~0.03 mAh/day — see the note in BLE_GAP_EVENT_ENC_CHANGE.
 
 static uint8_t *s_rx_buf;
 static size_t   s_rx_len;
@@ -633,6 +638,76 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         return 0;
     }
 
+    // ── set_audio: speaker volume + quiet hours ──────────────────────────────
+    //
+    // Gated on conn_is_authorised(), like set_tz and for the same reason: this
+    // is CONFIGURATION, not an action on the child's screen. A phone holding
+    // the pairing nonce must be able to send it during setup, before the
+    // paired-peer anchor exists.
+    //
+    // Every field is optional and omitted fields keep their current value, so
+    // a volume-slider change does not have to restate the quiet window.
+    if (strcmp(cmd, "set_audio") == 0) {
+        if (!conn_is_authorised(conn_handle)) {
+            ESP_LOGW(TAG, "set_audio REJECTED — connection not authorised");
+            cJSON_Delete(env);
+            return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        }
+
+        rr_audio_policy_t p;
+        rr_audio_get_policy(&p);
+
+        const cJSON *v = cJSON_GetObjectItemCaseSensitive(env, "volume_pct");
+        if (cJSON_IsNumber(v)) p.volume_pct = (uint8_t) v->valueint;
+
+        const cJSON *qv = cJSON_GetObjectItemCaseSensitive(env, "quiet_volume_pct");
+        if (cJSON_IsNumber(qv)) p.quiet_volume_pct = (uint8_t) qv->valueint;
+
+        // quiet_from: null is how the app turns the window OFF — distinct from
+        // omitting the field, which leaves it alone.
+        const cJSON *qf = cJSON_GetObjectItemCaseSensitive(env, "quiet_from");
+        if (cJSON_IsNull(qf)) {
+            p.quiet_from_min = RR_AUDIO_QUIET_DISABLED;
+        } else if (cJSON_IsString(qf)) {
+            int hh = 0, mm = 0;
+            if (sscanf(qf->valuestring, "%d:%d", &hh, &mm) != 2 ||
+                hh < 0 || hh > 23 || mm < 0 || mm > 59) {
+                ESP_LOGE(TAG, "set_audio: quiet_from \"%s\" is not LOCAL HH:MM",
+                         qf->valuestring);
+                cJSON_Delete(env);
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            p.quiet_from_min = (int16_t) (hh * 60 + mm);
+        }
+
+        const cJSON *qt = cJSON_GetObjectItemCaseSensitive(env, "quiet_to");
+        if (cJSON_IsString(qt)) {
+            int hh = 0, mm = 0;
+            if (sscanf(qt->valuestring, "%d:%d", &hh, &mm) != 2 ||
+                hh < 0 || hh > 23 || mm < 0 || mm > 59) {
+                ESP_LOGE(TAG, "set_audio: quiet_to \"%s\" is not LOCAL HH:MM",
+                         qt->valuestring);
+                cJSON_Delete(env);
+                return BLE_ATT_ERR_UNLIKELY;
+            }
+            p.quiet_to_min = (int16_t) (hh * 60 + mm);
+        }
+
+        cJSON_Delete(env);
+
+        if (rr_audio_set_policy(&p) != ESP_OK) {
+            ESP_LOGE(TAG, "set_audio REJECTED — values out of range");
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        // Log the RESULT, not the receipt — the same lesson set_tz taught: a
+        // handler that reports success while the device behaves differently is
+        // the hardest kind of bug to see from outside.
+        ESP_LOGI(TAG, "set_audio applied: volume %u%%, effective right now %u%%%s",
+                 p.volume_pct, rr_audio_effective_volume(),
+                 rr_audio_in_quiet_hours() ? " (inside quiet hours)" : "");
+        return 0;
+    }
+
     ESP_LOGW(TAG, "RR_CONTROL: unknown cmd \"%s\" — rejecting this command only", cmd);
     cJSON_Delete(env);
     return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
@@ -859,6 +934,96 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
     { 0 }
 };
 
+// ═════════════════════════════════════════════════════════════════════════════
+// Bond store: protect the paired phone, evict anything else
+//
+// ⚠️ THIS REPLACES NimBLE's ble_store_util_status_rr, WHOSE OWN SOURCE SAYS IT
+// IS WRONG FOR A PRODUCT:
+//
+//     "This is not the best behavior for an actual product because
+//      uninteresting peers could cause important bonds to be deleted."
+//
+// It calls ble_gap_unpair_oldest_peer() — three slots (CONFIG_BT_NIMBLE_MAX_BONDS
+// = 3), evict whatever is oldest. On this watch exactly ONE bond matters: the
+// phone that paired it. Everything else is a development laptop.
+//
+// It bit us for real. A dev build that randomised the watch's BLE address every
+// boot made each reboot look like a new peripheral to macOS, and each of those
+// bonded — a bond entry ON THE WATCH per boot. With three slots, the phone's bond
+// was evicted by junk, encryption then failed (enc_change status 7), iOS
+// terminated the link (reason 531), and a Sync worked only when the phone
+// happened to hold a slot. It presented as "sync is stuck", which is a long way
+// from its cause.
+//
+// So: on overflow, delete a bond that is NOT the paired peer's. Fall back to the
+// stock behaviour only if the paired peer is somehow the only bond, because
+// refusing to evict anything at all would fail the pairing outright.
+static int bond_store_status(struct ble_store_status_event *event, void *arg)
+{
+    if (event->event_code != BLE_STORE_EVENT_OVERFLOW) {
+        return ble_store_util_status_rr(event, arg);
+    }
+
+    switch (event->overflow.obj_type) {
+    case BLE_STORE_OBJ_TYPE_OUR_SEC:
+    case BLE_STORE_OBJ_TYPE_PEER_SEC:
+    case BLE_STORE_OBJ_TYPE_PEER_ADDR: {
+        // Walk the stored peers and unpair the first that is not ours to keep.
+        ble_addr_t peers[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
+        int count = 0;
+        if (ble_store_util_bonded_peers(peers, &count,
+                                        sizeof(peers) / sizeof(peers[0])) == 0) {
+            for (int i = 0; i < count; i++) {
+                if (rr_identity_is_paired_peer(peers[i].val, peers[i].type)) continue;
+                ESP_LOGW(TAG, "bond store full — evicting a NON-paired peer "
+                              "%02x:%02x:%02x:%02x:%02x:%02x to make room",
+                         peers[i].val[5], peers[i].val[4], peers[i].val[3],
+                         peers[i].val[2], peers[i].val[1], peers[i].val[0]);
+                return ble_gap_unpair(&peers[i]);
+            }
+            ESP_LOGW(TAG, "bond store full and every stored bond is the paired peer "
+                          "— falling back to evicting the oldest");
+        }
+        return ble_gap_unpair_oldest_peer();
+    }
+    default:
+        return ble_store_util_status_rr(event, arg);
+    }
+}
+
+// Report how full the bond store is, every boot.
+//
+// This failure mode is completely invisible otherwise: a watch whose phone bond
+// has been evicted looks healthy, advertises normally, answers scans — and simply
+// cannot be connected to. One line here would have pointed straight at it instead
+// of a session spent chasing crashes and connection parameters.
+static void log_bond_store(void)
+{
+    ble_addr_t peers[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
+    int count = 0;
+    if (ble_store_util_bonded_peers(peers, &count, sizeof(peers) / sizeof(peers[0])) != 0) {
+        ESP_LOGW(TAG, "bond store unreadable");
+        return;
+    }
+
+    ESP_LOGI(TAG, "bond store: %d/%d slot(s) used", count, MYNEWT_VAL(BLE_STORE_MAX_BONDS));
+    bool have_paired = false;
+    for (int i = 0; i < count; i++) {
+        const bool mine = rr_identity_is_paired_peer(peers[i].val, peers[i].type);
+        if (mine) have_paired = true;
+        ESP_LOGI(TAG, "  [%d] %02x:%02x:%02x:%02x:%02x:%02x%s", i,
+                 peers[i].val[5], peers[i].val[4], peers[i].val[3],
+                 peers[i].val[2], peers[i].val[1], peers[i].val[0],
+                 mine ? "  <- the paired phone" : "");
+    }
+    if (rr_identity_is_paired() && !have_paired) {
+        // The exact state that presents as "sync is stuck".
+        ESP_LOGE(TAG, "PAIRED BUT NO BOND FOR THE PAIRED PEER — the phone will fail "
+                      "encryption and iOS will drop the link. Re-pair, or clear the "
+                      "bond store (idf.py -DRR_CLEAR_BONDS=1) and pair again.");
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Advertising
 //
@@ -871,6 +1036,72 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
 // does not fit alongside it — it goes in the scan response instead.
 // ─────────────────────────────────────────────────────────────────────────────
 static int gap_event_cb(struct ble_gap_event *event, void *arg);
+
+// ── Advertising intervals, in 0.625 ms BLE units ─────────────────────────────
+//
+// ⚠️ THESE ARE APPLE'S PUBLISHED VALUES, NOT ROUND NUMBERS. Getting that wrong
+// broke connectivity on hardware, so it is worth stating why.
+//
+// The first cut of this used 1000-1500 ms for the idle state. iOS still FOUND
+// the watch — scanning only needs one ADV_IND — but connecting failed every
+// time: establishing a link needs the central to catch a SUBSEQUENT advertising
+// event inside its connect timeout, and at 1-1.5 s it kept missing. Observed as
+// four consecutive "connection failed" retries against a watch that was
+// advertising perfectly and answering scans in 150 ms.
+//
+// Apple's Accessory Design Guidelines list the intervals iOS aligns its scan
+// cadence to: 152.5, 211.25, 318.75, 417.5, 546.25, 760, 852.5, 1022.5 ms. A
+// value from that list connects reliably; an arbitrary one in between does not.
+// min == max on purpose — a RANGE lets the controller pick something off-list.
+//
+//   417.5 ms idle: still ~10x fewer transmissions than the 30-60 ms this
+//     replaced, so most of the estimated saving survives, and it is comfortably
+//     inside what iOS connects to. 852.5 ms would save more; it is one step away
+//     if a measurement says the extra is worth re-testing connectivity for.
+//   152.5 ms eager: Apple's fastest listed value, for the 30 s after a run is
+//     queued when a phone may be in the next room.
+//   30-60 ms pairing: fast is explicitly allowed for the first 30 s of a
+//     connectable accessory, and a parent is standing there holding the QR.
+#define ADV_ITVL_PAIRING_MIN  0x0030   /*    30 ms */
+#define ADV_ITVL_PAIRING_MAX  0x0060   /*    60 ms */
+#define ADV_ITVL_EAGER_MIN    0x00F4   /*   152.5 ms — Apple-listed */
+#define ADV_ITVL_EAGER_MAX    0x00F4
+#define ADV_ITVL_IDLE_MIN     0x029C   /*   417.5 ms — Apple-listed */
+#define ADV_ITVL_IDLE_MAX     0x029C
+
+/** How long a freshly-queued run keeps advertising brisk. */
+#define ADV_EAGER_MS (30 * 1000)
+
+typedef enum { ADV_IDLE = 0, ADV_EAGER, ADV_PAIRING } rr_adv_state_t;
+
+static rr_adv_state_t s_adv_state = ADV_PAIRING;   /* first boot advertises fast */
+static int64_t s_queue_activity_ms = INT64_MIN;
+
+static const char *adv_state_name(rr_adv_state_t s)
+{
+    switch (s) {
+    case ADV_PAIRING: return "pairing/fast";
+    case ADV_EAGER:   return "eager";
+    default:          return "idle/slow";
+    }
+}
+
+static rr_adv_state_t adv_state(void)
+{
+    // Unpaired means the QR is on screen and a parent is waiting: latency is the
+    // product here, so this state never gets slowed down.
+    if (!rr_identity_is_paired()) return ADV_PAIRING;
+
+    const int64_t now = (int64_t) xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if (s_queue_activity_ms != INT64_MIN && now - s_queue_activity_ms < ADV_EAGER_MS) {
+        return ADV_EAGER;
+    }
+    // Deliberately NOT "eager while anything is queued": a watch worn all day
+    // with an undrained run would then advertise briskly for hours, which is the
+    // draw this change exists to remove. The records are durable and the phone's
+    // foreground drain will collect them.
+    return ADV_IDLE;
+}
 
 static void advertise(void)
 {
@@ -900,6 +1131,50 @@ static void advertise(void)
     params.conn_mode = BLE_GAP_CONN_MODE_UND;
     params.disc_mode = BLE_GAP_DISC_MODE_GEN;
 
+    // ── Advertising interval: adapted to state, not fixed ────────────────────
+    //
+    // This used to leave itvl_min/itvl_max at 0, which makes NimBLE substitute
+    // its default for CONN_MODE_UND: BLE_GAP_ADV_FAST_INTERVAL1, 30-60 ms,
+    // started BLE_HS_FOREVER and never varied. A watch asleep on a nightstand
+    // transmitted 20-30 times a second all night — on a 400 mAh cell that was
+    // the single largest idle draw (est. 4-8 mA of a 12-20 mA budget).
+    //
+    // Three states, because the right interval genuinely differs:
+    //
+    //   PAIRING (unpaired) — fast. A parent is standing there with the QR on
+    //     screen waiting for the app to find it; latency is the whole
+    //     experience and the window is seconds long.
+    //   WORK PENDING — brisk, for a while. A run was just queued, so a phone
+    //     coming into range should be found quickly. Time-boxed: after
+    //     ADV_EAGER_MS the records are no less safe, they just wait for the
+    //     next foreground drain rather than costing battery all night.
+    //   IDLE — slow. Nothing to say. The phone's foreground drain scans
+    //     actively and retries, so it tolerates a longer window.
+    //
+    // ⚠️ THE TRADE, STATED: idle discovery gets slower. Measured before this
+    // change, a cold scan first saw a sleeping watch in 0.35 s typical / 1.2 s
+    // worst (spec §6B.7). At a 1000-1500 ms interval expect roughly 1-2 s
+    // typical and ~3 s worst. That is absorbed by design — BLEService.
+    // connectToWatch() scans a full window and then retries once transparently
+    // (packages/ble/src/index.ts) — but it is a real regression in the "press
+    // Sync and watch it work" feel, and the reason this is tunable in one place.
+    const rr_adv_state_t st = adv_state();
+    switch (st) {
+    case ADV_PAIRING:
+        params.itvl_min = ADV_ITVL_PAIRING_MIN;
+        params.itvl_max = ADV_ITVL_PAIRING_MAX;
+        break;
+    case ADV_EAGER:
+        params.itvl_min = ADV_ITVL_EAGER_MIN;
+        params.itvl_max = ADV_ITVL_EAGER_MAX;
+        break;
+    case ADV_IDLE:
+    default:
+        params.itvl_min = ADV_ITVL_IDLE_MIN;
+        params.itvl_max = ADV_ITVL_IDLE_MAX;
+        break;
+    }
+
     // The GAP callback MUST be passed here — without it NimBLE delivers no
     // connect / disconnect / encryption-change events at all, so the watch
     // never re-advertises after a peer drops and bonding completion is
@@ -915,7 +1190,37 @@ static void advertise(void)
         ESP_LOGE(TAG, "adv_start failed: %d", rc);
         return;
     }
-    ESP_LOGI(TAG, "advertising as \"%s\" — service %s", RR_BLE_DEVICE_NAME, RR_SYNC_SERVICE_UUID_STR);
+    s_adv_state = st;
+    ESP_LOGI(TAG, "advertising as \"%s\" — %s (%u-%u ms), service %s",
+             RR_BLE_DEVICE_NAME, adv_state_name(st),
+             (unsigned) (params.itvl_min * 625 / 1000),
+             (unsigned) (params.itvl_max * 625 / 1000),
+             RR_SYNC_SERVICE_UUID_STR);
+}
+
+// Re-advertise at a new interval if the state that picks it has changed.
+//
+// ble_gap_adv_start cannot change the interval of a running advertisement, so
+// this stops and restarts. That opens a sub-millisecond gap in advertising,
+// which is why it only runs on an actual state CHANGE rather than on every
+// queue event or timer tick.
+static void adv_refresh(const char *reason)
+{
+    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) return;   // advertising stops while connected
+    const rr_adv_state_t want = adv_state();
+    if (want == s_adv_state) return;
+
+    ESP_LOGI(TAG, "advertising %s -> %s (%s)",
+             adv_state_name(s_adv_state), adv_state_name(want), reason);
+    ble_gap_adv_stop();
+    advertise();
+}
+
+void rr_ble_note_queue_activity(void)
+{
+    // Timestamp first, so the state function sees the new value.
+    s_queue_activity_ms = (int64_t) xTaskGetTickCount() * portTICK_PERIOD_MS;
+    adv_refresh("run queued");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -934,6 +1239,13 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             ctl_reset();
             rx_reset();
             ESP_LOGI(TAG, "connected (handle %u)", (unsigned) s_conn_handle);
+
+            // Connection parameters are NOT requested here — see
+            // BLE_GAP_EVENT_ENC_CHANGE. Issuing an L2CAP parameter update in the
+            // same instant as the central's MTU exchange and bonding is a known
+            // way to upset a link, and a mid-drain disconnect was observed on the
+            // first hardware run with it here. Waiting for encryption costs
+            // nothing: the drain cannot start before then anyway.
 #ifdef RR_DEV_NONCE_WHEN_PAIRED
             // TEST BUILDS ONLY (see the root CMakeLists).
             //
@@ -967,6 +1279,9 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         s_authed_conn = BLE_HS_CONN_HANDLE_NONE;
         rx_reset();
         ctl_reset();
+        // Force a re-pick of the interval: the state may have changed while the
+        // phone was connected (a routine finished, or pairing completed).
+        s_adv_state = (rr_adv_state_t) -1;
         advertise();
         return 0;
 
@@ -975,6 +1290,27 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         return 0;
 
     case BLE_GAP_EVENT_ENC_CHANGE:
+        // ── NO CONNECTION-PARAMETER REQUEST HERE. REVERTED, MEASURED. ────────
+        //
+        // Phase 10 item 5 asked for a relaxed link (90-150 ms, slave latency 4)
+        // to stop the auto-sync drain from costing radio time. It was a bad
+        // trade and hardware said so within one test:
+        //
+        //   ROUTINE_PUSH went from ~4 s to ~112 s. The watch log showed 20-byte
+        //   chunks landing every ~855 ms — which is exactly (1 + latency) *
+        //   itvl_max = 5 * 150 ms. Slave latency lets a peripheral SKIP
+        //   connection events when it has nothing to send; with
+        //   write-with-response traffic it delays every single response instead.
+        //
+        // And the upside was never real: the estimate was 1-3 mA WHILE
+        // CONNECTED, and connections here last seconds a day — call it
+        // 0.03 mAh/day against a ~400 mAh cell. Paying a 25x slower sync for
+        // that is indefensible.
+        //
+        // If this is ever revisited: latency must stay 0 during transfers, and
+        // any relaxation belongs AFTER the drain completes, not before it. The
+        // CONN_UPDATE logging below is kept so the link's actual parameters are
+        // visible in any capture.
         // Bonding completed (or failed). Phase 1 does not gate TIME_SYNC on
         // encryption, so this is informational — it tells us the bond path
         // works before Phase 2 starts depending on it.
@@ -984,7 +1320,36 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_SUBSCRIBE:
         ESP_LOGI(TAG, "subscribe: attr=%u notify=%d",
                  (unsigned) event->subscribe.attr_handle, event->subscribe.cur_notify);
+        // Push the queue depth the moment the phone subscribes.
+        //
+        // This is the "on connect" notification, and it belongs HERE rather than
+        // in BLE_GAP_EVENT_CONNECT: a notify sent before the central has written
+        // the CCCD is discarded by the stack, so notifying on connect would look
+        // correct and reach nobody. Subscription is the first instant the phone
+        // can actually hear us.
+        //
+        // It matters because the phone otherwise has to poll to discover work:
+        // a watch carrying three offline runs said nothing until asked.
+        if (event->subscribe.attr_handle == s_queue_status_handle &&
+            event->subscribe.cur_notify) {
+            ESP_LOGI(TAG, "phone subscribed to QUEUE_STATUS — pushing current depth");
+            rr_ble_notify_queue_status();
+        }
         return 0;
+
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+        // Report what the link ACTUALLY settled on. A requested interval is a
+        // request; iOS in particular applies its own policy, and assuming the
+        // relaxed values were granted would make any power measurement a guess.
+        struct ble_gap_conn_desc desc;
+        if (ble_gap_conn_find(event->conn_update.conn_handle, &desc) == 0) {
+            ESP_LOGI(TAG, "conn params now: itvl=%u (%u ms) latency=%u timeout=%u (status=%d)",
+                     (unsigned) desc.conn_itvl, (unsigned) (desc.conn_itvl * 125 / 100),
+                     (unsigned) desc.conn_latency, (unsigned) desc.supervision_timeout,
+                     event->conn_update.status);
+        }
+        return 0;
+    }
 
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "MTU negotiated: %u", (unsigned) event->mtu.value);
@@ -1025,13 +1390,19 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 // normal reboots because device_id is, so bonds and reconnection survive.
 static void derive_static_addr(ble_addr_t *out)
 {
-    // FNV-1a over the device_id, then folded to 6 bytes.
+    // FNV-1a over the device_id AND the BLE address generation, folded to 6 bytes.
+    //
+    // The generation lets the watch present a fresh BLE identity — so a phone
+    // holding a stale bond will pair again — WITHOUT changing device_id, which is
+    // what the server-side pairing is keyed on. See rr_identity.h.
     const char *id = rr_identity_device_id();
     uint64_t h = 1469598103934665603ULL;
     for (const char *p = id; *p; p++) {
         h ^= (unsigned char) *p;
         h *= 1099511628211ULL;
     }
+    h ^= (uint64_t) rr_identity_ble_generation();
+    h *= 1099511628211ULL;
     for (int i = 0; i < 6; i++) {
         out->val[i] = (uint8_t) (h >> (i * 8));
     }
@@ -1053,8 +1424,59 @@ static void derive_static_addr(ble_addr_t *out)
     out->type = BLE_ADDR_RANDOM;
 }
 
+/**
+ * Detect "paired but no bond" and escape it by rotating the BLE address.
+ *
+ * Must run BEFORE derive_static_addr(), because the whole point is to change what
+ * that derives. Returns true if the generation was bumped.
+ *
+ * The state is unrecoverable otherwise: the phone encrypts with a key the watch
+ * lost, iOS drops the link, and no app can make iOS forget a BLE bond. Rotating
+ * our address makes us a new peripheral to the phone, which then bonds cleanly —
+ * at the cost of one stale entry in the phone's bond list, which is invisible to
+ * the parent and far cheaper than a factory reset and a QR re-registration.
+ *
+ * Conditions are deliberately narrow: paired, an anchor recorded, and ZERO bonds.
+ * A watch with any bond at all is left alone, because rotating then would break a
+ * link that might be working.
+ */
+#ifdef RR_ROTATE_BLE_ADDR
+static bool heal_lost_bond(void)
+{
+    if (!rr_identity_is_paired()) return false;
+
+    ble_addr_t peers[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
+    int count = 0;
+    if (ble_store_util_bonded_peers(peers, &count, sizeof(peers) / sizeof(peers[0])) != 0) {
+        return false;   // store unreadable: do not act on a guess
+    }
+    if (count > 0) return false;
+
+    ESP_LOGE(TAG, "PAIRED WITH ZERO BONDS — the phone cannot encrypt to us and iOS "
+                  "cannot be told to forget us. Rotating the BLE address so it "
+                  "bonds again.");
+    return rr_identity_bump_ble_generation("paired but no bond") == ESP_OK;
+}
+#endif
+
 static void on_sync(void)
 {
+#ifdef RR_ROTATE_BLE_ADDR
+    // Opt-in only: `idf.py -DRR_ROTATE_BLE_ADDR=1`.
+    //
+    // ⚠️ THIS WAS AUTOMATIC AND THAT WAS A MISTAKE. Run on every boot it turned a
+    // crash loop into a pairing loop: each panic rebooted the watch, each boot saw
+    // zero bonds, each boot rotated the address, and the phone was asked to pair
+    // again — generation reached 7 and the parent got repeated pairing prompts for
+    // what was actually a stack overflow on the ack path.
+    //
+    // "Zero bonds" is not by itself proof of the unrecoverable state; it is also
+    // what a watch looks like moments before a legitimate first pairing, or after
+    // any reboot that raced the store. Rotating identity is disruptive enough that
+    // it should be a decision, not an inference.
+    heal_lost_bond();
+#endif
+
     int rc = ble_hs_util_ensure_addr(0);
     if (rc != 0) {
         ESP_LOGE(TAG, "ensure_addr failed: %d", rc);
@@ -1076,10 +1498,32 @@ static void on_sync(void)
     }
 
     uint8_t cur[6] = { 0 };
+#ifdef RR_CLEAR_BONDS
+    // ⚠️ ONE-SHOT RECOVERY BUILD: `idf.py -DRR_CLEAR_BONDS=1`.
+    //
+    // Wipes ONLY the BLE bond store. Deliberately NOT a factory reset: that also
+    // regenerates device_id, which orphans the server-side pairing and costs a
+    // QR re-registration. This leaves device_id, the paired flag, the peer anchor
+    // and the whole littlefs cache alone — the phone just has to bond again,
+    // which it does by connecting once.
+    //
+    // Flash this, boot once, then flash a normal build.
+    {
+        int crc = ble_store_clear();
+        ESP_LOGW(TAG, "╔══ RR_CLEAR_BONDS: BLE bond store cleared (rc=%d) ══", crc);
+        ESP_LOGW(TAG, "║ device_id, pairing state and the cache are UNTOUCHED.");
+        ESP_LOGW(TAG, "║ Connect the phone once to re-bond, then flash a normal build.");
+        ESP_LOGW(TAG, "╚═══════════════════════════════════════════════════════");
+    }
+#endif
+
+    log_bond_store();
+
     ble_hs_id_copy_addr(s_addr_type, cur, NULL);
-    ESP_LOGI(TAG, "BLE address %02x:%02x:%02x:%02x:%02x:%02x (%s, derived from device_id)",
+    ESP_LOGI(TAG, "BLE address %02x:%02x:%02x:%02x:%02x:%02x (%s, device_id + gen %u)",
              cur[5], cur[4], cur[3], cur[2], cur[1], cur[0],
-             s_addr_type == BLE_OWN_ADDR_RANDOM ? "random-static" : "public");
+             s_addr_type == BLE_OWN_ADDR_RANDOM ? "random-static" : "public",
+             (unsigned) rr_identity_ble_generation());
 
     advertise();
 }
@@ -1128,7 +1572,7 @@ esp_err_t rr_ble_init(void)
 
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
-    ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
+    ble_hs_cfg.store_status_cb = bond_store_status;
 
     // Bonding with LE Secure Connections (§6B.2). The watch has no keyboard or
     // display it can use for a passkey during this phase, so Just Works — the

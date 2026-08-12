@@ -56,3 +56,17 @@ void rr_ble_factory_reset(const char *reason);
 
 /** Push a fresh QUEUE_STATUS to a subscribed central (queue depth changed). */
 void rr_ble_notify_queue_status(void);
+
+/**
+ * A run was just queued — advertise briskly for a while so a phone coming into
+ * range finds the watch quickly.
+ *
+ * Idle advertising is deliberately slow (1000-1500 ms) because it is the largest
+ * single idle draw on this board. This is the escape hatch for the one moment
+ * where discovery latency actually matters: a child has just finished a routine
+ * and the parent may well be in the next room with the app open.
+ *
+ * Time-boxed inside (30 s): the queue is durable, so after that the records wait
+ * for the next foreground drain rather than costing battery all night.
+ */
+void rr_ble_note_queue_activity(void);

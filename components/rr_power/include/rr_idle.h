@@ -45,3 +45,17 @@ bool rr_idle_is_suspended(void);
  * rr_power already depends on rr_ble.
  */
 void rr_idle_set_face_gate(bool (*fn)(void));
+
+/**
+ * The queue depth changed — refresh the face's "N to upload" badge.
+ *
+ * Deliberately only SETS A FLAG. This is called from whichever task changed the
+ * queue, which for an ack is the NimBLE host task, and rebuilding the face
+ * streams a 280px avatar off littlefs — doing that inline would stall the BLE
+ * host for the duration of a flash read. idle_tick picks the flag up on its next
+ * 500 ms pass instead, which is immediate to a human and costs the host nothing.
+ *
+ * No-op unless the face is actually the screen on display: there is nothing to
+ * refresh behind a routine step screen or a dark panel.
+ */
+void rr_idle_notify_queue_changed(void);
