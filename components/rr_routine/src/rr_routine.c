@@ -63,6 +63,10 @@ static void show_current_step(void);
 static void on_done(void);
 static void on_skip(void);
 
+// Defined with the other hooks at the bottom; declared here because
+// finish_routine() calls it. See rr_routine.h.
+static void (*s_finish_hook)(void);
+
 static void log_heap(const char *when)
 {
     ESP_LOGI(TAG, "heap %s: free=%u largest=%u", when,
@@ -203,6 +207,11 @@ static void finish_routine(void)
 
     rr_ui_show_routine_complete(s.routine_name, done, skipped);
     log_heap("at routine complete");
+
+    // The watch is idle again. Anything that was waiting for that — today, a
+    // scheduled routine the busy rule deferred — gets told immediately rather
+    // than discovering it on its next poll.
+    if (s_finish_hook != NULL) s_finish_hook();
 }
 
 static void advance(rr_step_outcome_t outcome)
@@ -302,6 +311,11 @@ static void (*s_wake_hook)(void);
 void rr_routine_set_wake_hook(void (*fn)(void))
 {
     s_wake_hook = fn;
+}
+
+void rr_routine_set_finish_hook(void (*fn)(void))
+{
+    s_finish_hook = fn;
 }
 
 // The index is resolved BEFORE deferring and carried through as a plain int,

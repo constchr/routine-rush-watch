@@ -20,6 +20,7 @@
 #include "freertos/task.h"
 #include "nvs_flash.h"
 
+#include "esp_random.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
@@ -34,6 +35,7 @@
 #include "rr_identity.h"
 #include "rr_store.h"
 #include "rr_routine.h"
+#include "rr_sched.h"
 #include "rr_ui.h"
 
 static const char *TAG = "rr_ble";
@@ -161,7 +163,28 @@ static int time_sync_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     if (rr_rtc_get(&after) == ESP_OK) rr_rtc_format(&after, safter, sizeof(safter));
-    ESP_LOGI(TAG, "  RTC after:  %s (osc_ok=%d)  <<< TIME SYNCED", safter, (int) after.osc_ok);
+    ESP_LOGI(TAG, "  RTC after:  %s UTC (osc_ok=%d)  <<< TIME SYNCED", safter, (int) after.osc_ok);
+
+    // The clock the scheduler measures everything against just moved, so its
+    // computed wait is now wrong by however far it moved. Re-arm rather than
+    // let it wake at the old offset and fire late (or early).
+    rr_sched_rearm("TIME_SYNC");
+
+    // Print the LOCAL time this implies, right next to the UTC one. The
+    // timezone bug hid here: this handler reported success while the face
+    // showed a time three hours off, and nothing in the log connected the two.
+    // If no offset has arrived yet, say so — a silent absence is what made the
+    // original failure invisible.
+    if (rr_rtc_has_utc_offset()) {
+        rr_rtc_time_t local;
+        char slocal[24] = "<unreadable>";
+        if (rr_rtc_get_local(&local) == ESP_OK) rr_rtc_format(&local, slocal, sizeof(slocal));
+        ESP_LOGI(TAG, "  local:      %s (offset_s=%" PRId32 ")",
+                 slocal, rr_rtc_get_utc_offset());
+    } else {
+        ESP_LOGW(TAG, "  local:      UNKNOWN — no set_tz received yet, the face "
+                      "will show UTC. The phone should send set_tz with every TIME_SYNC.");
+    }
 
     return 0;
 }
@@ -564,6 +587,52 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         }
     }
 
+    // ── set_tz: the UTC offset for local wall-clock display ──────────────────
+    //
+    // Gated on conn_is_authorised() — the ROUTINE_PUSH gate (nonce OR paired
+    // peer), NOT the stricter peer_is_trusted() used by factory_reset and
+    // start_routine. This is configuration data of the same kind as the
+    // routine set, not an act of control over the device, and it must work
+    // during PAIRING, when the phone has only the nonce.
+    //
+    // The offset is applied to the SCREEN only; the RTC keeps UTC. See
+    // rr_rtc.h for why that split is load-bearing (run records are UTC "Z"
+    // instants and would silently be wrong by the offset otherwise).
+    if (strcmp(cmd, "set_tz") == 0) {
+        const cJSON *joff = cJSON_GetObjectItemCaseSensitive(env, "offset_s");
+        const bool have = cJSON_IsNumber(joff);
+        const int32_t offset_s = have ? (int32_t) joff->valuedouble : 0;
+        cJSON_Delete(env);
+
+        if (!conn_is_authorised(conn_handle)) {
+            ESP_LOGW(TAG, "set_tz REJECTED — connection not authorised");
+            return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        }
+        if (!have) {
+            ESP_LOGE(TAG, "set_tz: no numeric \"offset_s\" in the envelope");
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+
+        if (rr_rtc_set_utc_offset(offset_s) != ESP_OK) {
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+
+        // Log the RESULT, not just the receipt. The original bug was invisible
+        // precisely because nothing ever printed the local time the watch
+        // believed in — "TIME_SYNC received" looked like success while the
+        // face was three hours out.
+        rr_rtc_time_t local;
+        char lbuf[24] = "<unreadable>";
+        if (rr_rtc_get_local(&local) == ESP_OK) rr_rtc_format(&local, lbuf, sizeof(lbuf));
+        ESP_LOGI(TAG, "set_tz received: offset_s=%" PRId32 " -> local %s",
+                 offset_s, lbuf);
+
+        // Schedules are authored as LOCAL "HH:MM", so changing the offset
+        // moves every fire time. A DST boundary is exactly this event.
+        rr_sched_rearm("set_tz");
+        return 0;
+    }
+
     ESP_LOGW(TAG, "RR_CONTROL: unknown cmd \"%s\" — rejecting this command only", cmd);
     cJSON_Delete(env);
     return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
@@ -696,6 +765,12 @@ static int routine_push_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
     // Prove the round trip by reading it straight back off flash.
     rr_store_log_routines();
+
+    // New schedules — including a routine whose time a parent just edited in
+    // the app. The scheduler is asleep on a wait computed from the OLD cache,
+    // so it has to be told, or the change only takes effect after the next
+    // resync wake.
+    rr_sched_rearm("ROUTINE_PUSH");
 
     // First successful authenticated push == paired. Persist so the QR does
     // not reappear on reboot, and leave the pairing screen.
@@ -859,6 +934,24 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             ctl_reset();
             rx_reset();
             ESP_LOGI(TAG, "connected (handle %u)", (unsigned) s_conn_handle);
+#ifdef RR_DEV_NONCE_WHEN_PAIRED
+            // TEST BUILDS ONLY (see the root CMakeLists).
+            //
+            // NimBLE answers a write to a WRITE_ENC characteristic on an
+            // unencrypted link with ATT 0x0F (Insufficient Encryption).
+            // CoreBluetooth starts pairing on 0x05 but NOT on 0x0F, so a macOS
+            // central retries forever and never bonds — which is what blocked
+            // the laptop harnesses. Asking for security from this side makes
+            // the bond happen.
+            //
+            // NOT enabled in shipping builds on purpose: the phone's pairing
+            // flow was validated against the current behaviour in Phase 2, and
+            // changing when security is requested is a change to that flow, not
+            // to the scheduler. Worth revisiting on its own (it likely affects
+            // the iOS app too) — but on its own, with the phone in hand.
+            int sec = ble_gap_security_initiate(s_conn_handle);
+            ESP_LOGW(TAG, "DEV BUILD: security_initiate -> %d", sec);
+#endif
         } else {
             ESP_LOGW(TAG, "connect failed (status %d) — re-advertising", event->connect.status);
             advertise();
@@ -942,6 +1035,19 @@ static void derive_static_addr(ble_addr_t *out)
     for (int i = 0; i < 6; i++) {
         out->val[i] = (uint8_t) (h >> (i * 8));
     }
+#ifdef RR_DEV_NONCE_WHEN_PAIRED
+    // TEST BUILDS ONLY (see the root CMakeLists): a fresh identity EVERY BOOT.
+    //
+    // A fixed dev address is not enough. macOS caches the bond, the watch's
+    // bond store does not always still have it after a reflash, and from then
+    // on CoreBluetooth refuses to connect at all ("Peer removed pairing
+    // information") with no way to clear it from the command line. Randomising
+    // per boot sidesteps the whole cache: every test session is a device macOS
+    // has never seen. It costs a junk entry in the host's bond list per boot,
+    // which is the right trade for a throwaway image.
+    out->val[0] ^= (uint8_t) (esp_random() & 0xFF);
+    out->val[1] ^= (uint8_t) (esp_random() & 0xFF);
+#endif
     // A random STATIC address requires the two most significant bits set.
     out->val[5] |= 0xC0;
     out->type = BLE_ADDR_RANDOM;

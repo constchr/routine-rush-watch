@@ -150,11 +150,53 @@ typedef struct {
 
 /**
  * Soonest upcoming scheduled routine at or after (now_hour:now_min) on
- * `iso_weekday` (1=Mon..7=Sun). If nothing remains today, wraps to the
- * earliest schedule on any later day and sets today=false.
+ * `iso_weekday` (1=Mon..7=Sun). If nothing remains today, rolls forward to the
+ * next day that routine ACTUALLY RUNS ON and sets today=false.
+ *
+ * Times are LOCAL — schedules are authored as local "HH:MM" in the app, so the
+ * caller must pass local wall-clock (rr_rtc_get_local), never UTC.
+ *
+ * Phase 7: this is now a thin wrapper over rr_store_next_schedule(), so the
+ * hint on the face and the routine the scheduler actually fires are computed
+ * by the same code and cannot disagree.
  */
 esp_err_t rr_store_next_routine(int iso_weekday, int now_hour, int now_min,
                                 rr_next_routine_t *out);
+
+// ── Phase 7: schedule matching for the scheduler (§7) ────────────────────────
+
+typedef struct {
+    bool found;
+    char assignment_id[40];   /**< what rr_routine_request_start() takes */
+    char routine_name[64];
+    char routine_emoji[16];
+    int  days_ahead;          /**< 0 = today, up to 7 */
+    int  minute_of_day;       /**< 0..1439, LOCAL wall-clock */
+} rr_schedule_hit_t;
+
+/**
+ * The earliest scheduled occurrence at or after (from_iso_weekday,
+ * from_minute_of_day), searching 8 days forward.
+ *
+ * DAY-OF-WEEK IS HONOURED. The Phase 6 hint took the earliest HH:MM of any
+ * schedule that ran on some other day, so a Monday-only routine was offered on
+ * a Tuesday evening. Rolling the weekday forward day by day and testing
+ * membership each time is what makes "07:00 tomorrow when it is 23:00 today"
+ * and "not until Monday" both come out right.
+ *
+ * skip_ids/skip_count exclude specific assignment_ids from the occurrence that
+ * lands EXACTLY on (from_iso_weekday, from_minute_of_day) — nothing else. That
+ * is how two routines sharing one trigger time get queued rather than one of
+ * them being silently lost: the scheduler fires the first, then asks again
+ * from the same minute with that id skipped (§7 "if multiple routines collide,
+ * queue them").
+ *
+ * ESP_ERR_NOT_FOUND means there is genuinely nothing scheduled, which is a
+ * real answer — an unscheduled watch is a supported state, not a fault.
+ */
+esp_err_t rr_store_next_schedule(int from_iso_weekday, int from_minute_of_day,
+                                 const char *const *skip_ids, int skip_count,
+                                 rr_schedule_hit_t *out);
 
 
 // ── Phase 6b: the cached child (§5 /cache/child.json) ────────────────────────

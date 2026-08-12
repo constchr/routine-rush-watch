@@ -14,6 +14,7 @@
 #include "rr_store.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -576,88 +577,154 @@ uint32_t rr_queue_oldest_ts(void)
     return ts;
 }
 
-// ── Phase 6: next scheduled routine ──────────────────────────────────────────
+// ── Phase 6/7: schedule matching ─────────────────────────────────────────────
+//
+// One implementation, two callers: the idle face's "Next:" hint and the
+// scheduler that actually rings. They were separate in Phase 6 and disagreed —
+// the hint offered a Monday-only routine on a Tuesday — so they are the same
+// search now and a fix to one is a fix to both.
 
-esp_err_t rr_store_next_routine(int iso_weekday, int now_hour, int now_min,
-                                rr_next_routine_t *out)
+/** Read and parse the routine cache. Caller owns the tree. NULL if absent. */
+static cJSON *load_routines(void)
 {
-    if (!s_mounted || out == NULL) return ESP_ERR_INVALID_ARG;
-    memset(out, 0, sizeof(*out));
-
     struct stat st;
-    if (stat(ROUTINES_PATH, &st) != 0) return ESP_ERR_NOT_FOUND;
+    if (stat(ROUTINES_PATH, &st) != 0) return NULL;
+
     FILE *f = fopen(ROUTINES_PATH, "rb");
-    if (f == NULL) return ESP_FAIL;
+    if (f == NULL) return NULL;
     char *buf = malloc((size_t) st.st_size + 1);
-    if (buf == NULL) { fclose(f); return ESP_ERR_NO_MEM; }
+    if (buf == NULL) { fclose(f); return NULL; }
     size_t got = fread(buf, 1, (size_t) st.st_size, f);
     fclose(f);
     buf[got] = '\0';
 
     cJSON *root = cJSON_ParseWithLength(buf, got);
     free(buf);
-    if (root == NULL || !cJSON_IsArray(root)) { cJSON_Delete(root); return ESP_ERR_INVALID_STATE; }
+    if (root != NULL && !cJSON_IsArray(root)) { cJSON_Delete(root); return NULL; }
+    return root;
+}
 
-    const int now_mins = now_hour * 60 + now_min;
-    int best_today = 24 * 60 + 1;    // minutes-of-day, lower is sooner
-    int best_later = 24 * 60 + 1;
-    const cJSON *pick_today = NULL, *pick_later = NULL;
-    int pick_today_hm = 0, pick_later_hm = 0;
+/** True if `days` (the JSON array) contains ISO weekday `wd` (1=Mon..7=Sun). */
+static bool days_contains(const cJSON *days, int wd)
+{
+    int n = cJSON_GetArraySize(days);
+    for (int k = 0; k < n; k++) {
+        const cJSON *d = cJSON_GetArrayItem((cJSON *) days, k);
+        if (!cJSON_IsNumber(d)) continue;
+        // The app emits ISO weekdays (1=Mon..7=Sun) but the sample data also
+        // uses 0 for Sunday, so accept both spellings.
+        int v = d->valueint;
+        if (v == 0) v = 7;
+        if (v == wd) return true;
+    }
+    return false;
+}
 
-    int n = cJSON_GetArraySize(root);
+/** "HH:MM" -> minutes-of-day, or -1 if it is not a time. */
+static int parse_hhmm(const cJSON *tt)
+{
+    if (!cJSON_IsString(tt)) return -1;
+    int hh = 0, mm = 0;
+    if (sscanf(tt->valuestring, "%d:%d", &hh, &mm) != 2) return -1;
+    if (hh < 0 || hh > 23 || mm < 0 || mm > 59) return -1;
+    return hh * 60 + mm;
+}
+
+esp_err_t rr_store_next_schedule(int from_iso_weekday, int from_minute_of_day,
+                                 const char *const *skip_ids, int skip_count,
+                                 rr_schedule_hit_t *out)
+{
+    if (!s_mounted || out == NULL) return ESP_ERR_INVALID_ARG;
+    if (from_iso_weekday < 1 || from_iso_weekday > 7) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+
+    cJSON *root = load_routines();
+    if (root == NULL) return ESP_ERR_NOT_FOUND;
+
+    // Distance from the search origin, in minutes. Anything strictly smaller
+    // than the running best wins, so ties resolve to the FIRST routine in the
+    // cache — a stable order, which matters when two routines share a time.
+    int best = INT_MAX;
+
+    const int n = cJSON_GetArraySize(root);
     for (int i = 0; i < n; i++) {
-        cJSON *r = cJSON_GetArrayItem(root, i);
+        const cJSON *r = cJSON_GetArrayItem(root, i);
         const cJSON *scheds = cJSON_GetObjectItemCaseSensitive(r, "schedules");
         if (!cJSON_IsArray(scheds)) continue;
 
-        int sn = cJSON_GetArraySize(scheds);
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(r, "assignment_id");
+        if (!cJSON_IsString(id)) continue;   // unstartable: nothing to pass to request_start
+
+        const int sn = cJSON_GetArraySize(scheds);
         for (int j = 0; j < sn; j++) {
-            cJSON *sc = cJSON_GetArrayItem((cJSON *) scheds, j);
-            const cJSON *tt = cJSON_GetObjectItemCaseSensitive(sc, "trigger_time");
+            const cJSON *sc = cJSON_GetArrayItem((cJSON *) scheds, j);
             const cJSON *days = cJSON_GetObjectItemCaseSensitive(sc, "days");
-            if (!cJSON_IsString(tt) || !cJSON_IsArray(days)) continue;
+            if (!cJSON_IsArray(days)) continue;
 
-            int hh = 0, mm = 0;
-            if (sscanf(tt->valuestring, "%d:%d", &hh, &mm) != 2) continue;
-            const int at = hh * 60 + mm;
+            const int at = parse_hhmm(cJSON_GetObjectItemCaseSensitive(sc, "trigger_time"));
+            if (at < 0) continue;
 
-            bool runs_today = false, runs_other_day = false;
-            int dn = cJSON_GetArraySize(days);
-            for (int k = 0; k < dn; k++) {
-                cJSON *d = cJSON_GetArrayItem((cJSON *) days, k);
-                if (!cJSON_IsNumber(d)) continue;
-                // The app emits ISO weekdays (1=Mon..7=Sun) but the sample data
-                // also uses 0 for Sunday, so accept both spellings.
-                int wd = d->valueint;
-                if (wd == 0) wd = 7;
-                if (wd == iso_weekday) runs_today = true;
-                else runs_other_day = true;
-            }
+            // Walk forward a day at a time. d == 7 is "the same weekday next
+            // week", which is what makes a once-a-week schedule resolvable
+            // rather than reported as "nothing scheduled".
+            for (int d = 0; d <= 7; d++) {
+                const int wd = ((from_iso_weekday - 1 + d) % 7) + 1;
+                if (!days_contains(days, wd)) continue;
+                if (d == 0 && at < from_minute_of_day) continue;   // already past today
 
-            if (runs_today && at >= now_mins && at < best_today) {
-                best_today = at; pick_today = r; pick_today_hm = at;
-            }
-            if ((runs_other_day || runs_today) && at < best_later) {
-                best_later = at; pick_later = r; pick_later_hm = at;
+                // The skip list applies ONLY to the exact origin minute: it
+                // exists to say "this one already fired just now", not to hide
+                // the routine from tomorrow.
+                if (d == 0 && at == from_minute_of_day && skip_ids != NULL) {
+                    bool skipped = false;
+                    for (int s = 0; s < skip_count; s++) {
+                        if (skip_ids[s] != NULL && strcmp(skip_ids[s], id->valuestring) == 0) {
+                            skipped = true;
+                            break;
+                        }
+                    }
+                    if (skipped) continue;
+                }
+
+                const int distance = d * 1440 + at;
+                if (distance < best) {
+                    best = distance;
+                    out->found = true;
+                    out->days_ahead = d;
+                    out->minute_of_day = at;
+                    strlcpy(out->assignment_id, id->valuestring, sizeof(out->assignment_id));
+                    copy_str(out->routine_name, sizeof(out->routine_name),
+                             cJSON_GetObjectItemCaseSensitive(r, "name"), "");
+                    copy_str(out->routine_emoji, sizeof(out->routine_emoji),
+                             cJSON_GetObjectItemCaseSensitive(r, "emoji"), "");
+                }
+                break;   // nearest day for THIS schedule found; later ones cannot win
             }
         }
     }
 
-    const cJSON *pick = pick_today ? pick_today : pick_later;
-    int hm = pick_today ? pick_today_hm : pick_later_hm;
-    if (pick != NULL) {
-        out->found = true;
-        out->today = (pick_today != NULL);
-        out->hour = hm / 60;
-        out->minute = hm % 60;
-        const cJSON *nm = cJSON_GetObjectItemCaseSensitive(pick, "name");
-        const cJSON *em = cJSON_GetObjectItemCaseSensitive(pick, "emoji");
-        strlcpy(out->routine_name, cJSON_IsString(nm) ? nm->valuestring : "", sizeof(out->routine_name));
-        strlcpy(out->routine_emoji, cJSON_IsString(em) ? em->valuestring : "", sizeof(out->routine_emoji));
-    }
-
     cJSON_Delete(root);
     return out->found ? ESP_OK : ESP_ERR_NOT_FOUND;
+}
+
+esp_err_t rr_store_next_routine(int iso_weekday, int now_hour, int now_min,
+                                rr_next_routine_t *out)
+{
+    if (out == NULL) return ESP_ERR_INVALID_ARG;
+    memset(out, 0, sizeof(*out));
+
+    rr_schedule_hit_t hit;
+    esp_err_t err = rr_store_next_schedule(iso_weekday, now_hour * 60 + now_min,
+                                           NULL, 0, &hit);
+    if (err != ESP_OK) return err;
+
+    out->found = true;
+    out->today = (hit.days_ahead == 0);
+    out->hour = hit.minute_of_day / 60;
+    out->minute = hit.minute_of_day % 60;
+    strlcpy(out->routine_name, hit.routine_name, sizeof(out->routine_name));
+    strlcpy(out->routine_emoji, hit.routine_emoji, sizeof(out->routine_emoji));
+    return ESP_OK;
 }
 
 

@@ -142,3 +142,16 @@ int rr_ui_iso_weekday(int y, int m, int d);
 
 /** True if the last screen rendered was the idle watch face. */
 bool rr_ui_last_screen_is_watchface(void);
+
+// ── Phase 7: the alarm screen (§7) ───────────────────────────────────────────
+
+/**
+ * The screen a scheduled routine rings on: time, routine, "Let's go", snooze.
+ *
+ * on_start is what actually begins the routine, and it must go through
+ * rr_routine_request_start() — this screen starts nothing itself. Both
+ * callbacks run on the LVGL task.
+ */
+esp_err_t rr_ui_show_alarm(const char *routine_name, const char *routine_emoji,
+                           int hour, int minute, const char *language,
+                           rr_ui_step_cb_t on_start, rr_ui_step_cb_t on_snooze);

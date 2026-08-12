@@ -1,6 +1,6 @@
 // Routine Rush Watch — application entry point.
 //
-// PHASE 6: idle watch face + raise-to-wake.
+// PHASE 9: step counting on the QMI8658's on-chip pedometer.
 //
 // The watch mints a persistent device_id, generates an ephemeral pairing
 // nonce, renders both as a QR on the AMOLED, and waits. The parent app scans
@@ -10,14 +10,17 @@
 //
 // Phase 1's TIME_SYNC path is still here and is now bond-gated (WRITE_ENC).
 //
-// Not implemented: routine pull, sync engine, queue, routine UI, watch face,
-// audio.
+// Not implemented: the sync engine, power tuning (Phase 10), and the full
+// audio subsystem (Phase 8 — only the alarm tone path exists, see rr_audio.h).
+// Steps are local-only by design (§10.1 leaves backend sync to v1.1).
 
+#include <inttypes.h>
 #include <stdio.h>
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_idf_version.h"
+#include "nvs.h"
 #include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -34,6 +37,9 @@
 #include "rr_rtc.h"
 #include "rr_ui.h"
 #include "rr_reset_button.h"
+#include "rr_sched.h"
+#include "rr_audio.h"
+#include "rr_steps.h"
 
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 5, 0)
 #error "Routine Rush Watch requires ESP-IDF v5.5+ (board BSP declares idf >=5.5.0)."
@@ -68,6 +74,13 @@ static bool watchface_allowed(void)
     return rr_store_get_child(&child) == ESP_OK;
 }
 
+// rr_routine's finish hook is void(void); rr_sched_rearm carries a reason
+// string so the log says WHY a fire time was recomputed. This is the seam.
+static void rr_sched_rearm_on_idle(void)
+{
+    rr_sched_rearm("routine finished");
+}
+
 // Idle-sleep suspension. Two unrelated reasons, both "the screen is doing a
 // job right now":
 //   - a routine is running: a child reading a countdown must not be blanked;
@@ -75,14 +88,17 @@ static bool watchface_allowed(void)
 //     Blanking it after 8 s makes a reset watch look bricked, and the wrist
 //     raise that would wake it is not something you do while holding a phone
 //     up to scan.
+//   - a scheduled alarm is ringing and nobody has answered it yet: an alarm
+//     that blanks itself after 8 s is not an alarm. rr_sched auto-snoozes it
+//     after a minute, which is what ends this suspension.
 static bool idle_suspended(void)
 {
-    return rr_routine_is_active() || !rr_identity_is_paired();
+    return rr_routine_is_active() || !rr_identity_is_paired() || rr_sched_alarm_is_showing();
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Routine Rush Watch — Phase 6 (watch face + raise-to-wake)");
+    ESP_LOGI(TAG, "Routine Rush Watch — Phase 9 (step counting)");
     ESP_LOGI(TAG, "ESP-IDF %s", esp_get_idf_version());
 
     // NVS first — app_main owns the NVS lifecycle for the whole firmware.
@@ -106,7 +122,27 @@ void app_main(void)
         nvs_err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(nvs_err);
-    ESP_LOGI(TAG, "NVS initialised");
+
+    // Report how full NVS is, every boot.
+    //
+    // This partition is 24 KB — six pages — and it holds the things that make
+    // the watch THIS child's watch: the device_id the server-side pairing is
+    // keyed on, the BLE bond, the UTC offset, the scheduler's last-fired marker,
+    // and the step count. If it ever fills, the recovery path above ERASES IT,
+    // which regenerates the device_id and silently orphans the pairing. That is
+    // a bad thing to discover from a parent saying the app stopped finding the
+    // watch, so the headroom is visible in the log from now on.
+    nvs_stats_t st;
+    if (nvs_get_stats(NULL, &st) == ESP_OK) {
+        ESP_LOGI(TAG, "NVS initialised — %d/%d entries used (%d free), %d namespaces",
+                 st.used_entries, st.total_entries, st.free_entries, st.namespace_count);
+        if (st.free_entries * 4 < st.total_entries) {
+            ESP_LOGW(TAG, "NVS is over 75%% full — if it fills, the erase-and-retry "
+                          "recovery costs the device_id and the watch needs re-pairing");
+        }
+    } else {
+        ESP_LOGI(TAG, "NVS initialised");
+    }
 
     // Identity next: the QR cannot be built without it, and a failure here is
     // fatal to pairing (see rr_identity.c on why we refuse a volatile id).
@@ -141,6 +177,25 @@ void app_main(void)
         // Already in service — do NOT show the QR again. Re-pairing needs an
         // explicit reset (see rr_identity.h).
         ESP_LOGI(TAG, "already paired — skipping the pairing QR");
+
+#ifdef RR_DEV_NONCE_WHEN_PAIRED
+        // ⚠️ TEMPORARY TEST AFFORDANCE — NEVER DEFINE THIS FOR A REAL BUILD.
+        //
+        // A paired watch shows no QR, so there is no nonce, so the laptop BLE
+        // harnesses (tools/*.py) cannot authorise and cannot push test
+        // schedules. This mints one anyway and prints it, purely so Phase 7
+        // can be driven from a workstation without unpairing the phone.
+        //
+        // Build with: idf.py -DRR_DEV_NONCE=1 build
+        {
+            char devnonce[RR_NONCE_LEN];
+            rr_identity_new_nonce(devnonce, sizeof(devnonce));
+            rr_identity_set_active_nonce(devnonce);
+            ESP_LOGW(TAG, "╔══ DEV BUILD: nonce auth enabled on a PAIRED watch ══");
+            ESP_LOGW(TAG, "║ nonce: %s", devnonce);
+            ESP_LOGW(TAG, "╚══ this must NOT ship ═══════════════════════════════");
+        }
+#endif
         if (rr_store_has_routines() == ESP_OK) {
             rr_store_log_routines();     // prove the cache survived the reboot
             rr_ui_show_paired_status();
@@ -191,18 +246,53 @@ void app_main(void)
     // rr_routine_request_start() too.
     rr_routine_set_wake_hook(rr_idle_wake_manual);
 
+    // ── Phase 9: step counting ──────────────────────────────────────────────
+    // Before rr_idle_init(), because the first face this boot draws reads the
+    // count — an uninitialised module there would paint the placeholder once and
+    // not correct it until the next wake.
+    //
+    // rr_steps asks rr_imu to start the on-chip engine; it does not touch the
+    // sensor. A failure is non-fatal and deliberately visible: the face keeps
+    // showing "—" rather than a confident zero.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(rr_steps_init());
+
+
     ESP_ERROR_CHECK_WITHOUT_ABORT(rr_idle_init());
+
+    // ── Phase 7: audio + the scheduler ──────────────────────────────────────
+    // Audio FIRST: the scheduler's only alerting channel is the speaker (no
+    // vibration motor exists on this board, §2), so a scheduler started before
+    // the codec could fire its first alarm silently.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(rr_audio_init());
+
+    // Same two hooks rr_routine already uses, and for the same reason: rr_power
+    // depends on rr_ble, which depends on rr_sched, so the arrows only point
+    // one way and main.c ties the ends together.
+    rr_sched_set_wake_hook(rr_idle_wake_manual);
+    rr_routine_set_finish_hook(rr_sched_rearm_on_idle);
+
+    ESP_ERROR_CHECK_WITHOUT_ABORT(rr_sched_init());
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(5000));
+        // Both clocks, every tick. The timezone bug survived as long as it did
+        // because this line printed one time and the face showed another, with
+        // nothing saying which was which or that an offset was missing.
         if (rr_rtc_get(&now) == ESP_OK) {
             rr_rtc_format(&now, tbuf, sizeof(tbuf));
-            ESP_LOGI(TAG, "RTC %s | ble=%s | routine=%s | screen=%s | queued=%d | heap %u",
-                     tbuf,
+            rr_rtc_time_t local;
+            char lbuf[24] = "no set_tz";
+            if (rr_rtc_has_utc_offset() && rr_rtc_get_local(&local) == ESP_OK) {
+                rr_rtc_format(&local, lbuf, sizeof(lbuf));
+            }
+            ESP_LOGI(TAG, "UTC %s | local %s | ble=%s | routine=%s | screen=%s | queued=%d "
+                          "| steps %" PRIu32 "%s | heap %u",
+                     tbuf, lbuf,
                      rr_ble_is_connected() ? "CONNECTED" : "advertising",
                      rr_routine_is_active() ? "RUNNING" : "idle",
                      rr_idle_is_awake() ? "awake" : "asleep",
                      rr_queue_count(),
+                     rr_steps_today(), rr_steps_valid() ? "" : "(invalid)",
                      (unsigned) esp_get_free_heap_size());
         }
     }

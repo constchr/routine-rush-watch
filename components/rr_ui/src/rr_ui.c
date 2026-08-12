@@ -38,7 +38,8 @@ static lv_obj_t *s_screen;
 
 // Last non-transient screen, so an aborted reset countdown can restore exactly
 // what the watch was showing instead of guessing at pairing state.
-typedef enum { RR_SCREEN_NONE, RR_SCREEN_QR, RR_SCREEN_PAIRED, RR_SCREEN_WAITING, RR_SCREEN_WATCHFACE } rr_screen_t;
+typedef enum { RR_SCREEN_NONE, RR_SCREEN_QR, RR_SCREEN_PAIRED, RR_SCREEN_WAITING,
+               RR_SCREEN_WATCHFACE, RR_SCREEN_ALARM } rr_screen_t;
 static rr_screen_t s_last_screen;
 static char s_last_qr_payload[128];
 
@@ -278,8 +279,11 @@ esp_err_t rr_ui_show_last_status(void)
     case RR_SCREEN_PAIRED:  return rr_ui_show_paired_status();
     case RR_SCREEN_WAITING: return rr_ui_show_waiting_status();
     case RR_SCREEN_WATCHFACE:
+    case RR_SCREEN_ALARM:
         // Without this an ABORTED reset hold left the red countdown on screen
-        // until the next minute tick happened to repaint it.
+        // until the next minute tick happened to repaint it. A SNOOZED alarm
+        // needs the same treatment for the same reason — dismissing it has to
+        // put something back, or the alarm screen simply stays up.
         if (s_repaint_face) s_repaint_face();
         return ESP_OK;
     default:                return ESP_OK;
@@ -360,6 +364,87 @@ esp_err_t rr_ui_font_selftest(void)
 static lv_obj_t *s_arc;
 static lv_obj_t *s_mmss;
 
+// ═════════════════════════════════════════════════════════════════════════════
+// STEP SCREEN VERTICAL LAYOUT (§8 screens 2/3)
+//
+// ⚠️ EVERY Y HERE IS TOP-RELATIVE TO THE SAFE AREA, DELIBERATELY.
+//
+// The original layout positioned the emoji, label and ring from the TOP and the
+// two buttons from the BOTTOM. Both halves were individually reasonable and
+// nothing in the code related them, so nobody could see that they collided —
+// and on hardware the OK button was drawn straight through the countdown ring
+// (the ring occupied y=224..374, the button y=296..364). Photographed on device
+// in Phase 9.
+//
+// Two rules keep that from coming back:
+//   1. one coordinate system — every element is placed from the top of the safe
+//      area, so the numbers can simply be compared;
+//   2. the comparisons are _Static_assert, so an overlapping layout is a BUILD
+//      FAILURE rather than something to notice on a photograph.
+//
+// The other half of the fix is spatial: a stacked emoji AND a separate ring do
+// not fit in 412 px alongside a two-line label and two buttons. The ring is now
+// CONCENTRIC — the emoji sits inside it with the mm:ss below, so the countdown
+// reads as a halo around the step's icon. That reclaims ~100 px, and on a 2"
+// kids' watch it looks more like a watch than a stack of boxes.
+// ═════════════════════════════════════════════════════════════════════════════
+
+#define STEP_POS_Y        0     /* "1 / 2" */
+#define STEP_POS_H        26
+
+#define STEP_RING_Y       26
+#define STEP_RING_SIZE    186
+#define STEP_RING_STROKE  12
+#define STEP_RING_EMOJI_DY (-12)  /* emoji offset from the ring centre */
+#define STEP_RING_MMSS_DY  58     /* mm:ss offset from the ring centre */
+
+// Two lines of rr_font_28 (~34 px each). The label was rr_font_36, and this is
+// the one real concession the fix makes: at 36 px a two-line Greek label
+// ("Καθαρίζεις το τραπέζι") needs 88 px and there is nowhere to take it from.
+// 28 px is still large on a 410x502 panel, and shrinking the instruction beats
+// truncating it or overlapping the button a child has to press.
+#define STEP_LABEL_Y      220
+#define STEP_LABEL_H      72
+
+#define STEP_SKIP_H       38
+#define STEP_SKIP_Y       (RR_SAFE_H - STEP_SKIP_H)
+#define STEP_OK_H         66
+#define STEP_OK_Y         (STEP_SKIP_Y - 8 - STEP_OK_H)
+
+// The untimed step (§8 screen 3) has no ring, so its emoji and label get the
+// space the ring would have used. Same buttons, same bottom anchors.
+#define STEP_U_EMOJI_Y    46
+#define STEP_U_EMOJI_H    96
+#define STEP_U_LABEL_Y    166
+#define STEP_U_LABEL_H    88    /* room for two lines of rr_font_36 here */
+
+_Static_assert(STEP_POS_Y + STEP_POS_H <= STEP_RING_Y,
+               "step screen: the position counter overlaps the countdown ring");
+_Static_assert(STEP_RING_Y + STEP_RING_SIZE <= STEP_LABEL_Y,
+               "step screen: the countdown ring overlaps the step label");
+_Static_assert(STEP_LABEL_Y + STEP_LABEL_H <= STEP_OK_Y,
+               "step screen: the step label overlaps the OK button");
+_Static_assert(STEP_OK_Y + STEP_OK_H <= STEP_SKIP_Y,
+               "step screen: the OK button overlaps the Skip button");
+_Static_assert(STEP_SKIP_Y + STEP_SKIP_H <= RR_SAFE_H,
+               "step screen: the Skip button falls outside the safe area");
+_Static_assert(STEP_U_EMOJI_Y + STEP_U_EMOJI_H <= STEP_U_LABEL_Y,
+               "untimed step: the emoji overlaps the label");
+_Static_assert(STEP_U_LABEL_Y + STEP_U_LABEL_H <= STEP_OK_Y,
+               "untimed step: the label overlaps the OK button");
+
+// The concentric content must also fit INSIDE the ring, which is a circle and
+// not a box: at the emoji's widest the inner radius has to still clear half the
+// emoji. Checked at build time in integer maths (squared, to avoid sqrt).
+#define STEP_RING_INNER_R  ((STEP_RING_SIZE - 2 * STEP_RING_STROKE) / 2)
+#define STEP_EMOJI_HALF    48
+#define STEP_EMOJI_FAR_Y   (-STEP_RING_EMOJI_DY + STEP_EMOJI_HALF)   /* |y| at the top edge */
+_Static_assert(STEP_EMOJI_FAR_Y * STEP_EMOJI_FAR_Y + STEP_EMOJI_HALF * STEP_EMOJI_HALF
+               <= STEP_RING_INNER_R * STEP_RING_INNER_R,
+               "step screen: the emoji's corners fall outside the countdown ring");
+_Static_assert(STEP_RING_MMSS_DY + 17 <= STEP_RING_INNER_R,
+               "step screen: the mm:ss readout falls outside the countdown ring");
+
 static void mmss_str(int secs, char *out, size_t cap)
 {
     if (secs < 0) secs = 0;
@@ -382,7 +467,6 @@ esp_err_t rr_ui_show_step(const rr_step_view_t *v,
     lv_obj_t *root = rr_ui_begin_screen(RR_BG);
     s_arc = NULL;
     s_mmss = NULL;
-    
 
     const bool timed = v->time_limit_s > 0;
 
@@ -393,25 +477,60 @@ esp_err_t rr_ui_show_step(const rr_step_view_t *v,
     lv_label_set_text(lpos, pos);
     lv_obj_set_style_text_font(lpos, &rr_font_20, LV_PART_MAIN);
     lv_obj_set_style_text_color(lpos, RR_MUTED, LV_PART_MAIN);
-    lv_obj_align(lpos, LV_ALIGN_TOP_MID, 0, 0);
+    lv_obj_align(lpos, LV_ALIGN_TOP_MID, 0, STEP_POS_Y);
+
+    // ── countdown ring — created FIRST so the emoji and mm:ss draw inside it ─
+    // §8 screen 3: an untimed step gets no ring at all. Showing an empty or
+    // full ring that never moves would imply a timer that is broken.
+    if (timed) {
+        s_arc = lv_arc_create(root);
+        lv_obj_set_size(s_arc, STEP_RING_SIZE, STEP_RING_SIZE);
+        lv_arc_set_rotation(s_arc, 270);
+        lv_arc_set_bg_angles(s_arc, 0, 360);
+        lv_arc_set_range(s_arc, 0, 1000);      // finer than seconds, so the
+        lv_arc_set_value(s_arc, 1000);         // sweep looks continuous
+        lv_obj_remove_style(s_arc, NULL, LV_PART_KNOB);
+        lv_obj_remove_flag(s_arc, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_arc_width(s_arc, STEP_RING_STROKE, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(s_arc, STEP_RING_STROKE, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_color(s_arc, RR_SURFACE, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(s_arc, RR_ACCENT, LV_PART_INDICATOR);
+        lv_obj_align(s_arc, LV_ALIGN_TOP_MID, 0, STEP_RING_Y);
+    }
 
     // ── emoji, 96px, streamed from littlefs ─────────────────────────────────
+    // Inside the ring when there is one, so the countdown reads as a halo round
+    // the step's icon rather than competing with it for vertical space.
     char lvpath[96];
     const char *posix_path = rr_emoji_path(v->emoji);
     bool drew_emoji = false;
+    lv_obj_t *icon = NULL;
+
     if (posix_path != NULL && to_lv_path(posix_path, lvpath, sizeof(lvpath))) {
-        lv_obj_t *img = lv_image_create(root);
-        lv_image_set_src(img, lvpath);
-        lv_obj_align(img, LV_ALIGN_TOP_MID, 0, 34);
+        icon = lv_image_create(root);
+        lv_image_set_src(icon, lvpath);
         drew_emoji = true;
     } else {
-        lv_obj_t *dot = lv_obj_create(root);
-        lv_obj_set_size(dot, 96, 96);
-        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-        lv_obj_set_style_bg_color(dot, RR_SURFACE, LV_PART_MAIN);
-        lv_obj_set_style_border_width(dot, 0, LV_PART_MAIN);
-        lv_obj_align(dot, LV_ALIGN_TOP_MID, 0, 34);
+        icon = lv_obj_create(root);
+        lv_obj_set_size(icon, 96, 96);
+        lv_obj_set_style_radius(icon, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+        lv_obj_set_style_bg_color(icon, RR_SURFACE, LV_PART_MAIN);
+        lv_obj_set_style_border_width(icon, 0, LV_PART_MAIN);
         ESP_LOGW(TAG, "emoji '%s' unmapped — fallback dot", v->emoji);
+    }
+
+    if (timed) lv_obj_align_to(icon, s_arc, LV_ALIGN_CENTER, 0, STEP_RING_EMOJI_DY);
+    else       lv_obj_align(icon, LV_ALIGN_TOP_MID, 0, STEP_U_EMOJI_Y);
+
+    // ── mm:ss, inside the ring under the emoji ──────────────────────────────
+    if (timed) {
+        char buf[16];
+        mmss_str(v->time_limit_s, buf, sizeof(buf));
+        s_mmss = lv_label_create(root);
+        lv_label_set_text(s_mmss, buf);
+        lv_obj_set_style_text_font(s_mmss, &rr_font_28, LV_PART_MAIN);
+        lv_obj_set_style_text_color(s_mmss, RR_TEXT, LV_PART_MAIN);
+        lv_obj_align_to(s_mmss, s_arc, LV_ALIGN_CENTER, 0, STEP_RING_MMSS_DY);
     }
 
     // ── step label ──────────────────────────────────────────────────────────
@@ -419,44 +538,25 @@ esp_err_t rr_ui_show_step(const rr_step_view_t *v,
     lv_label_set_long_mode(llabel, LV_LABEL_LONG_WRAP);
     lv_obj_set_width(llabel, RR_SAFE_W);
     lv_label_set_text(llabel, v->label);
-    lv_obj_set_style_text_font(llabel, &rr_font_36, LV_PART_MAIN);
+    // Keep the label at rr_font_36 when it fits on ONE line, and only drop to
+    // rr_font_28 when it needs two. Measured rather than assumed: most step
+    // labels are one Greek word ("Βούρτσισμα") and shrinking those to make room
+    // for the long ones would be paying the cost everywhere to fix it in a few
+    // places. STEP_LABEL_H (72) holds either one line of 36 or two of 28.
+    lv_point_t sz;
+    lv_text_get_size(&sz, v->label, &rr_font_36, 0, 0, RR_SAFE_W, LV_TEXT_FLAG_NONE);
+    const lv_font_t *label_font = (sz.y <= 44) ? &rr_font_36 : &rr_font_28;
+    lv_obj_set_style_text_font(llabel, timed ? label_font : &rr_font_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(llabel, RR_TEXT, LV_PART_MAIN);
     lv_obj_set_style_text_align(llabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(llabel, LV_ALIGN_TOP_MID, 0, 140);
-
-    // ── countdown ring — only for TIMED steps ───────────────────────────────
-    // §8 screen 3: an untimed step has no ring at all. Showing an empty or
-    // full ring that never moves would imply a timer that is broken.
-    if (timed) {
-        s_arc = lv_arc_create(root);
-        lv_obj_set_size(s_arc, 150, 150);
-        lv_arc_set_rotation(s_arc, 270);
-        lv_arc_set_bg_angles(s_arc, 0, 360);
-        lv_arc_set_range(s_arc, 0, 1000);      // finer than seconds, so the
-        lv_arc_set_value(s_arc, 1000);         // sweep looks continuous
-        lv_obj_remove_style(s_arc, NULL, LV_PART_KNOB);
-        lv_obj_remove_flag(s_arc, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_set_style_arc_width(s_arc, 12, LV_PART_MAIN);
-        lv_obj_set_style_arc_width(s_arc, 12, LV_PART_INDICATOR);
-        lv_obj_set_style_arc_color(s_arc, RR_SURFACE, LV_PART_MAIN);
-        lv_obj_set_style_arc_color(s_arc, RR_ACCENT, LV_PART_INDICATOR);
-        lv_obj_align(s_arc, LV_ALIGN_TOP_MID, 0, 224);
-
-        char buf[16];
-        mmss_str(v->time_limit_s, buf, sizeof(buf));
-        s_mmss = lv_label_create(root);
-        lv_label_set_text(s_mmss, buf);
-        lv_obj_set_style_text_font(s_mmss, &rr_font_28, LV_PART_MAIN);
-        lv_obj_set_style_text_color(s_mmss, RR_TEXT, LV_PART_MAIN);
-        lv_obj_align_to(s_mmss, s_arc, LV_ALIGN_CENTER, 0, 0);
-    }
+    lv_obj_align(llabel, LV_ALIGN_TOP_MID, 0, timed ? STEP_LABEL_Y : STEP_U_LABEL_Y);
 
     // ── Done: the primary action, deliberately the biggest thing on screen ──
     lv_obj_t *bdone = lv_button_create(root);
-    lv_obj_set_size(bdone, RR_SAFE_W, 68);
-    lv_obj_align(bdone, LV_ALIGN_BOTTOM_MID, 0, -48);
+    lv_obj_set_size(bdone, RR_SAFE_W, STEP_OK_H);
+    lv_obj_align(bdone, LV_ALIGN_TOP_MID, 0, STEP_OK_Y);
     lv_obj_set_style_bg_color(bdone, RR_ACCENT, LV_PART_MAIN);
-    lv_obj_set_style_radius(bdone, 34, LV_PART_MAIN);
+    lv_obj_set_style_radius(bdone, STEP_OK_H / 2, LV_PART_MAIN);
     lv_obj_add_event_cb(bdone, done_event_cb, LV_EVENT_CLICKED, (void *) on_done);
     lv_obj_t *ldone = lv_label_create(bdone);
     lv_label_set_text(ldone, "OK");
@@ -466,12 +566,12 @@ esp_err_t rr_ui_show_step(const rr_step_view_t *v,
 
     // ── Skip: present but visually quiet, so it is not the obvious tap ──────
     lv_obj_t *bskip = lv_button_create(root);
-    lv_obj_set_size(bskip, 140, 40);
-    lv_obj_align(bskip, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_size(bskip, 140, STEP_SKIP_H);
+    lv_obj_align(bskip, LV_ALIGN_TOP_MID, 0, STEP_SKIP_Y);
     lv_obj_set_style_bg_color(bskip, RR_BG, LV_PART_MAIN);
     lv_obj_set_style_border_width(bskip, 1, LV_PART_MAIN);
     lv_obj_set_style_border_color(bskip, RR_MUTED, LV_PART_MAIN);
-    lv_obj_set_style_radius(bskip, 20, LV_PART_MAIN);
+    lv_obj_set_style_radius(bskip, STEP_SKIP_H / 2, LV_PART_MAIN);
     lv_obj_add_event_cb(bskip, done_event_cb, LV_EVENT_CLICKED, (void *) on_skip);
     lv_obj_t *lskip = lv_label_create(bskip);
     lv_label_set_text(lskip, "Skip");
@@ -481,9 +581,19 @@ esp_err_t rr_ui_show_step(const rr_step_view_t *v,
 
     bsp_display_unlock();
 
-    ESP_LOGI(TAG, "step [%d/%d] '%s' %s limit=%ds emoji=%s",
+    ESP_LOGI(TAG, "step [%d/%d] '%s' %s limit=%ds emoji=%s label=%s",
              v->position + 1, v->step_count, v->label, v->emoji,
-             v->time_limit_s, drew_emoji ? "ok" : "FALLBACK");
+             v->time_limit_s, drew_emoji ? "ok" : "FALLBACK",
+             label_font == &rr_font_36 ? "36/1line" : "28/wrapped");
+    // The layout the asserts guarantee, printed once per step so a future
+    // regression is visible in a log and not only on a photograph.
+    if (timed) {
+        ESP_LOGI(TAG, "  layout y: pos 0-%d | ring %d-%d | label %d-%d | OK %d-%d | skip %d-%d (safe %d)",
+                 STEP_POS_H, STEP_RING_Y, STEP_RING_Y + STEP_RING_SIZE,
+                 STEP_LABEL_Y, STEP_LABEL_Y + STEP_LABEL_H,
+                 STEP_OK_Y, STEP_OK_Y + STEP_OK_H,
+                 STEP_SKIP_Y, STEP_SKIP_Y + STEP_SKIP_H, RR_SAFE_H);
+    }
     s_last_screen = RR_SCREEN_NONE;
     return ESP_OK;
 }
@@ -774,4 +884,98 @@ esp_err_t rr_ui_show_watchface(const rr_watchface_t *w)
 bool rr_ui_last_screen_is_watchface(void)
 {
     return s_last_screen == RR_SCREEN_WATCHFACE;
+}
+
+// ── Phase 7: the alarm screen (§7, §8 screen 1) ─────────────────────────────
+//
+// This is §8's "Start" screen with one thing added: a snooze. It is NOT a
+// second way to run a routine — nothing starts until "Πάμε"/"Let's go" is
+// tapped, and that tap goes through rr_routine_request_start() like every
+// other start on this watch.
+//
+// Why a screen at all, rather than dropping straight into step 1: a scheduled
+// routine fires at a child who is not holding the watch and did not ask for
+// it. Starting a 30-second countdown they are not looking at spends the first
+// step before they have picked up their wrist. The alarm rings, the screen
+// says what it wants, and the child decides.
+
+esp_err_t rr_ui_show_alarm(const char *routine_name, const char *routine_emoji,
+                           int hour, int minute, const char *language,
+                           rr_ui_step_cb_t on_start, rr_ui_step_cb_t on_snooze)
+{
+    const bool el = (language != NULL && language[0] == 'e' && language[1] == 'l');
+
+    bsp_display_lock(0);
+    lv_obj_t *root = rr_ui_begin_screen(RR_BG);
+    s_arc = NULL;
+    s_mmss = NULL;
+
+    // The scheduled time, in the accent colour — this is data, and it is the
+    // answer to the child's first question ("why is my watch making noise").
+    char hhmm[8];
+    snprintf(hhmm, sizeof(hhmm), "%02d:%02d", hour, minute);
+    lv_obj_t *ltime = lv_label_create(root);
+    lv_label_set_text(ltime, hhmm);
+    lv_obj_set_style_text_font(ltime, &rr_font_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(ltime, RR_ACCENT, LV_PART_MAIN);
+    lv_obj_align(ltime, LV_ALIGN_TOP_MID, 0, 0);
+
+    char lvpath[96];
+    const char *posix_path = routine_emoji ? rr_emoji_path(routine_emoji) : NULL;
+    if (posix_path != NULL && to_lv_path(posix_path, lvpath, sizeof(lvpath))) {
+        lv_obj_t *img = lv_image_create(root);
+        lv_image_set_src(img, lvpath);
+        lv_obj_align(img, LV_ALIGN_TOP_MID, 0, 56);
+    }
+
+    lv_obj_t *lname = lv_label_create(root);
+    lv_label_set_long_mode(lname, LV_LABEL_LONG_WRAP);
+    lv_obj_set_width(lname, RR_SAFE_W);
+    lv_label_set_text(lname, routine_name ? routine_name : "");
+    lv_obj_set_style_text_font(lname, &rr_font_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lname, RR_TEXT, LV_PART_MAIN);
+    lv_obj_set_style_text_align(lname, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
+    lv_obj_align(lname, LV_ALIGN_TOP_MID, 0, 170);
+
+    // Primary action, full width — the same shape and size as the runtime's
+    // Done button, so "the big one starts things" holds across every screen.
+    lv_obj_t *bgo = lv_button_create(root);
+    lv_obj_set_size(bgo, RR_SAFE_W, 68);
+    lv_obj_align(bgo, LV_ALIGN_BOTTOM_MID, 0, -48);
+    lv_obj_set_style_bg_color(bgo, RR_ACCENT, LV_PART_MAIN);
+    lv_obj_set_style_radius(bgo, 34, LV_PART_MAIN);
+    lv_obj_add_event_cb(bgo, done_event_cb, LV_EVENT_CLICKED, (void *) on_start);
+    lv_obj_t *lgo = lv_label_create(bgo);
+    lv_label_set_text(lgo, el ? "Πάμε!" : "Let's go!");
+    lv_obj_set_style_text_font(lgo, &rr_font_36, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lgo, RR_BG, LV_PART_MAIN);
+    lv_obj_center(lgo);
+
+    // Snooze: quiet, like Skip. Deliberately NOT "tap anywhere to snooze" —
+    // the alarm wakes a lit screen on a moving wrist, and a whole-screen
+    // snooze target would be hit by accident far more often than on purpose.
+    lv_obj_t *bsn = lv_button_create(root);
+    lv_obj_set_size(bsn, 180, 44);
+    lv_obj_align(bsn, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(bsn, RR_BG, LV_PART_MAIN);
+    lv_obj_set_style_border_width(bsn, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(bsn, RR_MUTED, LV_PART_MAIN);
+    lv_obj_set_style_radius(bsn, 22, LV_PART_MAIN);
+    lv_obj_add_event_cb(bsn, done_event_cb, LV_EVENT_CLICKED, (void *) on_snooze);
+    lv_obj_t *lsn = lv_label_create(bsn);
+    lv_label_set_text(lsn, el ? "Σε 5′" : "Snooze 5′");
+    lv_obj_set_style_text_font(lsn, &rr_font_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lsn, RR_MUTED, LV_PART_MAIN);
+    lv_obj_center(lsn);
+
+    bsp_display_unlock();
+
+    // Its own screen kind, for two reasons: rr_ui_last_screen_is_watchface()
+    // must say NO (or rr_idle's minute tick repaints the face straight over a
+    // ringing alarm), and dismissing a snooze has to restore something, which
+    // rr_ui_show_last_status() can only do if it knows what is up.
+    s_last_screen = RR_SCREEN_ALARM;
+    ESP_LOGI(TAG, "ALARM screen: %s @ %s (%s)", routine_name ? routine_name : "?",
+             hhmm, el ? "el" : "en");
+    return ESP_OK;
 }

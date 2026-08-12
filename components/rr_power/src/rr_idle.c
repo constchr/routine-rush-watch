@@ -29,6 +29,7 @@
 #include "rr_battery.h"
 #include "rr_imu.h"
 #include "rr_rtc.h"
+#include "rr_steps.h"
 #include "rr_store.h"
 #include "rr_ui.h"
 
@@ -88,8 +89,17 @@ static bool build_and_show_face(void)
     rr_watchface_t w;
     memset(&w, 0, sizeof(w));
 
+    // LOCAL, not UTC. The RTC is canonical UTC (rr_rtc.h) and the offset is
+    // applied here, on the way to the screen.
+    //
+    // This governs more than the clock digits: w.year/month/day feed the date
+    // AND the ISO weekday, and w.hour/minute feed rr_store_next_routine() —
+    // whose schedules are authored as LOCAL "HH:MM" in the app. Reading UTC
+    // here did not just show the wrong time, it compared local schedule times
+    // against a UTC clock, so "next routine" was off by the offset too, and on
+    // the wrong DAY either side of midnight.
     rr_rtc_time_t t;
-    if (rr_rtc_get(&t) == ESP_OK) {
+    if (rr_rtc_get_local(&t) == ESP_OK) {
         w.hour = t.hour; w.minute = t.minute;
         w.year = t.year; w.month = t.month; w.day = t.day;
     } else {
@@ -117,8 +127,12 @@ static bool build_and_show_face(void)
         w.charging = b.charging;
     }
 
-    w.steps_today = 0;
-    w.steps_valid = false;      // Phase 9 flips this
+    // Refreshed HERE, on face build, so the number on screen is the engine's
+    // current count and not up to a poll interval stale. One I2C read, the same
+    // cost as the battery read just above it.
+    rr_steps_refresh();
+    w.steps_today = (int) rr_steps_today();
+    w.steps_valid = rr_steps_valid();
     w.queued_runs = rr_queue_count();
 
     int wd = rr_ui_iso_weekday(w.year, w.month, w.day);
@@ -233,7 +247,11 @@ static void idle_tick(lv_timer_t *t)
         // so a minute is the natural refresh unit.
         if (rr_ui_last_screen_is_watchface()) {
             rr_rtc_time_t t;
-            if (rr_rtc_get(&t) == ESP_OK && t.minute != s_shown_minute) {
+            // Local, to match s_shown_minute. Whole-hour offsets would compare
+            // the same either way, but the :30 and :45 zones (India, Nepal,
+            // Chatham) would not — the face would refresh a minute early or
+            // late forever.
+            if (rr_rtc_get_local(&t) == ESP_OK && t.minute != s_shown_minute) {
                 build_and_show_face();
             }
         }

@@ -82,3 +82,18 @@ rr_start_result_t rr_routine_request_start(const char *assignment_id);
  * and wires them together, the same shape rr_idle's own gate/suspend hooks use.
  */
 void rr_routine_set_wake_hook(void (*fn)(void));
+
+/**
+ * Register a callback for "a routine just ended".
+ *
+ * Phase 7's scheduler uses it to service a fire it had to DEFER: a scheduled
+ * routine that arrived while another was running waits for the watch to go
+ * idle, and the moment it ends is exactly that. Without the hook the deferred
+ * fire waits out a polling interval instead, which on a 30-minute grace window
+ * is a visible delay for no reason.
+ *
+ * A hook and not a direct call, for the usual reason: rr_sched depends on this
+ * component, so calling into it from here would be a cycle. Runs on the LVGL
+ * task, at the end of the routine — do not block in it.
+ */
+void rr_routine_set_finish_hook(void (*fn)(void));
