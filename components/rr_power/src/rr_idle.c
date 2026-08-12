@@ -217,7 +217,11 @@ static void idle_tick(lv_timer_t *t)
 
     if (s_paired_at_ms != 0 && now_ms() - s_paired_at_ms >= PAIRED_HOLD_MS) {
         s_paired_at_ms = 0;
-        if (build_and_show_face()) s_last_activity_ms = now_ms();
+        // Only worth drawing if the panel is actually lit. A sync can land
+        // while the watch is asleep on a wrist, and rendering behind a dark
+        // screen would just burn the flash reads — wake_up() builds the face
+        // itself, and by then the gate is open.
+        if (s_awake && build_and_show_face()) s_last_activity_ms = now_ms();
     }
 
     if (s_awake) {

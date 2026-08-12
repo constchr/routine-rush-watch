@@ -91,6 +91,19 @@ typedef struct {
 /** Read one step out of the cached routine set. ESP_ERR_NOT_FOUND if absent. */
 esp_err_t rr_store_get_step(int routine_idx, int step_idx, rr_step_view_t *out);
 
+/**
+ * Resolve an assignment_id to its index in the cached routine set.
+ *
+ * The cache is an ordered array and everything downstream (rr_store_get_step,
+ * rr_routine_start) addresses routines BY INDEX, but the phone only ever knows
+ * them by id — an index is a property of one particular push and would mean
+ * something different after the next one. This is the seam between the two.
+ *
+ * ESP_ERR_NOT_FOUND means exactly "this watch has not been sent that routine",
+ * which is a real answer worth relaying, not a failure.
+ */
+esp_err_t rr_store_find_routine(const char *assignment_id, int *out_idx);
+
 
 // ── Phase 5: the durable completion queue (§5, §6.3) ─────────────────────────
 //

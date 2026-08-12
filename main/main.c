@@ -182,6 +182,15 @@ void app_main(void)
     rr_idle_set_face_gate(watchface_allowed);
     rr_idle_set_suspend_check(idle_suspended);
 
+    // A remotely-started routine has to light the screen — the whole point of
+    // the nudge is that the watch is on a wrist, asleep, and the child has not
+    // touched it. Wired here, not called directly from rr_routine, because
+    // rr_power depends on rr_ble which depends on rr_routine; the hook keeps
+    // that a straight line instead of a build cycle. Same shape as the two
+    // gates above. Phase 7's scheduler inherits it for free — it goes through
+    // rr_routine_request_start() too.
+    rr_routine_set_wake_hook(rr_idle_wake_manual);
+
     ESP_ERROR_CHECK_WITHOUT_ABORT(rr_idle_init());
 
     while (1) {

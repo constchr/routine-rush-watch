@@ -94,6 +94,22 @@ const layouts = {
   RUN_ACK: parseLayout('RUN_ACK'),
 }
 
+// ── RR_CONTROL response codes ───────────────────────────────────────────────
+// The ATT statuses a command handler returns. They ARE contract — the phone
+// switches on them to tell a parent "the watch is busy" rather than "something
+// went wrong" — so they are generated, not retyped into the firmware where
+// they could drift by one hex digit and be wrong in a way nothing catches.
+const attBlock = src.match(/export const RR_CONTROL_ATT\s*=\s*\{([\s\S]*?)\}\s*as const/)?.[1]
+  ?? fail('could not find RR_CONTROL_ATT in the contract')
+const attCodes = [...attBlock.matchAll(/^\s*(\w+)\s*:\s*(0x[0-9a-f]+|\d+)\s*,/gim)]
+  .map(([, name, value]) => ({ name, value: Number(value) }))
+if (attCodes.length === 0) fail('parsed zero RR_CONTROL_ATT codes')
+for (const c of attCodes) {
+  if (!Number.isInteger(c.value) || c.value < 0 || c.value > 0xff) {
+    fail(`RR_CONTROL_ATT.${c.name} = ${c.value} is not a byte-sized ATT status`)
+  }
+}
+
 // ── Emit ────────────────────────────────────────────────────────────────────
 const uuidToCArray = (u) =>
   '{ ' + u.replace(/-/g, '').match(/../g).map((b) => `0x${b}`).join(', ') + ' }'
@@ -165,6 +181,19 @@ h += `
 #define RR_QUEUE_PULL_LEN_PREFIX_BYTES   2
 #define RR_ROUTINE_PUSH_LEN_PREFIX_BYTES 4
 #define RR_CONTROL_LEN_PREFIX_BYTES      ${controlPrefix}
+
+// ── RR_CONTROL response codes ────────────────────────────────────────────────
+// RR_CONTROL is write-only with NO notify: the ATT write response IS the reply
+// channel (§6B.3). A command handler returns one of these from its access
+// callback and NimBLE puts it on the wire as the ATT status.
+//
+// 0x00 is success; 0x05/0x06 are standard ATT errors the contract already
+// assigns meaning to; 0x80+ are in the ATT APPLICATION range (0x80-0x9F) that
+// the core spec reserves for profile-defined errors, and are scoped PER
+// COMMAND — the phone always knows which command it just wrote.
+${attCodes.map(c =>
+  `#define RR_CONTROL_ATT_${c.name.padEnd(16)} 0x${c.value.toString(16).padStart(2, '0')}`,
+).join('\n')}
 `
 
 if (process.argv.includes('--check')) {

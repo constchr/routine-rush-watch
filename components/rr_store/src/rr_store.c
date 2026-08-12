@@ -93,22 +93,46 @@ esp_err_t rr_store_put_routines(const char *json, size_t len)
     // Both are DATA. This is not the v2 mistake of putting commands on a data
     // characteristic, and it needs no change to watchProtocol.ts, whose
     // encodeRoutinePush() takes `unknown` and stringifies it.
+    // Whether a child record arrived decides whether the watch face can ever
+    // render, so every outcome here is logged. Silence used to be ambiguous:
+    // no child in the payload and a failed child.json write looked identical
+    // from the monitor, and both end as a watch stuck on "Paired" with no face.
     const cJSON *arr = probe;
     if (cJSON_IsObject(probe)) {
         const cJSON *child = cJSON_GetObjectItemCaseSensitive(probe, "child");
         if (cJSON_IsObject(child)) {
             char *cjson = cJSON_PrintUnformatted(child);
-            if (cjson != NULL) {
+            if (cjson == NULL) {
+                ESP_LOGE(TAG, "child record present but could not be re-serialised");
+            } else {
                 FILE *cf = fopen(CHILD_PATH, "wb");
-                if (cf != NULL) {
-                    fwrite(cjson, 1, strlen(cjson), cf);
+                if (cf == NULL) {
+                    ESP_LOGE(TAG, "fopen(%s) failed (errno %d) — NO WATCH FACE: the "
+                                  "face needs a cached child record", CHILD_PATH, errno);
+                } else {
+                    size_t cw = fwrite(cjson, 1, strlen(cjson), cf);
                     fflush(cf); fsync(fileno(cf)); fclose(cf);
-                    ESP_LOGI(TAG, "cached child record (%u bytes)", (unsigned) strlen(cjson));
+                    if (cw != strlen(cjson)) {
+                        ESP_LOGE(TAG, "short write to %s (%u of %u) — deleting",
+                                 CHILD_PATH, (unsigned) cw, (unsigned) strlen(cjson));
+                        unlink(CHILD_PATH);
+                    } else {
+                        ESP_LOGI(TAG, "cached child record (%u bytes) → %s",
+                                 (unsigned) cw, CHILD_PATH);
+                        ESP_LOGI(TAG, "  %s", cjson);
+                    }
                 }
                 free(cjson);
             }
+        } else {
+            ESP_LOGW(TAG, "envelope carries NO 'child' object — the watch face "
+                          "cannot render without one; staying on the status screen");
         }
         arr = cJSON_GetObjectItemCaseSensitive(probe, "routines");
+    } else {
+        // The bare-array shape: a pre-child app build, or a caller that had no
+        // child to send. Same end state — worth naming rather than inferring.
+        ESP_LOGW(TAG, "bare routines array (no child envelope) — no watch face");
     }
 
     if (!cJSON_IsArray(arr)) {
@@ -327,6 +351,50 @@ esp_err_t rr_store_get_step(int routine_idx, int step_idx, rr_step_view_t *out)
                 err = ESP_OK;
             }
         }
+    }
+
+    cJSON_Delete(root);
+    return err;
+}
+
+esp_err_t rr_store_find_routine(const char *assignment_id, int *out_idx)
+{
+    if (!s_mounted || assignment_id == NULL || out_idx == NULL || assignment_id[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    struct stat st;
+    if (stat(ROUTINES_PATH, &st) != 0) return ESP_ERR_NOT_FOUND;
+
+    FILE *f = fopen(ROUTINES_PATH, "rb");
+    if (f == NULL) return ESP_FAIL;
+    char *buf = malloc((size_t) st.st_size + 1);
+    if (buf == NULL) { fclose(f); return ESP_ERR_NO_MEM; }
+    size_t got = fread(buf, 1, (size_t) st.st_size, f);
+    fclose(f);
+    buf[got] = '\0';
+
+    cJSON *root = cJSON_ParseWithLength(buf, got);
+    free(buf);
+    if (root == NULL || !cJSON_IsArray(root)) { cJSON_Delete(root); return ESP_ERR_INVALID_STATE; }
+
+    esp_err_t err = ESP_ERR_NOT_FOUND;
+    int n = cJSON_GetArraySize(root);
+    for (int i = 0; i < n; i++) {
+        const cJSON *r = cJSON_GetArrayItem(root, i);
+        const cJSON *id = cJSON_GetObjectItemCaseSensitive(r, "assignment_id");
+        if (cJSON_IsString(id) && strcmp(id->valuestring, assignment_id) == 0) {
+            *out_idx = i;
+            err = ESP_OK;
+            break;
+        }
+    }
+
+    if (err != ESP_OK) {
+        // Names the miss precisely: "not in a cache of N" is the difference
+        // between a stale phone and an empty watch, and the phone's next move
+        // differs for each.
+        ESP_LOGW(TAG, "routine %s not in the cache (%d cached)", assignment_id, n);
     }
 
     cJSON_Delete(root);

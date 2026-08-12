@@ -2,11 +2,13 @@
 
 #include "rr_routine.h"
 
+#include <stdint.h>
 #include <string.h>
 
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_system.h"
+#include "bsp/esp-bsp.h"
 #include "lvgl.h"
 #include "cJSON.h"
 
@@ -289,4 +291,84 @@ esp_err_t rr_routine_start(int routine_idx)
 bool rr_routine_is_active(void)
 {
     return s.active;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Remote / scheduled start — the deferred entry point (see rr_routine.h)
+// ═════════════════════════════════════════════════════════════════════════════
+
+static void (*s_wake_hook)(void);
+
+void rr_routine_set_wake_hook(void (*fn)(void))
+{
+    s_wake_hook = fn;
+}
+
+// The index is resolved BEFORE deferring and carried through as a plain int,
+// not a pointer: lv_async_call takes ownership of nothing, so anything heap-
+// allocated here would need freeing in the callback, and anything stack-
+// allocated would be gone. An int fits in the void* itself.
+static void deferred_start(void *arg)
+{
+    const int routine_idx = (int) (intptr_t) arg;
+
+    // Re-check under the LVGL task. Between the accept and this callback the
+    // child could have started something by hand, or a second start could have
+    // been accepted. The synchronous check is what the phone was TOLD; this is
+    // what actually protects the running routine.
+    if (s.active) {
+        ESP_LOGW(TAG, "deferred start dropped — a routine started in the meantime");
+        return;
+    }
+
+    // Wake FIRST, then paint. wake_up() rebuilds the watch face on its way
+    // back up, so starting first would show the step screen and then have the
+    // face drawn straight over it.
+    if (s_wake_hook != NULL) s_wake_hook();
+
+    esp_err_t err = rr_routine_start(routine_idx);
+    if (err != ESP_OK) {
+        // Only reachable if the cache changed between the lookup and here.
+        ESP_LOGE(TAG, "deferred start of routine %d failed: %s",
+                 routine_idx, esp_err_to_name(err));
+    }
+}
+
+rr_start_result_t rr_routine_request_start(const char *assignment_id)
+{
+    if (assignment_id == NULL || assignment_id[0] == '\0') return RR_START_ERROR;
+
+    // Busy check first, and deliberately before the cache read: refusing costs
+    // nothing, and there is no reason to spend a flash read and a JSON parse
+    // on a request whose answer is already known.
+    if (s.active) {
+        ESP_LOGW(TAG, "start_routine %s REFUSED — '%s' is running (step %d/%d)",
+                 assignment_id, s.routine_name, s.step_idx + 1, s.step_count);
+        return RR_START_BUSY;
+    }
+
+    int idx = 0;
+    esp_err_t err = rr_store_find_routine(assignment_id, &idx);
+    if (err == ESP_ERR_NOT_FOUND) return RR_START_UNKNOWN_ROUTINE;
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "start_routine %s: cache unreadable: %s",
+                 assignment_id, esp_err_to_name(err));
+        return RR_START_ERROR;
+    }
+
+    // Hand off to the LVGL task. lv_async_call touches an LVGL list, so it
+    // takes the display lock like any other LVGL call from a foreign task —
+    // the callback itself then runs inside lv_timer_handler, where building
+    // screens and creating timers is legal.
+    bsp_display_lock(0);
+    lv_result_t rc = lv_async_call(deferred_start, (void *) (intptr_t) idx);
+    bsp_display_unlock();
+
+    if (rc != LV_RESULT_OK) {
+        ESP_LOGE(TAG, "start_routine %s: could not queue the start", assignment_id);
+        return RR_START_ERROR;
+    }
+
+    ESP_LOGI(TAG, "start_routine %s ACCEPTED → routine index %d", assignment_id, idx);
+    return RR_START_OK;
 }

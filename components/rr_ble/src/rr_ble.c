@@ -33,6 +33,7 @@
 #include "rr_rtc.h"
 #include "rr_identity.h"
 #include "rr_store.h"
+#include "rr_routine.h"
 #include "rr_ui.h"
 
 static const char *TAG = "rr_ble";
@@ -71,7 +72,7 @@ static uint16_t s_queue_status_handle;
 #define RR_ROUTINE_PUSH_MAX 32768
 #define RR_CONTROL_MAX 1024
 #define RR_QUEUE_PULL_MAX 4096
-#define RR_FW_VERSION 5      /**< packed firmware version reported in QUEUE_STATUS */
+#define RR_FW_VERSION 6      /**< packed firmware version reported in QUEUE_STATUS */
 
 static uint8_t *s_rx_buf;
 static size_t   s_rx_len;
@@ -202,18 +203,24 @@ void rr_ble_factory_reset(const char *reason)
 }
 
 // Is this connection both encrypted AND from the peer that paired us?
+//
+// The strictest gate the watch has, and shared by every command that is an act
+// of CONTROL over the device rather than a data sync: factory_reset and
+// start_routine. Deliberately NOT conn_is_authorised() — a nonce proves the
+// peer saw the QR, which is a pairing-time question and no answer at all to
+// "may you wipe this watch / start a routine on this child's wrist".
 static bool peer_is_trusted(uint16_t conn_handle)
 {
     struct ble_gap_conn_desc desc;
     if (ble_gap_conn_find(conn_handle, &desc) != 0) return false;
 
     if (!desc.sec_state.encrypted) {
-        ESP_LOGW(TAG, "reset refused: link is not encrypted");
+        ESP_LOGW(TAG, "privileged command refused: link is not encrypted");
         return false;
     }
     if (!rr_identity_is_paired_peer(desc.peer_id_addr.val, desc.peer_id_addr.type)) {
-        ESP_LOGW(TAG, "reset refused: peer %02x:%02x:%02x:%02x:%02x:%02x is bonded "
-                      "but is NOT the peer that paired this watch",
+        ESP_LOGW(TAG, "privileged command refused: peer %02x:%02x:%02x:%02x:%02x:%02x "
+                      "is bonded but is NOT the peer that paired this watch",
                  desc.peer_id_addr.val[5], desc.peer_id_addr.val[4], desc.peer_id_addr.val[3],
                  desc.peer_id_addr.val[2], desc.peer_id_addr.val[1], desc.peer_id_addr.val[0]);
         return false;
@@ -498,6 +505,63 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         }
         rr_ble_factory_reset("unlinked by the paired phone over BLE");
         return 0;   // not reached — esp_restart()
+    }
+
+    // ── start_routine: remote start, paired-peer only ────────────────────────
+    //
+    // Gated on peer_is_trusted(), the SAME gate as factory_reset and
+    // deliberately NOT the looser conn_is_authorised(): starting a routine on
+    // a child's wrist is an act of control over the device, so it belongs to
+    // the phone this watch was paired with and to nothing else. The nonce path
+    // would not help anyway — a paired watch shows no QR, so there is no nonce
+    // to present, and a watch that IS showing its QR has no routines cached to
+    // start.
+    //
+    // The outcome rides the ATT status of this write. RR_CONTROL is write-only
+    // with no notify by design (§6B.3: "the ATT write response already carries
+    // success or failure"), so the reply channel is the return value here:
+    //
+    //   0     started — it is on screen
+    //   0x80  busy    — a routine is running and was NOT interrupted
+    //   0x81  unknown — that routine_id is not cached; the phone must push
+    //   0x05  the peer is not the one this watch paired with
+    //
+    // 0x80/0x81 are in the ATT APPLICATION error range (0x80-0x9F), which the
+    // core spec reserves for exactly this. No new characteristic, no byte
+    // moved — the frozen contract is untouched.
+    if (strcmp(cmd, "start_routine") == 0) {
+        const cJSON *jid = cJSON_GetObjectItemCaseSensitive(env, "routine_id");
+        char routine_id[40] = { 0 };
+        if (cJSON_IsString(jid)) {
+            strlcpy(routine_id, jid->valuestring, sizeof(routine_id));
+        }
+        cJSON_Delete(env);
+
+        if (!peer_is_trusted(conn_handle)) {
+            ESP_LOGW(TAG, "start_routine REJECTED — untrusted peer");
+            return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        }
+        if (routine_id[0] == '\0') {
+            ESP_LOGE(TAG, "start_routine: no \"routine_id\" in the envelope");
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+
+        switch (rr_routine_request_start(routine_id)) {
+        case RR_START_OK:
+            ESP_LOGI(TAG, "╔══════════════════════════════════════════════════");
+            ESP_LOGI(TAG, "║ REMOTE START accepted — routine %s", routine_id);
+            ESP_LOGI(TAG, "╚══════════════════════════════════════════════════");
+            return 0;
+        case RR_START_BUSY:
+            // Not an error on the wire so much as an answer: the phone turns
+            // this into "the watch is busy" and the child keeps their routine.
+            return RR_CONTROL_ATT_BUSY;
+        case RR_START_UNKNOWN_ROUTINE:
+            return RR_CONTROL_ATT_UNKNOWN_ROUTINE;
+        case RR_START_ERROR:
+        default:
+            return BLE_ATT_ERR_UNLIKELY;
+        }
     }
 
     ESP_LOGW(TAG, "RR_CONTROL: unknown cmd \"%s\" — rejecting this command only", cmd);

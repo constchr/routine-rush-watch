@@ -318,6 +318,11 @@ export function decodeRoutinePush<T = unknown>(bytes: Uint8Array): RoutinePushDe
 //
 // Commands are additive: a watch that does not recognise a `cmd` rejects that
 // one command and keeps working, so new commands do not need a version bump.
+//
+// Commands so far:
+//   nonce_auth     authorise this CONNECTION with the QR nonce   (v2)
+//   factory_reset  wipe pairing, bonds, cache; reboot            (v2)
+//   start_routine  start a routine on the watch, now, at step 1  (additive)
 // ─────────────────────────────────────────────────────────────
 
 export type RrControlCommand =
@@ -326,8 +331,47 @@ export type RrControlCommand =
   | { cmd: 'nonce_auth'; nonce: string }
   /** Wipe pairing state, bonds and cache; the watch reboots to its QR. */
   | { cmd: 'factory_reset' }
+  /** Start `routine_id` on the watch RIGHT NOW, at step 1 (remote start).
+   *
+   *  `routine_id` is the routine's `assignment_id` — the same id the watch
+   *  caches from ROUTINE_PUSH, which in this repo is `routine.id` (there is no
+   *  separate assignment table; see watchSync.ts).
+   *
+   *  Purely additive: a new `cmd` string on the existing envelope. No new
+   *  characteristic, no byte-layout change — the v2 contract states outright
+   *  that commands are additive and need no version bump. */
+  | { cmd: 'start_routine'; routine_id: string }
 
 export const RR_CONTROL_LEN_PREFIX_BYTES = 4
+
+// ── RR_CONTROL response codes ────────────────────────────────────────────────
+//
+// RR_CONTROL is write-only with NO notify, by design: "the ATT write response
+// already carries success or failure". So an outcome that is richer than
+// yes/no has to ride the ATT error code, which is exactly what the contract
+// intends — 0x05 already means "not authorised" and 0x06 already means
+// "unknown command".
+//
+// `start_routine` needs two more outcomes than those, so it uses the ATT
+// APPLICATION error range (0x80–0x9F), which the Bluetooth core spec reserves
+// for profile-defined errors. This is a semantic addition to an existing
+// channel, NOT a layout change: no characteristic is added and no byte moves.
+//
+// Codes are per-command, not global — a future command may reuse 0x80 for its
+// own "the state is wrong for this" meaning, since the phone always knows
+// which command it just wrote.
+export const RR_CONTROL_ATT = {
+  /** Success. The write response carries no error at all. */
+  OK: 0,
+  /** 0x05 — the link is not the paired peer (or is unencrypted). */
+  UNAUTHORISED: 0x05,
+  /** 0x06 — this firmware does not know the command. */
+  UNKNOWN_COMMAND: 0x06,
+  /** 0x80 — `start_routine`: a routine is already running; refused. */
+  BUSY: 0x80,
+  /** 0x81 — `start_routine`: that routine_id is not in the watch's cache. */
+  UNKNOWN_ROUTINE: 0x81,
+} as const
 
 export function encodeControl(command: RrControlCommand): Uint8Array {
   const json = utf8Encode(JSON.stringify(command))

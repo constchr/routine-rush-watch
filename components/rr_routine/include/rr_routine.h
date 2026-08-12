@@ -26,8 +26,59 @@ typedef enum {
     RR_STEP_SKIPPED,
 } rr_step_outcome_t;
 
-/** Start a routine from the cache at step 0. */
+/**
+ * Start a routine from the cache at step 0.
+ *
+ * MUST be called from the LVGL task — it builds screens and creates an
+ * lv_timer. Anything on another task (the NimBLE host, a scheduler tick) wants
+ * rr_routine_request_start() instead, which defers to the LVGL task for you.
+ */
 esp_err_t rr_routine_start(int routine_idx);
 
 /** True while a routine is on screen. */
 bool rr_routine_is_active(void);
+
+// ── Remote / scheduled start ────────────────────────────────────────────────
+//
+// THE ONE ENTRY POINT for "begin routine X now" when the caller is not already
+// the LVGL task. Today that caller is the RR_CONTROL start_routine command
+// from the paired phone; Phase 7's on-watch scheduler is the next one, and it
+// calls exactly this — the busy rule, the cache lookup, the wake and the task
+// hand-off are all here precisely so a second start path never gets written.
+
+typedef enum {
+    /** Accepted. The routine will be on screen within a frame or two. */
+    RR_START_OK = 0,
+    /** A routine is ALREADY RUNNING and was deliberately left alone. */
+    RR_START_BUSY,
+    /** No routine with that assignment_id is cached — the phone must push first. */
+    RR_START_UNKNOWN_ROUTINE,
+    /** The cache is missing or unreadable. */
+    RR_START_ERROR,
+} rr_start_result_t;
+
+/**
+ * Ask for `assignment_id` to start at step 1, right now.
+ *
+ * SAFE FROM ANY TASK. The decision (busy? cached?) is made synchronously so
+ * the caller gets a real answer to relay — the BLE handler turns it straight
+ * into an ATT status on the write response — while the LVGL work is deferred
+ * to the display task, where touching widgets and timers is legal.
+ *
+ * Refusing while a routine is active is a PRODUCT rule, not a technical one: a
+ * child three steps into getting dressed must not be thrown back to step 1
+ * because a parent tapped a button. The watch owns that rule because only the
+ * watch knows what is on its screen.
+ */
+rr_start_result_t rr_routine_request_start(const char *assignment_id);
+
+/**
+ * Register the "wake the screen" action, called just before a deferred start
+ * paints its first step.
+ *
+ * A hook rather than a direct call because rr_power (which owns wake) already
+ * depends on rr_ble, and rr_ble depends on this component — calling rr_idle
+ * from here would close that loop into a build cycle. main.c owns both sides
+ * and wires them together, the same shape rr_idle's own gate/suspend hooks use.
+ */
+void rr_routine_set_wake_hook(void (*fn)(void));
