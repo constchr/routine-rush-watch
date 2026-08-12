@@ -323,6 +323,7 @@ export function decodeRoutinePush<T = unknown>(bytes: Uint8Array): RoutinePushDe
 //   nonce_auth     authorise this CONNECTION with the QR nonce   (v2)
 //   factory_reset  wipe pairing, bonds, cache; reboot            (v2)
 //   start_routine  start a routine on the watch, now, at step 1  (additive)
+//   set_tz         UTC offset for local wall-clock display       (additive)
 // ─────────────────────────────────────────────────────────────
 
 export type RrControlCommand =
@@ -341,8 +342,30 @@ export type RrControlCommand =
    *  characteristic, no byte-layout change — the v2 contract states outright
    *  that commands are additive and need no version bump. */
   | { cmd: 'start_routine'; routine_id: string }
+  /** Set the watch's UTC offset for LOCAL WALL-CLOCK DISPLAY.
+   *
+   *  `offset_s` is total seconds to ADD to UTC to get local time, SIGNED so
+   *  west-of-UTC works (Cyprus summer = +10800; New York winter = -18000).
+   *
+   *  WHY THIS IS A COMMAND AND NOT PART OF TIME_SYNC: TIME_SYNC is frozen at
+   *  exactly 4 bytes — a bare u32 epoch — so there is physically nowhere in it
+   *  to put an offset. Widening it would be a v3 layout change to a frozen
+   *  characteristic. Riding RR_CONTROL is additive and costs nothing.
+   *
+   *  Send it on EVERY connect, alongside TIME_SYNC. An offset captured once
+   *  goes stale at the next DST boundary; re-sending on every contact is what
+   *  makes the watch self-correct without knowing any timezone rules. */
+  | { cmd: 'set_tz'; offset_s: number }
 
 export const RR_CONTROL_LEN_PREFIX_BYTES = 4
+
+/**
+ * Bounds for `set_tz.offset_s`. Real UTC offsets span UTC-12:00 to UTC+14:00
+ * (Kiribati), and there are :45 zones (Nepal +05:45, Chatham +12:45), so the
+ * range is checked but the granularity is not.
+ */
+export const TZ_OFFSET_MIN_S = -12 * 3600
+export const TZ_OFFSET_MAX_S = 14 * 3600
 
 // ── RR_CONTROL response codes ────────────────────────────────────────────────
 //
