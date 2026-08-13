@@ -311,6 +311,9 @@ _Static_assert(RR_QUEUE_FRAME_PREFIX_BYTES == RR_QUEUE_PULL_LEN_PREFIX_BYTES,
 // It is RAM-only and deliberately so: it resets to 0 on connect, on disconnect
 // and on every accepted RUN_ACK, so a reconnect always restarts from a record
 // boundary rather than from wherever a dropped link happened to stop.
+//
+// ONLY queue_seek MOVES IT. Serving a page does not — see the long note at the
+// end of queue_pull_access_cb for why a read must be idempotent.
 static uint32_t s_pull_offset;
 
 static void pull_offset_reset(const char *why)
@@ -342,8 +345,10 @@ static int queue_pull_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     // TWO DIFFERENT LIMITS, AND CONFLATING THEM IS WHAT BROKE THE DRAIN:
     //   • RR_QUEUE_PULL_MAX_VALUE (512) is BLE_ATT_ATTR_MAX_LEN — the largest an
     //     ATT attribute VALUE may be. It bounds what we may ever store.
-    //   • ATT_MTU - 1 is the largest a single ATT_READ_RSP can CARRY. At the
-    //     MTU iOS actually granted (256) that is 253 bytes.
+    //   • ATT_MTU - 1 is the largest a single ATT_READ_RSP can CARRY (one opcode
+    //     byte). At the MTU iOS actually granted (256) that is 255 bytes, so the
+    //     page lands at 255 - 12 = 243 B of payload — which is exactly the stride
+    //     the hardware log shows: pages @0, @243, @486, @729.
     //
     // A 512-byte value under a 256-byte MTU is only fetchable with a LONG READ
     // (ATT_READ_BLOB_REQ), and we cannot depend on every central issuing one —
@@ -478,9 +483,33 @@ static int queue_pull_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         // forever, which is worse than a page the phone may reject once.
     }
 
-    // Auto-advance, so the happy path is one read per page with no round trip
-    // to move the cursor. The phone can always override with queue_seek.
-    s_pull_offset = offset + (uint32_t) got;
+    // ═══════════════════════════════════════════════════════════════════════
+    // ⚠️ THE CURSOR IS NOT TOUCHED HERE. A READ IS IDEMPOTENT.
+    //
+    // This callback used to end with `s_pull_offset = offset + got`, so a drain
+    // was one read per page with no round trip. It cost every other page:
+    //
+    //     watch served:  @0  @243  @486  @729       (four pages)
+    //     phone received: @0        @486            (two)
+    //
+    // TWO ATT read callbacks can fire for ONE logical central read. iOS is free
+    // to issue extra ATT_READ_REQ/ATT_READ_BLOB_REQ, and ble-plx's
+    // readCharacteristicForDevice surfaces only the last value — the central
+    // cannot even detect that it happened. Auto-advance encodes position as "how
+    // many times was I read", and a GATT server has no way to know that number.
+    // It is not an off-by-one to correct; it is an unobservable quantity.
+    //
+    // So position lives on the phone, which is the one side that knows how many
+    // pages it actually received: it sets the cursor with queue_seek before every
+    // page (contract v3, CURSOR SEMANTICS). A duplicated underlying read now
+    // returns the same bytes twice and is harmless instead of destructive.
+    //
+    // The phone's desync guard stays on the other side of this: it compares each
+    // page's echoed offset against what it seeked to, which is what caught this
+    // in the first place.
+    //
+    // Unrelated to the ACK cursor, which is on flash in rr_store and still moves
+    // only on a matching RUN_ACK. Pulling a record never retires it.
 
     ESP_LOGI(TAG, "QUEUE_PULL: page @%" PRIu32 " +%d of %" PRIu32 " B%s (value %u B, "
                   "mtu %u, cap %d)",

@@ -88,10 +88,11 @@ int main(void) {
 
         // Page at several sizes, including 1 and 2 to force a boundary INSIDE
         // the length prefix, and 500 (the real page size).
-        // 241 is the real page cap at the MTU iOS grants (256 - 1 - 12), so the
+        // 243 is the real page cap at the MTU iOS grants (256 - 1 - 12), and the
+        // hardware log confirms the stride: pages @0, @243, @486, @729. So the
         // matrix now covers the size actually served on hardware, not just the
         // theoretical 500. 1/2/3 still force a boundary INSIDE a length prefix.
-        const int pages[] = {1, 2, 3, 7, 241, 500, 100000};
+        const int pages[] = {1, 2, 3, 7, 243, 500, 100000};
         for (unsigned p = 0; p < sizeof(pages)/sizeof(pages[0]); p++) {
             unsigned char got[131072];
             size_t at = 0;

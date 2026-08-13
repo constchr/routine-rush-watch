@@ -6,7 +6,10 @@
 //   at most 500 bytes, so a value can never exceed the 512-byte ATT ceiling.
 //   A run record may now span pages, which removes the hard limit of ~2 steps
 //   per routine that made every longer run permanently undrainable. Adds the
-//   RR_CONTROL `queue_seek` command as the paging recovery primitive.
+//   RR_CONTROL `queue_seek` command, which the reader uses to advance the read
+//   cursor before every page — a QUEUE_PULL read is idempotent and moves
+//   nothing (see CURSOR SEMANTICS; the first cut of v3 auto-advanced on the
+//   watch and lost every other page on hardware).
 //   No UUID changed; QUEUE_STATUS, RUN_ACK, TIME_SYNC, ROUTINE_PUSH and the
 //   frame layer are untouched.
 //
@@ -266,15 +269,37 @@ export function decodeRunAck(bytes: Uint8Array): RunAck {
 // `offset` is a byte offset into the UNACKED STREAM — the framed bytes starting
 // at the queue's ack cursor. Not a file offset, not a record index.
 //
-//   • The watch AUTO-ADVANCES its read offset by `len` after serving a page, so
-//     the happy path is one read per page with no extra round trip.
+//   • A QUEUE_PULL READ IS IDEMPOTENT. It serves the page at the watch's
+//     current read cursor and does NOT move it. Reading twice without seeking
+//     returns the same bytes twice.
+//   • THE READER ADVANCES THE CURSOR, with RR_CONTROL `queue_seek`, before
+//     every page. The phone's view of position is authoritative; the watch
+//     never infers position from how many times it was read.
 //   • Every page ECHOES the offset it starts at. The reader asserts this
-//     matches what it expected, so a desync is caught at the page that causes
+//     matches what it seeked to, so a desync is caught at the page that causes
 //     it rather than surfacing later as a corrupt frame.
-//   • RR_CONTROL `queue_seek` sets the read offset explicitly. That is the
-//     recovery primitive: seek(0) restarts from the head unacked record.
 //   • The watch RESETS the read offset to 0 on connect, on disconnect, and on
-//     every accepted RUN_ACK.
+//     every accepted RUN_ACK. That only makes a forgotten seek start from a
+//     record boundary — it is not a substitute for seeking.
+//
+// ⚠️ WHY THE WATCH MUST NOT AUTO-ADVANCE — THIS COST A HARDWARE DEBUG SESSION.
+// v3 originally advanced the read cursor by `len` at the end of the read
+// callback, so a drain was just repeated reads with no round trip per page. On
+// real hardware the pages came out of the watch @0, @243, @486, @729 while the
+// phone received @0 and then @486 — every other page, and the drain aborted on
+// the offset gap (correctly).
+//
+// The cause is not fixable on the watch side: TWO ATT read callbacks can fire
+// for ONE logical read. iOS may issue extra ATT_READ_REQ/ATT_READ_BLOB_REQ, and
+// ble-plx's readCharacteristicForDevice exposes only the final value, so the
+// central cannot even see it happened. Auto-advance means "position = how many
+// times I was read", and a GATT server cannot know that number. Serving the
+// page at the cursor makes a duplicated underlying read return the same bytes
+// harmlessly — the duplicate becomes invisible instead of destructive.
+//
+// The wire LAYOUT is unchanged by this, so `version` stays 3: a page from a
+// firmware that still auto-advances decodes fine and simply trips the reader's
+// desync guard on page 2, which is a loud abort rather than corruption.
 //
 // ⚠️ ANY RUN_ACK INVALIDATES OUTSTANDING OFFSETS. An ack advances the ack
 // cursor, so the unacked stream's base moves and every offset within it shifts.
@@ -515,11 +540,18 @@ export function decodeRoutinePush<T = unknown>(bytes: Uint8Array): RoutinePushDe
  * always the first byte of the head unacked record — a record boundary, and
  * therefore always a safe place to restart.
  *
- * NOT normally needed: the watch auto-advances after each page, so a drain is
- * just repeated reads. This exists for the two cases that need to be explicit
- * rather than inferred:
+ * REQUIRED ON EVERY PAGE, not a recovery primitive. The watch serves the page
+ * at its cursor and never moves it (see the QUEUE_PULL cursor semantics), so
+ * this is the ONLY thing that advances a drain. A reader that seeks once and
+ * then just reads gets page 1 forever.
  *
- *   • RESYNC. A page whose echoed `offset` is not what the reader expected
+ * That is the point: paging position lives on the phone, which is the only side
+ * that knows how many pages it has actually received. The watch cannot know —
+ * one logical read can produce two ATT reads underneath.
+ *
+ * The two cases it also covers, for free:
+ *
+ *   • RESYNC. A page whose echoed `offset` is not what the reader seeked to
  *     means the two sides disagree about position. Seeking makes the reader's
  *     view authoritative instead of guessing.
  *   • RESTART. Beginning a drain, or resuming after a dropped link, seeks 0 so
