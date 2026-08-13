@@ -6,13 +6,20 @@
 /** Show the face and start the idle/sleep cycle. Call after rr_imu_init(). */
 esp_err_t rr_idle_init(void);
 
-/** Called from the IMU interrupt task on a wrist raise. */
-void rr_idle_notify_wake(void);
-
 /** Any interaction — resets the sleep timeout. */
 void rr_idle_notify_activity(void);
 
-/** Manual wake (BOOT tap — the PWR fallback of §9B.2). */
+/**
+ * Wake the screen. THE ONLY WAY THE DISPLAY EVER COMES ON while asleep.
+ *
+ * Two callers, and both matter:
+ *   • rr_reset_button — a short press on BOOT, i.e. the child asking to look
+ *     at their watch. Automatic raise-to-wake was removed in Phase 10 (arming
+ *     the IMU's wake-on-motion freezes its output registers and kills step
+ *     counting), so this is the only manual path.
+ *   • rr_sched / rr_routine — a routine falling due. Wired via hooks in main.c
+ *     rather than called directly, to keep the dependency arrows one-way.
+ */
 void rr_idle_wake_manual(void);
 
 bool rr_idle_is_awake(void);

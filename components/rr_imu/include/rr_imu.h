@@ -1,46 +1,40 @@
 #pragma once
 // rr_imu — QMI8658 6-axis IMU: shared bring-up.
 //
-// ⚠️ THIS IS THE SHARED SENSOR INIT, not wake-detection code.
+// ⚠️ THIS IS THE SHARED SENSOR INIT. It is now sampling-only.
 //
-// Two features ride this one sensor, and they must not each initialise it
-// their own way:
-//   • raise-to-wake  (Phase 6, here)
-//   • step counting  (Phase 9, NOT built — see rr_imu_dev())
+// ONE feature rides this sensor: step counting (rr_steps). Raise-to-wake USED to
+// share it and was removed in Phase 10 by product decision — the screen is now
+// woken by a short press on BOOT or by the scheduler.
+//
+// ⚠️ THE THING MOST LIKELY TO BITE YOU HERE: the QMI8658 KEEPS ITS CONFIGURATION
+// ACROSS AN MCU RESET. Left in a non-converting state by an earlier firmware, it
+// stays there through every reflash, reporting 0x8000 on every axis — which
+// scales to a plausible-looking saturated -2.00 g while STATUS0 never signals
+// data-ready. rr_imu_init() soft-resets the part for exactly this reason. Do not
+// remove that, and do not trust control registers as evidence the sensor is
+// alive; only changing values are evidence.
 //
 // Phase 0 confirmed the part on hardware: I2C 0x6B, WHO_AM_I=0x05, correct
-// gravity vector, readings track real motion.
+// gravity vector, readings track real motion. rr_imu_init() now re-checks that
+// on every boot and shouts if |a| is not ~1 g.
 //
 // ⚠️ INTERRUPT PINS. INT1 is GPIO 16 and INT2 is GPIO 17 — the exact pins the
-// Waveshare examples route the console UART to. sdkconfig.defaults pins the
-// console to USB-Serial-JTAG precisely so these stay free. If wake-on-motion
-// ever stops firing, check that first: the failure is silent, because the IMU
-// still reads perfectly over I2C while its interrupt line is owned by a UART.
+// Waveshare examples route the console UART to. Nothing uses those pins any
+// more, but sdkconfig.defaults still keeps the console off them: if an
+// interrupt feature is ever wanted again, a console sitting on those pins makes
+// it silently impossible, and that warning is cheaper than rediscovering it.
 
 #include <stdbool.h>
 #include "esp_err.h"
 #include "driver/i2c_master.h"
 #include "qmi8658.h"
 
-/** Fired from an ISR-deferred task when the IMU reports motion. */
-typedef void (*rr_imu_motion_cb_t)(void);
-
 /**
- * Bring up the QMI8658 on the shared board I2C bus and configure INT1.
+ * Bring up the QMI8658 on the shared board I2C bus and start the accelerometer.
  * Idempotent. Call after bsp_i2c_init().
  */
 esp_err_t rr_imu_init(i2c_master_bus_handle_t bus);
-
-/**
- * Arm hardware wake-on-motion. `threshold` is the QMI8658's own units — lower
- * is more sensitive. While armed the IMU watches for movement on its own and
- * raises INT1, so the main CPU can stay asleep (§10: the primary battery
- * saver, since polling defeats the whole point).
- */
-esp_err_t rr_imu_arm_wake_on_motion(uint8_t threshold, rr_imu_motion_cb_t cb);
-
-/** Disarm wake-on-motion (e.g. while the screen is already awake). */
-esp_err_t rr_imu_disarm_wake_on_motion(void);
 
 /** True once rr_imu_init() has succeeded. */
 bool rr_imu_is_ready(void);
@@ -126,9 +120,12 @@ esp_err_t rr_imu_read_accel_g(float *x, float *y, float *z);
  * Pin the accelerometer to 2G / RR_IMU_PED_ODR_HZ for as long as something is
  * counting steps from it.
  *
- * Without this the range and rate follow the wake state — 2G/21 Hz low-power
- * while wake-on-motion is armed, 8G/500 Hz once the screen is up — and a step
- * detector whose thresholds are in g would silently change meaning every time
- * the screen slept. rr_steps holds it for the lifetime of the firmware.
+ * Historically the range and rate followed the WAKE STATE — 2G/21 Hz low-power
+ * while wake-on-motion was armed, 8G/500 Hz once the screen was up — so a step
+ * detector whose thresholds are in g silently changed meaning every time the
+ * screen slept. Wake-on-motion is gone and nothing changes the mode any more,
+ * so this is now belt-and-braces rather than load-bearing. rr_steps still holds
+ * it for the lifetime of the firmware, because the alternative is a detector
+ * whose correctness depends on nobody ever touching CTRL2 again.
  */
 void rr_imu_step_sampling_hold(bool hold);

@@ -35,6 +35,44 @@ static int32_t  s_day;           /**< local day number the total belongs to */
 static uint32_t s_persisted;     /**< s_daily as last written */
 static int64_t  s_persisted_at;  /**< tick ms of that write */
 
+// ── Liveness of the detector's INPUT, not just its output ───────────────────
+//
+// ⚠️ THIS EXISTS BECAUSE A DEAD SENSOR AND A STATIONARY WATCH LOOK IDENTICAL
+// FROM THE STEP COUNT ALONE, and this board spent from Phase 9 to Phase 10 in
+// exactly that ambiguity: arming the IMU's wake-on-motion froze its output
+// registers, so the detector was fed a CONSTANT for every hour the screen was
+// off and counted nothing — while "steps 128, unchanged" read as "nobody
+// walked". Wake-on-motion is gone now, but the lesson is cheap to keep.
+//
+// The spread between the smallest and largest magnitude seen since the last
+// report is the discriminator: a real accelerometer at rest still jitters by a
+// few mg, and a frozen one reports EXACTLY 0.000 forever. Reported to the
+// heartbeat so a regression is visible in the log rather than in a step count
+// that quietly stops growing.
+static float    s_mag_min = 0.0f;
+static float    s_mag_max = 0.0f;
+static float    s_mag_last = 0.0f;
+static uint32_t s_samples;
+static bool     s_mag_seen;
+
+// ── Tuning telemetry: the band-passed SIGNAL, not the raw magnitude ─────────
+//
+// The first real walk test credited 16 steps for ~50 taken. That is a threshold
+// problem, and the only way to fix it without another round of guessing is to
+// know what amplitude a real stride actually produces ON A WRIST — the detector
+// compares `signal` (fast EMA minus slow EMA) against THRESH_HIGH_G, so
+// `signal` is the number to look at, and the raw magnitude says nothing about
+// it.
+//
+// s_sig_peak is the largest signal seen since the last report. Compare it
+// directly with THRESH_HIGH_G: if a brisk walk peaks at 0.08 g against a 0.11 g
+// gate, the gate is simply too high and most strides never register.
+// s_detects counts threshold crossings, so "peaks found" and "steps credited"
+// can be told apart — a big gap between them means the rhythm/streak gates are
+// throwing away real steps rather than the amplitude gate missing them.
+static float    s_sig_peak;
+static uint32_t s_detects;
+
 static int64_t now_ms(void)
 {
     return (int64_t) xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -139,11 +177,57 @@ static void maybe_store(void)
 //                           sustain in rhythm, while any real walk clears it.
 //                           → RAISE IF WAVING STILL COUNTS.
 //                           → LOWER IF SHORT WALKS GO UNCOUNTED.
+// ── RETUNED FROM MEASURED WRIST DATA (Phase 10) ─────────────────────────────
+//
+// The first walk that ever reached this detector — step counting was dead
+// before Phase 10 — credited 16 steps for ~50 taken, then 0 for a minute of
+// walking on the spot. The instrumentation in rr_steps_describe_input() said
+// why, and it was not the amplitude gate:
+//
+//     accel 0.92g sprd 2.850 n=758 pk 0.396 det 14   -> credited 0
+//     accel 0.99g sprd 0.569 n=750 pk 0.210 det 18   -> credited 0
+//     accel 0.98g sprd 0.506 n=751 pk 0.170 det 12   -> credited 0
+//
+// `pk` (0.17-0.40 g) clears THRESH_HIGH_G (0.11 g) with room to spare, so peaks
+// were being FOUND. But `det` of 12-18 per 30 s is one detection every ~2 s,
+// which is longer than MAX_STEP_MS was — so EVERY detection took the "too slow,
+// start a fresh streak" branch, the streak never reached ENTRY_STEPS, and credit
+// was structurally guaranteed to be zero. Not a threshold that was slightly off:
+// a gate that could never open.
+//
+// ⚠️ AND THE REASON THE GAPS ARE THAT LONG IS ANATOMY, NOT TUNING. At the WRIST
+// the arm swings once per STRIDE — about one peak per TWO steps — so a
+// wrist-mounted detector sees roughly half the cadence a hip-mounted one does.
+// The old values were implicitly written for one peak per step.
+//
+//   MAX_STEP_MS 3000        was 1500. Must exceed the real inter-peak gap with
+//                           margin, or the streak resets forever. Measured gaps
+//                           were ~2000 ms at a gentle indoor pace; a child
+//                           dawdling will be slower still.
+//                           → RAISE IF A STEADY WALK STILL CREDITS NOTHING.
+//
+//   ENTRY_STEPS 4           was 8. At roughly one detection per stride, 8 meant
+//                           ~16 s of uninterrupted walking before ANY credit —
+//                           which almost no real child walk sustains. 4 is ~8 s,
+//                           still far more than a wave or a door-slam produces.
+//                           → RAISE IF ARM WAVING REGISTERS.
+//
+//   MIN_STEP_MS 300         was 260. Slightly wider now that one detection means
+//                           one stride: two peaks closer than 300 ms cannot be
+//                           consecutive strides, so that is still vibration.
+//
+// ⚠️ STEPS_PER_DETECT exists because of the anatomy note above: each confirmed
+// peak is credited as a stride, i.e. TWO steps. Without it the count reads
+// consistently half, which is exactly what the 16-for-50 result was (16*2 = 32,
+// against a streak that kept breaking). Verify against a hand-counted walk
+// before trusting it — it is the one value here that is a model rather than a
+// measurement.
 #define THRESH_HIGH_G  0.11f
 #define THRESH_LOW_G   0.045f
-#define MIN_STEP_MS    260
-#define MAX_STEP_MS    1500
-#define ENTRY_STEPS    8
+#define MIN_STEP_MS    300
+#define MAX_STEP_MS    3000
+#define ENTRY_STEPS    4
+#define STEPS_PER_DETECT 2
 
 // EMA coefficients at RR_STEPS_SAMPLE_HZ. FAST is a light smoother (~6 Hz
 // corner); SLOW tracks gravity and posture over a couple of seconds so that
@@ -171,12 +255,16 @@ static uint32_t detect(float mag_g, int64_t t_ms)
     s_slow += (s_fast - s_slow) * EMA_SLOW;
 
     const float signal = s_fast - s_slow;
+    if (signal > s_sig_peak) s_sig_peak = signal;
 
     if (!s_above && signal > THRESH_HIGH_G) {
         s_above = true;
+        s_detects++;
 
         const int64_t gap = t_ms - s_last_step_ms;
         s_last_step_ms = t_ms;
+        ESP_LOGD(TAG, "peak %.3fg gap %lldms streak %d", (double) signal,
+                 (long long) gap, s_streak);
 
         if (gap < MIN_STEP_MS) {
             // Too soon to be a stride: this is vibration, not walking. It also
@@ -203,9 +291,9 @@ static uint32_t detect(float mag_g, int64_t t_ms)
             // why a 50-step walk reports ~50 and not ~42.
             const uint32_t credit = s_pending + 1;
             s_pending = 0;
-            return credit;
+            return credit * STEPS_PER_DETECT;
         }
-        return 1;   // established rhythm: credit live
+        return STEPS_PER_DETECT;   // established rhythm: credit live
     }
 
     if (s_above && signal < THRESH_LOW_G) s_above = false;
@@ -282,6 +370,13 @@ static void steps_task(void *arg)
         if (rr_imu_read_accel_g(&x, &y, &z) != ESP_OK) continue;
         const float mag = sqrtf(x * x + y * y + z * z);
         const int64_t t = now_ms();
+
+        // Track the spread before anything else touches the sample.
+        if (!s_mag_seen) { s_mag_min = s_mag_max = mag; s_mag_seen = true; }
+        else if (mag < s_mag_min) s_mag_min = mag;
+        else if (mag > s_mag_max) s_mag_max = mag;
+        s_mag_last = mag;
+        s_samples++;
 
         if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) != pdTRUE) continue;
 
@@ -379,6 +474,27 @@ esp_err_t rr_steps_init(void)
     ESP_LOGW(TAG, "  ⚠ this samples the accelerometer from the CPU %d times a second, "
                   "including while asleep — Phase 10 power item", RR_STEPS_SAMPLE_HZ);
     return ESP_OK;
+}
+
+void rr_steps_describe_input(char *buf, size_t len)
+{
+    if (buf == NULL || len == 0) return;
+    if (!s_mag_seen) {
+        snprintf(buf, len, "accel NO SAMPLES");
+        return;
+    }
+    // Spread of exactly zero over thousands of samples means the registers are
+    // frozen, not that the watch is still — say so rather than print a number
+    // whose significance only one person remembers.
+    const float spread = s_mag_max - s_mag_min;
+    snprintf(buf, len, "accel %.2fg sprd %.3f n=%" PRIu32 " pk %.3f det %" PRIu32 "%s",
+             (double) s_mag_last, (double) spread, s_samples,
+             (double) s_sig_peak, s_detects,
+             spread < 0.001f ? " ⚠FROZEN" : "");
+    s_mag_min = s_mag_max = s_mag_last;   // per-report window
+    s_samples = 0;
+    s_sig_peak = 0.0f;
+    s_detects = 0;
 }
 
 uint32_t rr_steps_today(void) { return s_daily; }

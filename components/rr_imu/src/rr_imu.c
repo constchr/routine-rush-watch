@@ -1,4 +1,47 @@
-// rr_imu — QMI8658 shared bring-up + hardware wake-on-motion.
+// rr_imu — QMI8658 shared bring-up. Accelerometer sampling only.
+//
+// ═════════════════════════════════════════════════════════════════════════════
+// THE SENSOR DOES NOT REBOOT WHEN THE MCU DOES. SOFT RESET IT AT BRING-UP.
+//
+// This is the most important fact about this file, and it hid a completely dead
+// step counter from Phase 9 until Phase 10.
+//
+// The QMI8658 keeps its configuration across an ESP32 reset, a reflash and a
+// watchdog reboot — it only loses it on a full power cycle. Bring-up here never
+// said otherwise: it wrote range and ODR over the top of whatever was already
+// there and assumed the rest was default. When the part had been left in a
+// non-converting state by an earlier firmware, it stayed that way forever, and
+// every reflash inherited it.
+//
+// THE SIGNATURE, because it is deeply misleading:
+//
+//     ax=-32768 ay=-32768 az=-32768        <- 0x8000 on every axis
+//     -> x=-2.00 y=-2.00 z=-2.00  |a|=3.46 g
+//     CTRL2=0x07 (2G, 62.5 Hz)  CTRL7=0x01 (accel on)   <- all CORRECT
+//     STATUS0=0x00                                       <- never data-ready
+//
+// 0x8000 is the "no valid sample" sentinel, and at 2G it scales to exactly
+// -2.00 g — so it reads as a *saturated accelerometer* rather than as an absent
+// one. Every control register says healthy. Nothing errors. The only real tell
+// is that the values NEVER CHANGE, which is indistinguishable from a watch
+// nobody moved unless you are explicitly looking for variance (see
+// rr_steps_describe_input()).
+//
+// ⚠️ A CORRECTION WORTH RECORDING. This signature was first blamed on wake-on-
+// motion — "arming WoM freezes the output registers" — because it showed up
+// while WoM was armed. That was wrong, or at least never demonstrated: the same
+// frozen 0x8000 appears with WoM entirely absent from the firmware, and a soft
+// reset fixes it either way. The confounder was that the sensor had been left in
+// a bad state by a PREVIOUS boot, so the correlation with arming was incidental.
+// If wake-on-motion is ever wanted again, do not treat it as ruled out on those
+// grounds — re-test it against a freshly reset part.
+//
+// Wake-on-motion is nonetheless GONE by product decision (Phase 10): the screen
+// is woken by a short press on BOOT (rr_reset_button.c) or by the scheduler when
+// a routine is due (rr_sched -> rr_idle_wake_manual). That keeps the
+// accelerometer in one continuous sampling mode all day, which is what rr_steps
+// needs, and removes a whole class of mode-switching bugs.
+// ═════════════════════════════════════════════════════════════════════════════
 
 #include "rr_imu.h"
 
@@ -6,45 +49,54 @@
 #include <math.h>
 
 #include "esp_log.h"
-#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "freertos/semphr.h"
 
 static const char *TAG = "rr_imu";
 
-// Waveshare's pin audit: INT1 = GPIO 16, INT2 = GPIO 17. See the warning in
-// rr_imu.h about the console UART fighting for these.
-#define IMU_INT1_GPIO GPIO_NUM_16
+// GPIO 16/17 (QMI8658 INT1/INT2) are now UNUSED by this firmware. The
+// sdkconfig.defaults warning about keeping the console off those pins is
+// therefore no longer load-bearing — but leave it in place: routing the console
+// back onto them would make re-adding any interrupt feature silently impossible,
+// and that warning is cheaper than rediscovering it.
+
+// QMI8658 register map (datasheet §8). Above its first user, because rr_imu_init
+// now enables the accelerometer directly rather than leaving it to a WoM path.
+#define REG_CTRL1     0x02
+#define REG_CTRL2     0x03   /* accel range + ODR */
+#define REG_CTRL7     0x08   /* sensor enable; bit7 = sync-sample mode */
+#define REG_CTRL8     0x09   /* bit4 = pedometer enable */
+#define REG_CTRL9     0x0A   /* host command */
+#define REG_CAL1_L    0x0B
+#define REG_CAL1_H    0x0C
+#define REG_CAL2_L    0x0D
+#define REG_CAL2_H    0x0E
+#define REG_CAL3_L    0x0F
+#define REG_CAL3_H    0x10
+#define REG_CAL4_L    0x11
+#define REG_CAL4_H    0x12
+#define REG_STATUSINT 0x2D   /* bit7 = CmdDone */
+#define REG_STATUS0   0x2E
+#define REG_STATUS1   0x2F
+#define REG_AX_L      0x35
+#define REG_STEP_CNT_L 0x5A
+#define REG_STEP_CNT_M 0x5B
+#define REG_STEP_CNT_H 0x5C
+
+#define CTRL9_CMD_ACK          0x00
+#define CTRL9_CMD_CONFIG_PED   0x0D
+#define CTRL9_CMD_RESET_PED    0x0F
+
+#define CTRL8_PEDOMETER_BIT 0x10
+
+// Soft reset. Not in the vendor driver's register list, and the reason this
+// file needs it is in rr_imu_init(): the sensor survives an MCU reboot.
+#define REG_RESET             0x60
+#define QMI8658_SOFT_RESET_CMD 0xB0
 
 static qmi8658_dev_t s_dev;
 static bool s_ready;
-static bool s_armed;
 static bool s_ped_active;
-static rr_imu_motion_cb_t s_cb;
-static SemaphoreHandle_t s_int_sem;
-
-// The ISR does nothing but hand off. QMI8658 wake-on-motion needs an I2C read
-// to clear its status, and I2C cannot be driven from interrupt context.
-static void IRAM_ATTR imu_isr(void *arg)
-{
-    (void) arg;
-    BaseType_t hp = pdFALSE;
-    xSemaphoreGiveFromISR(s_int_sem, &hp);
-    if (hp == pdTRUE) portYIELD_FROM_ISR();
-}
-
-static void imu_int_task(void *arg)
-{
-    (void) arg;
-    while (1) {
-        if (xSemaphoreTake(s_int_sem, portMAX_DELAY) != pdTRUE) continue;
-        if (!s_armed) continue;   // transient from arming, or a late one after disarm
-
-        ESP_LOGI(TAG, "wake-on-motion interrupt");
-        if (s_cb) s_cb();
-    }
-}
 
 esp_err_t rr_imu_init(i2c_master_bus_handle_t bus)
 {
@@ -61,74 +113,130 @@ esp_err_t rr_imu_init(i2c_master_bus_handle_t bus)
     qmi8658_get_who_am_i(&s_dev, &who);
     ESP_LOGI(TAG, "QMI8658 up (WHO_AM_I=0x%02X)", who);
 
-    // Accelerometer-only config: wake-on-motion needs no gyro, and the gyro is
-    // the expensive half of this part. Phase 9's pedometer also runs on accel.
-    qmi8658_set_accel_range(&s_dev, QMI8658_ACCEL_RANGE_8G);
-    qmi8658_set_accel_odr(&s_dev, QMI8658_ACCEL_ODR_500HZ);
-    qmi8658_set_accel_unit_mps2(&s_dev, true);
+    // ── SOFT RESET FIRST. THE SENSOR DOES NOT REBOOT WHEN THE MCU DOES. ──────
+    //
+    // ⚠️ This is the bug that made step counting look impossible. The QMI8658
+    // keeps its configuration across an ESP32 reset, a reflash, and a watchdog
+    // reboot — it only loses it on a full power cycle. So whatever mode the
+    // PREVIOUS firmware left it in is the mode the NEXT one starts in, and
+    // bring-up here never said otherwise; it wrote range and ODR over the top
+    // and assumed the rest was default.
+    //
+    // The symptom is brutal to diagnose because everything reads healthy:
+    //
+    //     CTRL2=0x07 (2G, 62.5 Hz)  CTRL7=0x01 (accel on)   <- correct
+    //     STATUS0=0x00                                       <- never data-ready
+    //     ax=-1181 ay=1315 az=15882, byte-identical across 500 ms
+    //
+    // A perfectly plausible gravity vector (|a| = 0.98 g), frozen. Registers
+    // configured, sensor not converting, no error anywhere.
+    //
+    // Writing 0xB0 to RESET (0x60) puts the part in a known state, so bring-up
+    // depends on nothing that came before it. Everything below this line is
+    // applied to a freshly reset device.
+    qmi8658_write_register(&s_dev, REG_RESET, QMI8658_SOFT_RESET_CMD);
+    vTaskDelay(pdMS_TO_TICKS(20));   // datasheet: ~15 ms to come back
 
-    s_int_sem = xSemaphoreCreateBinary();
-    if (s_int_sem == NULL) return ESP_ERR_NO_MEM;
-
-    gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << IMU_INT1_GPIO,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        // ANY edge: the QMI8658's WoM interrupt polarity is configurable and the
-        // datasheet's default (CAL1_H initial-value bit) makes it active-HIGH,
-        // so keying on one edge is a silent-failure trap. Both edges cost
-        // nothing here — the handler is idempotent.
-        .intr_type = GPIO_INTR_ANYEDGE,
-    };
-    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_config(&cfg));
-
-    // The reset-button component may already have installed the ISR service.
-    err = gpio_install_isr_service(0);
-    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
-        ESP_LOGE(TAG, "gpio_install_isr_service failed: %s", esp_err_to_name(err));
+    // The reset drops the I2C-level settings the vendor init applied (address
+    // auto-increment in particular), so re-run it against the clean device
+    // rather than assuming the handle is still describing reality.
+    err = qmi8658_init(&s_dev, bus, QMI8658_ADDRESS_HIGH);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "qmi8658_init after soft reset failed: %s", esp_err_to_name(err));
         return err;
     }
-    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_isr_handler_add(IMU_INT1_GPIO, imu_isr, NULL));
 
-    if (xTaskCreate(imu_int_task, "rr_imu_int", 3072, NULL, 6, NULL) != pdPASS) {
-        ESP_LOGE(TAG, "could not start the IMU interrupt task");
-        return ESP_FAIL;
+    // Accelerometer only — the gyro is the expensive half of this part and
+    // nothing reads it. rr_steps immediately re-pins range and rate via
+    // rr_imu_step_sampling_hold(); these are just a sane state before it does.
+    qmi8658_set_accel_range(&s_dev, QMI8658_ACCEL_RANGE_2G);
+    qmi8658_set_accel_odr(&s_dev, QMI8658_ACCEL_ODR_62_5HZ);
+    qmi8658_set_accel_unit_mps2(&s_dev, true);
+
+    // CTRL7 bit0 = accel on, sync-sample off. Set explicitly and left alone for
+    // the life of the firmware: the only thing that ever took the sensor out of
+    // this mode was WoM arming, and that is gone. Continuous sampling is now the
+    // ONLY mode, which is what lets rr_steps count while the screen is off.
+    esp_err_t ctrl7 = qmi8658_write_register(&s_dev, REG_CTRL7, 0x01);
+    if (ctrl7 != ESP_OK) {
+        ESP_LOGE(TAG, "could not enable the accelerometer: %s", esp_err_to_name(ctrl7));
+        return ctrl7;
     }
 
     s_ready = true;
-    ESP_LOGI(TAG, "IMU ready; INT1 on GPIO%d", IMU_INT1_GPIO);
+
+    // Wait for the FIRST conversion before judging anything. Straight after a
+    // soft reset the output registers are genuinely all-zero for a few
+    // milliseconds, and reading them there produced a |a| = 0.00 g "SAMPLES ARE
+    // NOT VALID" warning on every boot of a perfectly healthy sensor. A check
+    // that cries wolf is worse than no check, because the next real one gets
+    // ignored.
+    // ⚠️ Poll the DATA, not STATUS0. Reading STATUS0 CLEARS its data-ready bit,
+    // so a wait loop built on it consumes the very flag the next reader needs —
+    // which is how this check managed to still report an invalid first sample
+    // after being "fixed" once already.
+    //
+    // Before the first conversion the registers read 0x8000 on every axis
+    // (-32768), which scales to exactly -2.00 g at 2G. That is the sentinel, not
+    // a measurement — see the note at the top of this file.
+    float x = 0, y = 0, z = 0;
+    for (int i = 0; i < 40; i++) {         // ~200 ms budget at 62.5 Hz
+        if (rr_imu_read_accel_g(&x, &y, &z) == ESP_OK) {
+            const float m = sqrtf(x * x + y * y + z * z);
+            if (m > 0.5f && m < 1.5f) break;   // a real gravity vector
+        }
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    if (rr_imu_read_accel_g(&x, &y, &z) == ESP_OK) {
+        const float mag = sqrtf(x * x + y * y + z * z);
+        ESP_LOGI(TAG, "IMU ready — x=%.2f y=%.2f z=%.2f |a|=%.2f g%s",
+                 (double) x, (double) y, (double) z, (double) mag,
+                 (mag < 0.80f || mag > 1.20f)
+                     ? "  ⚠ |a| IS NOT ~1 g — SAMPLES ARE NOT VALID"
+                     : "");
+    } else {
+        ESP_LOGE(TAG, "IMU ready but the first accelerometer read FAILED");
+    }
+
+    // ── Is it actually CONVERTING? ──────────────────────────────────────────
+    //
+    // A plausible-looking magnitude is not proof of life: the registers can hold
+    // one valid-looking sample forever. Dump the control state and take a few
+    // samples spaced well apart — if the raw counts are byte-identical across
+    // 500 ms, the part is not sampling, whatever the registers claim.
+    {
+        uint8_t c1 = 0, c2 = 0, c7 = 0, c8 = 0, st0 = 0;
+        qmi8658_read_register(&s_dev, REG_CTRL1, &c1, 1);
+        qmi8658_read_register(&s_dev, REG_CTRL2, &c2, 1);
+        qmi8658_read_register(&s_dev, REG_CTRL7, &c7, 1);
+        qmi8658_read_register(&s_dev, REG_CTRL8, &c8, 1);
+        qmi8658_read_register(&s_dev, REG_STATUS0, &st0, 1);
+        ESP_LOGI(TAG, "  CTRL1=0x%02X CTRL2=0x%02X CTRL7=0x%02X CTRL8=0x%02X STATUS0=0x%02X",
+                 c1, c2, c7, c8, st0);
+
+        int16_t prev_ax = 0;
+        bool changed = false;
+        for (int i = 0; i < 5; i++) {
+            uint8_t r[6] = { 0 };
+            qmi8658_read_register(&s_dev, REG_AX_L, r, sizeof(r));
+            const int16_t ax = (int16_t) ((r[1] << 8) | r[0]);
+            const int16_t ay = (int16_t) ((r[3] << 8) | r[2]);
+            const int16_t az = (int16_t) ((r[5] << 8) | r[4]);
+            uint8_t s0 = 0;
+            qmi8658_read_register(&s_dev, REG_STATUS0, &s0, 1);
+            ESP_LOGI(TAG, "  sample %d: ax=%6d ay=%6d az=%6d  STATUS0=0x%02X",
+                     i, ax, ay, az, s0);
+            if (i > 0 && ax != prev_ax) changed = true;
+            prev_ax = ax;
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+        if (!changed) {
+            ESP_LOGE(TAG, "  ⚠ RAW COUNTS IDENTICAL ACROSS 500 ms — THE ACCELEROMETER "
+                          "IS NOT CONVERTING. Step counting cannot work in this state.");
+        }
+    }
     return ESP_OK;
 }
-
-// QMI8658 register map (datasheet §8).
-#define REG_CTRL1     0x02
-#define REG_CTRL2     0x03   /* accel range + ODR */
-#define REG_CTRL7     0x08   /* sensor enable; bit7 = sync-sample mode */
-#define REG_CTRL8     0x09   /* bit4 = pedometer enable */
-#define REG_CTRL9     0x0A   /* host command */
-#define REG_CAL1_L    0x0B
-#define REG_CAL1_H    0x0C
-#define REG_CAL2_L    0x0D
-#define REG_CAL2_H    0x0E
-#define REG_CAL3_L    0x0F
-#define REG_CAL3_H    0x10
-#define REG_CAL4_L    0x11
-#define REG_CAL4_H    0x12
-#define REG_STATUSINT 0x2D   /* bit7 = CmdDone */
-#define REG_STATUS0   0x2E
-#define REG_STATUS1   0x2F   /* WoM / pedometer event latch; read to clear */
-#define REG_AX_L      0x35
-#define REG_STEP_CNT_L 0x5A
-#define REG_STEP_CNT_M 0x5B
-#define REG_STEP_CNT_H 0x5C
-
-#define CTRL9_CMD_ACK          0x00
-#define CTRL9_CMD_WRITE_WOM    0x08
-#define CTRL9_CMD_CONFIG_PED   0x0D
-#define CTRL9_CMD_RESET_PED    0x0F
-
-#define CTRL8_PEDOMETER_BIT 0x10
 
 // ── The CTRL9 handshake, in one place ────────────────────────────────────────
 //
@@ -179,125 +287,6 @@ static esp_err_t ctrl9_command(uint8_t cmd)
         return ESP_ERR_TIMEOUT;
     }
     return ESP_OK;
-}
-
-// ⚠️ The vendor driver's qmi8658_enable_wake_on_motion() does NOT work.
-//
-// It writes the threshold into CAL1_L/CAL1_H but never issues the CTRL9 host
-// command that latches a WoM setting, so the registers are staged and never
-// applied — the interrupt simply never fires, silently. Verified on hardware:
-// armed via the vendor call, the watch never woke.
-//
-// This is the datasheet sequence: stage CAL1_L/CAL1_H, issue the CTRL9
-// command, wait for the controller to acknowledge it, then re-enable the
-// accelerometer. Written against the register map rather than the vendor
-// helper so the acknowledgement step cannot be skipped again.
-static esp_err_t wom_apply(uint8_t threshold_mg, bool enable)
-{
-    // 1. Sensors off while the setting is staged.
-    esp_err_t err = qmi8658_write_register(&s_dev, REG_CTRL7, 0x00);
-    if (err != ESP_OK) return err;
-    vTaskDelay(pdMS_TO_TICKS(2));
-
-    // 2. Route the interrupt to a pin. CTRL1 bit3 enables INT1 as an output;
-    //    without it the pin stays high-Z and nothing reaches GPIO 16.
-    uint8_t ctrl1 = 0;
-    qmi8658_read_register(&s_dev, REG_CTRL1, &ctrl1, 1);
-    ctrl1 |= 0x08;
-    qmi8658_write_register(&s_dev, REG_CTRL1, ctrl1);
-
-    // 3. Stage the threshold. CAL1_H: bit7 = INT select (0 = INT1),
-    //    bit6 = initial level, bits5..0 = blanking samples. Blanking of 2
-    //    samples suppresses the ringing a single knock produces.
-    qmi8658_write_register(&s_dev, REG_CAL1_L, enable ? threshold_mg : 0x00);
-    qmi8658_write_register(&s_dev, REG_CAL1_H, enable ? 0x02 : 0x00);
-
-    // 4. Issue the command through the full handshake — the step the vendor
-    //    omits. Phase 9 moved this into ctrl9_command() so the pedometer's
-    //    back-to-back commands cannot trip over a latched CmdDone flag.
-    if (ctrl9_command(CTRL9_CMD_WRITE_WOM) != ESP_OK) {
-        ESP_LOGW(TAG, "CTRL9 WoM command not acknowledged — WoM may be inactive");
-    }
-
-    // 5. Accelerometer back on. CTRL7: bit0 = accel, bit1 = gyro, bit7 = sync-
-    //    sample mode. 0x01 is accel-only with sync-sample OFF, which is both
-    //    what wake-on-motion needs and the only mode the pedometer engine runs
-    //    in ("Non-SyncSample mode", datasheet).
-    //
-    //    This wrote 0x03 on the disarm path, which switched the GYRO ON every
-    //    time the screen woke — the expensive half of the part, contradicting
-    //    this file's own accel-only comment, and nothing reads the gyro.
-    err = qmi8658_write_register(&s_dev, REG_CTRL7, 0x01);
-    return err;
-}
-
-esp_err_t rr_imu_arm_wake_on_motion(uint8_t threshold, rr_imu_motion_cb_t cb)
-{
-    if (!s_ready) return ESP_ERR_INVALID_STATE;
-    s_cb = cb;
-
-    // Sampling rate while watching for a wrist raise.
-    //
-    // 21 Hz low-power is the cheapest mode that still notices an arm being
-    // raised, and it is what this used before the pedometer existed. But the
-    // step engine's timing parameters are counted in SAMPLES at a fixed ODR
-    // (rr_imu.h), and the watch is asleep for most of the day — which is
-    // exactly when most steps happen. Dropping to 21 Hz here would either stop
-    // the engine counting or silently change what every one of its thresholds
-    // means, and a pedometer that only counts while you are looking at the
-    // screen is not a pedometer.
-    //
-    // So: pedometer active wins. The power difference is real and named in the
-    // Phase 9 report as a Phase 10 item.
-    qmi8658_set_accel_range(&s_dev, QMI8658_ACCEL_RANGE_2G);
-    qmi8658_set_accel_odr(&s_dev, s_ped_active ? QMI8658_ACCEL_ODR_62_5HZ
-                                               : QMI8658_ACCEL_ODR_LOWPOWER_21HZ);
-
-    esp_err_t err = wom_apply(threshold, true);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "arming wake-on-motion failed: %s", esp_err_to_name(err));
-        return err;
-    }
-    // Arming itself moves INT1 (the pin is driven from high-Z to its configured
-    // initial level), and on an any-edge handler that transient is
-    // indistinguishable from a wrist raise — observed on hardware as an
-    // instant wake 13 ms after arming. Let the line settle, clear any latched
-    // status, then discard anything already queued so only genuine motion
-    // after this point counts.
-    vTaskDelay(pdMS_TO_TICKS(60));
-    uint8_t status = 0;
-    qmi8658_read_register(&s_dev, REG_STATUSINT, &status, 1);
-    // STATUS1 (0x2F) is the register whose read clears the WoM latch. This line
-    // used to hit 0x2E, which is STATUS0 — harmless but not the latch, so the
-    // clear was relying on the settle delay alone. Both are read now.
-    qmi8658_read_register(&s_dev, REG_STATUS0, &status, 1);
-    qmi8658_read_register(&s_dev, REG_STATUS1, &status, 1);
-    xSemaphoreTake(s_int_sem, 0);
-
-    s_armed = true;
-    ESP_LOGI(TAG, "wake-on-motion ARMED (threshold %u mg, INT1 idle level=%d)",
-             (unsigned) threshold, gpio_get_level(IMU_INT1_GPIO));
-    return ESP_OK;
-}
-
-esp_err_t rr_imu_disarm_wake_on_motion(void)
-{
-    if (!s_ready) return ESP_ERR_INVALID_STATE;
-    s_armed = false;
-
-    // Back to normal sampling. When the pedometer is running, "normal" is its
-    // fixed ODR and nothing else — see the note in rr_imu_arm_wake_on_motion().
-    esp_err_t err = wom_apply(0, false);
-    if (s_ped_active) {
-        qmi8658_set_accel_range(&s_dev, QMI8658_ACCEL_RANGE_2G);
-        qmi8658_set_accel_odr(&s_dev, QMI8658_ACCEL_ODR_62_5HZ);
-    } else {
-        qmi8658_set_accel_range(&s_dev, QMI8658_ACCEL_RANGE_8G);
-        qmi8658_set_accel_odr(&s_dev, QMI8658_ACCEL_ODR_500HZ);
-    }
-    if (err != ESP_OK) ESP_LOGW(TAG, "disarm: %s", esp_err_to_name(err));
-    else ESP_LOGI(TAG, "wake-on-motion disarmed");
-    return err;
 }
 
 bool rr_imu_is_ready(void) { return s_ready; }

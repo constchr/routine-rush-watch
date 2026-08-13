@@ -28,6 +28,7 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_sleep.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -40,7 +41,29 @@ static const char *TAG = "rr_reset_btn";
 
 #define BOOT_GPIO        GPIO_NUM_9
 #define POLL_MS          100
-#define ARM_MS           2000    // show the countdown after this long
+
+// ── The three press bands, and why the boundaries are where they are ─────────
+//
+// Phase 10 promoted this button from "fallback wake" to THE ONLY WAY TO WAKE THE
+// SCREEN BY HAND — hardware wake-on-motion is gone (see rr_idle.c). So the split
+// between "wake" and "start a factory reset" now matters far more than it did
+// when a wrist raise was the normal path and this was a backstop.
+//
+//   0 .. ARM_MS            RELEASE HERE  ->  wake the screen. Nothing else can
+//                          happen in this band: the countdown has not appeared,
+//                          so no reset is in progress to abort.
+//   ARM_MS .. HOLD_TO_RESET_MS
+//                          The countdown is ON SCREEN and ticking. Releasing
+//                          aborts it and does NOT wake — the screen is already
+//                          lit showing the countdown, and waking here would be
+//                          indistinguishable from a normal tap.
+//   >= HOLD_TO_RESET_MS    Factory reset.
+//
+// ⚠️ THE SAFETY PROPERTY: a short press CANNOT start a reset, because a reset
+// requires holding through eight further seconds of an explicit on-screen
+// countdown. The bands are contiguous and mutually exclusive, so there is no
+// duration that does two things or nothing.
+#define ARM_MS           2000    // countdown appears; also the wake/no-wake line
 #define HOLD_TO_RESET_MS 10000   // total hold required
 
 // ── Interrupt-gated, not polled ──────────────────────────────────────────────
@@ -110,11 +133,15 @@ static void reset_button_task(void *arg)
 
         // Released.
         //
-        // A SHORT press is the manual wake of §9B.2. The spec names the PWR
+        // A SHORT press is THE manual wake (§9B.2). The spec names the PWR
         // button, but PWR is wired to the AXP2101's PWRON pin rather than a
-        // GPIO, so reading it means polling PMIC registers over I2C. BOOT is
-        // directly readable and debounced above, so it serves as the fallback
-        // until Phase 10 wires the PMIC interrupt.
+        // GPIO, so reading it would mean polling PMIC registers over I2C —
+        // which is also why PWR could not take this job when Phase 10 removed
+        // wake-on-motion. BOOT is directly readable and debounced above.
+        //
+        // ⚠️ This is no longer a convenience path. With WoM gone it is the only
+        // way a child can look at their watch on demand, so a press that fails
+        // to wake reads as a broken device. Keep it dumb and unconditional.
         if (held_ms < ARM_MS) {
             ESP_LOGI(TAG, "short press (%d ms) — manual wake", held_ms);
             rr_idle_wake_manual();
@@ -162,12 +189,51 @@ esp_err_t rr_reset_button_init(void)
         return err;
     }
 
+    // ── Surviving light sleep (Phase 10) ────────────────────────────────────
+    //
+    // Automatic light sleep POWERS THE CPU DOWN (CONFIG_PM_POWER_DOWN_CPU_IN_
+    // LIGHT_SLEEP), so an ordinary GPIO interrupt does not run — only a
+    // registered wake source brings the chip back. Without the two calls below
+    // this button would appear to work on the bench (where the watch is awake
+    // and plugged in) and be completely dead on a sleeping watch on a wrist.
+    //
+    // That matters more here than anywhere else in the firmware: this button is
+    // the ONLY recovery path for a watch that was unlinked while out of BLE
+    // range. A factory reset that silently stops working once power management
+    // is switched on would be discovered by a parent, not by us.
+    //
+    // CONFIG_PM_SLP_DISABLE_GPIO turns every pad off during sleep to save
+    // 200-300 uA; gpio_sleep_sel_dis() exempts this one so the pull-up survives
+    // and a press is still a real level change. Light-sleep GPIO wakeup is
+    // LEVEL-triggered only (no edges), and BOOT idles high through its pull-up,
+    // so the press — a LOW level — is the wake condition.
+    //
+    // ⚠️ COMPILED OUT UNLESS LIGHT SLEEP IS ACTUALLY ON, AND THAT IS NOT
+    // TIDINESS — IT IS A BUG FIX. On the ESP32-C6 the light-sleep wake level and
+    // the ordinary edge-interrupt type are THE SAME REGISTER FIELD, so calling
+    // gpio_wakeup_enable(..., GPIO_INTR_LOW_LEVEL) here overwrote the
+    // GPIO_INTR_ANYEDGE configured by gpio_config() above. With WoM removed this
+    // button is the only manual way to wake the screen, and the result was a
+    // watch that could not be woken by hand at all.
+    //
+    // Light sleep is off by default (see main.c), so in the shipping build these
+    // calls bought nothing and cost the wake path.
+#ifdef RR_LIGHT_SLEEP
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_sleep_sel_dis(BOOT_GPIO));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_wakeup_enable(BOOT_GPIO, GPIO_INTR_LOW_LEVEL));
+    ESP_ERROR_CHECK_WITHOUT_ABORT(esp_sleep_enable_gpio_wakeup());
+    // Re-assert the edge config the ISR depends on: the call above shares the
+    // INT_TYPE field with it and would otherwise leave this pin level-triggered.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(gpio_set_intr_type(BOOT_GPIO, GPIO_INTR_ANYEDGE));
+#endif
+
     if (xTaskCreate(reset_button_task, "rr_reset_btn", 3072, NULL, 4, NULL) != pdPASS) {
         ESP_LOGE(TAG, "could not start the reset-button task");
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "local factory reset armed: hold BOOT (GPIO%d) for %d s",
+    ESP_LOGI(TAG, "local factory reset armed: hold BOOT (GPIO%d) for %d s "
+                  "(wakes the chip from light sleep)",
              BOOT_GPIO, HOLD_TO_RESET_MS / 1000);
     return ESP_OK;
 }

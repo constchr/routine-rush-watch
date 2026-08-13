@@ -3,16 +3,29 @@
 // The state machine is small on purpose:
 //
 //   AWAKE  --(no interaction for AWAKE_MS)-->  ASLEEP
-//   ASLEEP --(IMU wake-on-motion | touch | BOOT tap)-->  AWAKE
+//   ASLEEP --(short press on BOOT | a scheduled routine falling due)-->  AWAKE
 //
-// While ASLEEP the panel is dark and the IMU is armed to watch for movement on
-// its own hardware, so the CPU is not polling an accelerometer to find out
-// whether a wrist moved (§10 — polling would defeat the entire battery case).
+// ⚠️ THERE IS NO AUTOMATIC WAKE ANY MORE (Phase 10). Raise-to-wake was removed
+// by product decision: it kept the IMU switching between a motion-detect mode
+// and a sampling mode, and step counting — which needs one continuous sampling
+// mode all day — was the casualty. Waking is now an explicit act (the child
+// presses BOOT) or the watch's own decision (the scheduler says a routine is
+// due). See the note at the top of rr_imu.c for what actually broke and why the
+// first explanation for it was wrong.
 //
-// What is NOT here: CPU light-sleep and BLE duty-cycling. This turns the
-// display off, which is the dominant draw, but real power tuning is Phase 10.
-// Saying so plainly matters because "sleep" that only blanks a screen is easy
-// to mistake for a solved power story.
+// That second path is not a nicety, it is the product: a child must never have
+// to press anything to discover a routine has started. rr_sched calls
+// rr_idle_wake_manual() through a hook wired in main.c.
+//
+// While ASLEEP the panel is dark, touch is off, and the accelerometer keeps
+// sampling at 25 Hz so the daily step count stays real.
+//
+// Phase 10 added the other half. Blanking the panel was only ever the dominant
+// draw, not the only one: the CPU stayed at full tilt through every dark hour.
+// go_to_sleep() now also releases the no-light-sleep lock (rr_pm.h) so the chip
+// can actually sleep between wakes, and wake_up() takes it back before anything
+// touches the panel. The ordering of those two calls is load-bearing — see the
+// comments at each.
 
 #include "rr_idle.h"
 
@@ -28,6 +41,7 @@
 
 #include "rr_battery.h"
 #include "rr_imu.h"
+#include "rr_pm.h"
 #include "rr_rtc.h"
 #include "rr_steps.h"
 #include "rr_store.h"
@@ -35,21 +49,22 @@
 
 static const char *TAG = "rr_idle";
 
-// §9B.2: "render the watch face for ~5-8s -> fade back off". 8 s, because a
-// glance at a wrist is often interrupted and re-raising is annoying.
-#define AWAKE_MS 8000
-
-// QMI8658 wake-on-motion threshold, in MILLI-G. Lower = more sensitive.
+// §9B.2 says "render the watch face for ~5-8s -> fade back off", and this was
+// 8 s to match.
 //
-// Tuned on hardware: 8 mg (0.008 g) was so sensitive that desk vibration
-// through the USB cable re-woke the watch within a second of every sleep —
-// a wake loop, not a wake feature. 96 mg ignores ambient noise while still
-// catching a deliberate arm movement.
+// Raised to 30 s in Phase 10, because the cost of a short timeout changed when
+// raise-to-wake was removed. When a glance re-lit the screen for free, blanking
+// after 8 s was almost invisible; now the only way back is a deliberate button
+// press, so an early blank means the child has to press again to finish reading
+// what they were already looking at.
 //
-// This is the one number that still wants tuning on a REAL WRIST rather than a
-// bench: too low drains the battery in a pocket, too high misses a raise and
-// the child decides the watch is broken. Flagged for Phase 10.
-#define WOM_THRESHOLD 96
+// ⚠️ THIS IS THE DOMINANT SCREEN-ON POWER TERM. The AMOLED is the largest draw
+// on the device, so this number multiplies directly into battery life —
+// 30 s costs ~3.75x the panel-on time per wake that 8 s did. It is deliberately
+// a single constant for that reason: if runtime disappoints, this is the first
+// thing to trade back, and docs/POWER.md's idle-awake measurement is what tells
+// you how much it is worth.
+#define AWAKE_MS 30000
 
 // How long the "Paired ✓" confirmation holds before the face replaces it.
 // Long enough to read, short enough that the pairing flow ends on the face
@@ -183,10 +198,30 @@ static void go_to_sleep(void)
     // timer, which is a bigger change than this one.
     set_touch_enabled(false);
 
-    // Hand the watching over to the IMU's own hardware.
-    rr_imu_arm_wake_on_motion(WOM_THRESHOLD, rr_idle_notify_wake);
+    // ⚠️ NOTHING IS ARMED HERE ANY MORE. This used to hand the watching over to
+    // the IMU's wake-on-motion, and that is exactly what broke step counting:
+    // arming WoM freezes the QMI8658's output registers, so rr_steps spent every
+    // dark hour — most of the day — reading a constant and counting nothing.
+    //
+    // The accelerometer now keeps sampling straight through sleep, which is what
+    // makes the daily step count real. The screen is woken deliberately instead:
+    // a short press on BOOT, or the scheduler when a routine is due.
 
-    ESP_LOGI(TAG, "asleep — display off, IMU armed (heap %u)",
+    // ── Let the CPU sleep (Phase 10) ────────────────────────────────────────
+    //
+    // LAST, and deliberately so. Everything above this line touches the panel
+    // over QSPI or the touch controller over I2C, and light sleep stops the
+    // clocks those transfers ride on — the Phase 4b "went unresponsive"
+    // failure. Releasing the lock only once the display is dark and quiet means
+    // there is no window where a sleep can land mid-transfer.
+    //
+    // This is the change the whole phase is about: the screen is off for the
+    // vast majority of the day, and until now the CPU stayed at full tilt
+    // through all of it.
+    rr_pm_display_hold(false);
+
+    ESP_LOGI(TAG, "asleep — display off, touch off, accel still sampling "
+                  "(wake: BOOT press or a scheduled routine) — heap %u",
              (unsigned) esp_get_free_heap_size());
 }
 
@@ -196,12 +231,12 @@ static void wake_up(const char *reason)
     if (s_awake) return;
     s_awake = true;
 
-    set_touch_enabled(true);
+    // FIRST — before any panel or touch traffic. Symmetric with go_to_sleep()
+    // releasing it last: the lock brackets every transfer, so no QSPI or I2C
+    // transaction can be issued in a state where the clocks might stop under it.
+    rr_pm_display_hold(true);
 
-    // Disarm first: while awake we do not want a motion interrupt every time
-    // the child moves their arm, and Phase 9's pedometer wants the sensor in
-    // normal sampling mode anyway.
-    rr_imu_disarm_wake_on_motion();
+    set_touch_enabled(true);
 
     // Unpaired: there is no face to wake to. Put back exactly what was there —
     // the pairing QR — instead of inventing a face out of leftover cache.
@@ -209,12 +244,6 @@ static void wake_up(const char *reason)
     bsp_display_backlight_on();
 
     ESP_LOGI(TAG, "awake (%s) — heap %u", reason, (unsigned) esp_get_free_heap_size());
-}
-
-// Called from the IMU interrupt task, not an ISR.
-void rr_idle_notify_wake(void)
-{
-    wake_up("wrist raise");
 }
 
 void rr_idle_notify_activity(void)

@@ -33,6 +33,7 @@
 #include "rr_routine.h"
 #include "rr_imu.h"
 #include "rr_idle.h"
+#include "rr_pm.h"
 #include "rr_battery.h"
 #include "rr_rtc.h"
 #include "rr_ui.h"
@@ -162,35 +163,65 @@ void app_main(void)
     ESP_LOGI(TAG, "Routine Rush Watch — Phase 8 (voice prompts + audio policy)");
     ESP_LOGI(TAG, "ESP-IDF %s", esp_get_idf_version());
 
-    // ── Power management: DFS ON, automatic light sleep DELIBERATELY OFF ─────
+    // ── Power management: DFS ON, and light sleep ON as of Phase 10 ─────────
     //
-    // sdkconfig has had CONFIG_PM_ENABLE=y and tickless idle set since Phase 0,
-    // but esp_pm_configure() was never called — so none of it was live and the
-    // CPU ran flat out at 160 MHz forever. This turns on dynamic frequency
-    // scaling, which drops the CPU toward the XTAL rate whenever no driver holds
-    // a performance lock. IDF's own drivers take those locks, so this is safe
-    // with QSPI, I2C and I2S in use.
+    // Phase 8 turned DFS on and left light sleep off, for a reason that was
+    // correct at the time and has since been dealt with: the BLE controller
+    // would have had its clock stopped with nothing arranged to wake it. That
+    // needed CONFIG_BT_LE_SLEEP_ENABLE, which was thought impossible on this
+    // board for want of a 32.768 kHz crystal — GPIO0/GPIO1 are QSPI pins. It
+    // was not impossible; CONFIG_BT_LE_LP_CLK_SRC_MAIN_XTAL is IDF's answer for
+    // exactly that board. See rr_pm.h and sdkconfig.defaults.
     //
-    // light_sleep_enable stays FALSE, and that is a hardware conclusion rather
-    // than caution:
-    //   • CONFIG_BT_LE_SLEEP_ENABLE is not set, so the BLE controller holds the
-    //     main XTAL up. Automatic light sleep would therefore buy almost nothing
-    //     while advertising — which is always — and risks BLE timing.
-    //   • Enabling BLE sleep properly wants a 32.768 kHz low-power clock. This
-    //     board cannot give the SoC one: the ESP32-C6's XTAL_32K pins are
-    //     GPIO0/GPIO1, and here those are QSPI_SCL and QSPI_SIO0 for the display
-    //     (vendor pin audit). The 32 kHz crystal on the board belongs to the
-    //     PCF85063. Hence CONFIG_RTC_CLK_SRC_INT_RC.
-    // So light sleep is a separate, measured exercise with the BLE controller
-    // config in scope — not a flag to flip here.
-    const esp_pm_config_t pm = {
-        .max_freq_mhz = 160,
-        .min_freq_mhz = 40,          // the XTAL rate on this part
-        .light_sleep_enable = false,
-    };
-    esp_err_t pm_err = esp_pm_configure(&pm);
-    ESP_LOGI(TAG, "power management: DFS %d-%d MHz, light sleep off (%s)",
-             pm.min_freq_mhz, pm.max_freq_mhz, esp_err_to_name(pm_err));
+    // Everything about the decision now lives in rr_pm, because it is no longer
+    // a single call: it is a lock held while the panel is lit, GPIO wake sources
+    // registered for the IMU and the reset button, and — the part that was
+    // missing before — a way to MEASURE whether any of it worked.
+    //
+    // Called this early on purpose. The locks must exist before the display,
+    // BLE or any driver that takes one of its own, and the display lock is
+    // acquired inside rr_pm_init() because the screen is lit from boot.
+    //
+    // ⚠️ LIGHT SLEEP IS OPT-IN AND CURRENTLY OFF BY DEFAULT — build with
+    //     idf.py -DRR_LIGHT_SLEEP=1 build
+    // to turn it on. This is NOT caution left over from Phase 8; it is a
+    // measured, reproduced fault, and the flag exists so the remaining work can
+    // be done without shipping a watch that misses alarms in the meantime.
+    //
+    // WHAT HAPPENS WITH IT ON, on hardware, at 5+ minutes of uptime:
+    //   E task_wdt: Task watchdog got triggered ... IDLE (CPU 0)
+    //   E task_wdt: Tasks currently running: CPU 0: esp_timer
+    // repeating every 5 s, WITH THE 30 s HEARTBEAT ABSENT ENTIRELY — so the
+    // main task is being starved too, not just the idle task.
+    //
+    // WHY. Automatic light sleep costs a fixed entry/exit overhead each time.
+    // LVGL drives its tick from an esp_timer with a period of the same order
+    // (single-digit milliseconds), and that timer runs whether or not anything
+    // is on screen. So the scheduler thrashes: sleep, wake on the tick almost
+    // immediately, sleep again — never completing an idle pass. `ls` stuck at 1
+    // with `slp 0%` is the same story from the other side: it entered light
+    // sleep and got essentially no sleep out of it.
+    //
+    // THE FIX, NOT YET DONE: stop LVGL's tick and refresh timers while the panel
+    // is dark (they have nothing to drive) and restore them in wake_up(), so the
+    // idle period between step samples is tens of milliseconds rather than two.
+    // That is display surgery, and the Phase 4b "went unresponsive" incident is
+    // exactly what happens when it is done carelessly — hence a flag rather than
+    // a rushed change.
+    //
+    // EVERYTHING ELSE FROM PHASE 10 STAYS ON and is independently useful: the
+    // I2S locks are released (rr_audio), advertising is at 852.5 ms, the
+    // wrist-raise gate is live, and the PM locks and telemetry are in place and
+    // correct — the lock dump with light sleep enabled showed every
+    // sleep-blocking lock at Active 0, which is what makes the LVGL tick the
+    // remaining obstacle rather than one of several.
+#ifdef RR_LIGHT_SLEEP
+    ESP_ERROR_CHECK_WITHOUT_ABORT(rr_pm_init(true));
+    ESP_LOGW(TAG, "⚠ light sleep ENABLED by RR_LIGHT_SLEEP — expect IDLE task "
+                  "watchdog warnings until the LVGL tick is gated on the panel");
+#else
+    ESP_ERROR_CHECK_WITHOUT_ABORT(rr_pm_init(false));
+#endif
 
     // NVS first — app_main owns the NVS lifecycle for the whole firmware.
     //
@@ -352,6 +383,34 @@ void app_main(void)
     // showing "—" rather than a confident zero.
     ESP_ERROR_CHECK_WITHOUT_ABORT(rr_steps_init());
 
+#ifdef RR_PED_SELFTEST
+    // ⚠️ RE-PROVING THE ON-CHIP STEP ENGINE. Build with:
+    //     idf.py -DRR_PED_SELFTEST=1 build
+    //
+    // Phase 9 established that the QMI8658's embedded pedometer is INERT on this
+    // part (rr_imu.h carries the evidence), and everything since has rested on
+    // that finding. It is worth being able to re-run the experiment in one
+    // command rather than re-deriving it, because the whole step-counting power
+    // story depends on it: an on-chip engine counts with the CPU asleep and is
+    // nearly free, while the software detector this board actually uses costs a
+    // 25 Hz wake forever.
+    //
+    // The test reports the accelerometer alongside the counter, so "the engine
+    // is dead" and "nobody moved the watch" cannot be confused — which is the
+    // mistake that cost three inconclusive rounds the first time.
+    ESP_LOGW(TAG, "╔══ PEDOMETER SELFTEST BUILD — WALK WITH THE WATCH NOW ══");
+    if (rr_imu_pedometer_enable() == ESP_OK) {
+        rr_imu_pedometer_selftest(30);
+        rr_imu_pedometer_disable();
+    } else {
+        ESP_LOGE(TAG, "on-chip pedometer would not even enable");
+    }
+    // Put the accelerometer back where the software detector needs it: the
+    // selftest and the enable path both move range and ODR.
+    rr_imu_step_sampling_hold(true);
+    ESP_LOGW(TAG, "╚══ selftest done — software detector resumes ══════════");
+#endif
+
 
     ESP_ERROR_CHECK_WITHOUT_ABORT(rr_idle_init());
 
@@ -360,6 +419,25 @@ void app_main(void)
     // vibration motor exists on this board, §2), so a scheduler started before
     // the codec could fire its first alarm silently.
     ESP_ERROR_CHECK_WITHOUT_ABORT(rr_audio_init());
+
+#ifdef RR_AUDIO_BOOT_TEST
+    // ⚠️ VERIFYING THE PHASE 10 I2S REWRITE. Build with:
+    //     idf.py -DRR_AUDIO_BOOT_TEST=1 build
+    //
+    // rr_audio now brings up I2S itself instead of calling bsp_audio_init(),
+    // because the BSP left both channels enabled and that held the PM locks that
+    // made light sleep impossible (see rr_audio.c). The whole point of the
+    // rewrite is that playback is UNCHANGED — but "the codec initialised without
+    // returning an error" is not evidence of that, and the failure mode is a
+    // watch whose alarm is silent. There is no vibration motor (§2), so a silent
+    // alarm is a routine that simply never happens.
+    //
+    // So: make a noise at boot and let a human confirm it. This is deliberately
+    // a build flag rather than default behaviour — a watch that chirps every
+    // time it reboots would be its own bug.
+    ESP_LOGW(TAG, "╔══ AUDIO BOOT TEST — YOU SHOULD HEAR A TONE NOW ══");
+    rr_audio_play_tone(RR_TONE_ROUTINE_COMPLETE);
+#endif
 
     // Same two hooks rr_routine already uses, and for the same reason: rr_power
     // depends on rr_ble, which depends on rr_sched, so the arrows only point
@@ -375,6 +453,7 @@ void app_main(void)
     rr_powerlog_start(60);
 #endif
 
+    int beats = 0;
     while (1) {
         // 30 s, not 5. Each tick reads the RTC over I2C, LINE-SCANS runs.log for
         // the queue depth, and writes a console line — cheap individually, but it
@@ -391,30 +470,45 @@ void app_main(void)
             if (rr_rtc_has_utc_offset() && rr_rtc_get_local(&local) == ESP_OK) {
                 rr_rtc_format(&local, lbuf, sizeof(lbuf));
             }
-            // The live PM config rides the heartbeat, not just the boot banner.
+            // The live PM state rides the heartbeat, not just the boot banner.
             // Boot lines are unrecoverable over USB-Serial-JTAG (resetting the
             // chip tears down the CDC, so the first second is lost), and
             // docs/POWER.md's before/after procedure depends on knowing whether
             // DFS and light sleep were actually in force for a given capture.
-            esp_pm_config_t pmc = { 0 };
-            const char *pm_desc = "pm?";
-            char pm_buf[40];
-            if (esp_pm_get_configuration(&pmc) == ESP_OK) {
-                snprintf(pm_buf, sizeof(pm_buf), "%d-%dMHz ls=%d",
-                         pmc.min_freq_mhz, pmc.max_freq_mhz, (int) pmc.light_sleep_enable);
-                pm_desc = pm_buf;
-            }
+            //
+            // ⚠️ THIS USED TO PRINT esp_pm_get_configuration()'s light_sleep_
+            // enable FLAG, as "ls=0". That is the value we ourselves passed in
+            // — it could never have been anything else, so it looked like
+            // evidence while carrying none, and it was duly read as "light
+            // sleep is not engaging" when all it said was "we did not ask for
+            // it". rr_pm_describe() reports MEASURED sleeps and the share of
+            // wall-clock spent in them, so a lock left held by mistake shows up
+            // as a number that stops moving instead of a flag that still says 1.
+            char pm_buf[48];
+            rr_pm_describe(pm_buf, sizeof(pm_buf));
+
+            // Proof the step detector is being fed live data. See
+            // rr_steps_describe_input() — "steps unchanged" alone cannot tell a
+            // frozen sensor from a watch nobody moved, and that ambiguity hid a
+            // completely broken step counter for two phases.
+            char accel_buf[80];
+            rr_steps_describe_input(accel_buf, sizeof(accel_buf));
 
             ESP_LOGI(TAG, "UTC %s | local %s | ble=%s | routine=%s | screen=%s | queued=%d "
-                          "| steps %" PRIu32 "%s | %s | heap %u",
+                          "| steps %" PRIu32 "%s | %s | %s | heap %u",
                      tbuf, lbuf,
                      rr_ble_is_connected() ? "CONNECTED" : "advertising",
                      rr_routine_is_active() ? "RUNNING" : "idle",
                      rr_idle_is_awake() ? "awake" : "asleep",
                      rr_queue_count(),
                      rr_steps_today(), rr_steps_valid() ? "" : "(invalid)",
-                     pm_desc,
+                     pm_buf, accel_buf,
                      (unsigned) esp_get_free_heap_size());
+
+            // Once, on the second beat — by then the screen has slept and the
+            // steady-state set of lock holders is what it will be all night. If
+            // `slp` is stuck at 0%, this is the line that says who to blame.
+            if (++beats == 2) rr_pm_dump_locks();
         }
     }
 }

@@ -51,8 +51,23 @@
 // Nothing here touches BLE or the completion queue.
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include "esp_err.h"
+
+/**
+ * One line describing the detector's INPUT, for the heartbeat:
+ * "accel 1.00g sprd 0.004 n=750".
+ *
+ * ⚠️ The SPREAD is the point, not the magnitude. A live accelerometer at rest
+ * still jitters by a few mg; a frozen one reports an identical value forever, so
+ * a spread of zero is flagged FROZEN. Without this, "steps unchanged" is
+ * ambiguous between a dead sensor and a stationary watch — which is precisely
+ * the ambiguity that hid a broken step counter from Phase 9 to Phase 10.
+ *
+ * Resets its window on each call, so it describes the interval since last asked.
+ */
+void rr_steps_describe_input(char *buf, size_t len);
 
 /**
  * Accelerometer sample rate for the detector, in Hz.
