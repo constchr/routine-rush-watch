@@ -32,6 +32,7 @@
 #include "cJSON.h"
 
 #include "ble_contract.h"
+#include "rr_battery.h"
 #include "rr_rtc.h"
 #include "rr_identity.h"
 #include "rr_store.h"
@@ -277,14 +278,29 @@ static int queue_status_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
     if (!conn_is_authorised(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
 
+    // The AXP2101 gauge has existed since Phase 10; this field went on reporting
+    // the placeholder 0 long after it stopped being honest — the phone logged
+    // "batt 0%" from a watch whose own log said 100%. rr_battery lives below
+    // rr_ble precisely so this can be a live read (see its CMakeLists).
+    //
+    // 0 is still what goes out when there is no gauge to ask: the contract has no
+    // "unknown" encoding, and inventing one here would need a contract change.
+    uint8_t batt = 0;
+    rr_battery_t b;
+    if (rr_battery_read(&b) == ESP_OK && b.valid) {
+        batt = b.percent;
+    } else if (rr_battery_is_ready()) {
+        ESP_LOGW(TAG, "QUEUE_STATUS: gauge is present but the read failed; reporting 0%%");
+    }
+
     rr_queue_status_t st = {
         .queued_count = (uint16_t) rr_queue_count(),
         .oldest_ts = rr_queue_oldest_ts(),
         .fw_version = RR_FW_VERSION,
-        .batt = 0,   // AXP2101 wiring is Phase 10; 0 is honest, not a guess
+        .batt = batt,
     };
-    ESP_LOGI(TAG, "QUEUE_STATUS read: %u queued, oldest_ts=%" PRIu32,
-             (unsigned) st.queued_count, st.oldest_ts);
+    ESP_LOGI(TAG, "QUEUE_STATUS read: %u queued, oldest_ts=%" PRIu32 ", batt %u%%",
+             (unsigned) st.queued_count, st.oldest_ts, (unsigned) st.batt);
 
     return os_mbuf_append(ctxt->om, &st, sizeof(st)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
