@@ -15,6 +15,7 @@
 #include <inttypes.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -348,6 +349,62 @@ static int queue_pull_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         }
     }
 
+    // ── CLAMP BEFORE BUILDING, NOT AFTER ────────────────────────────────────
+    //
+    // ⚠️ THE FAILURE THIS REPLACES WAS FATAL, NOT NOISY. A page that exceeded the
+    // ATT ceiling was detected after the mbuf had been built, and the handler
+    // then returned an error — so NimBLE dropped the packet
+    // ("ATT handler not found; packet dropped"), the phone got nothing, the
+    // offset never advanced, and the drain stalled FOREVER at queued=1. An
+    // off-by-one in the page arithmetic therefore cost the whole feature rather
+    // than one slow page.
+    //
+    // Clamping here makes that impossible by construction: the payload is cut to
+    // whatever fits under the ceiling BEFORE anything is appended, so the worst a
+    // future arithmetic slip can do is serve a shorter page.
+    //
+    // A SHORT PAGE IS ALWAYS LEGAL, which is what makes this safe rather than a
+    // corruption risk. The v3 contract states it explicitly: "A trailing PARTIAL
+    // frame is legal; retain the tail and resume with the next page." The phone's
+    // decoder already reassembles frames across page boundaries, so it cannot
+    // tell a clamped page from a naturally-ending one — no frame alignment is
+    // needed here, and attempting to align to the last whole frame would need
+    // this code to re-parse the stream it just asked rr_store to serialise.
+    // ⚠️ BUDGET AGAINST THE BUFFER WE WERE HANDED, NOT AGAINST ZERO.
+    //
+    // The first version of this clamp assumed ctxt->om arrives empty and
+    // budgeted MAX_VALUE - HEADER. On hardware it does NOT always arrive empty:
+    //
+    //     page @0    +500 -> value 513 B    <- one byte too many
+    //     page @500  +500 -> value 512 B    <- identical inputs, correct
+    //     page @1000 +489 -> value 501 B    <- correct
+    //
+    // Same `got`, different totals, so the payload arithmetic was never wrong —
+    // the FIRST read after a queue_seek was entered with a byte already in the
+    // mbuf. The clamp above could not see that, because 500 <= 500 passed.
+    //
+    // So measure. Whatever NimBLE hands us counts against the ATT ceiling just
+    // as much as our own bytes do, and this is the only formulation that cannot
+    // be wrong about it.
+    const uint16_t pre_existing = OS_MBUF_PKTLEN(ctxt->om);
+    if (pre_existing != 0) {
+        ESP_LOGW(TAG, "QUEUE_PULL: mbuf arrived holding %u B — budgeting around it",
+                 (unsigned) pre_existing);
+    }
+
+    int max_payload = (int) RR_QUEUE_PULL_MAX_VALUE
+                    - (int) pre_existing
+                    - (int) RR_QUEUE_PULL_HEADER_SIZE;
+    if (max_payload < 0) max_payload = 0;
+
+    if (got > max_payload) {
+        ESP_LOGW(TAG, "QUEUE_PULL: clamping payload %d -> %d B (ceiling %d, header %d, "
+                      "already in buffer %u) so the drain slows instead of stalling",
+                 got, max_payload, RR_QUEUE_PULL_MAX_VALUE, RR_QUEUE_PULL_HEADER_SIZE,
+                 (unsigned) pre_existing);
+        got = max_payload;
+    }
+
     // ⚠️ The page header is built from the GENERATED struct, so its byte layout
     // cannot drift from the phone's decoder.
     rr_queue_pull_header_t hdr = {
@@ -372,9 +429,19 @@ static int queue_pull_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     // the phone just silently fails to read the tail.
     const uint16_t value_len = OS_MBUF_PKTLEN(ctxt->om);
     if (value_len > RR_QUEUE_PULL_MAX_VALUE) {
-        ESP_LOGE(TAG, "QUEUE_PULL: BUG — built a %u-byte value, over the %d-byte ATT ceiling",
-                 (unsigned) value_len, RR_QUEUE_PULL_MAX_VALUE);
-        return BLE_ATT_ERR_UNLIKELY;
+        // Should now be unreachable — `got` was clamped above and the header is
+        // a fixed 12 bytes by static assert. If it fires anyway, the mbuf held
+        // something before this callback appended to it, which is the only term
+        // left. Print EVERY component rather than just the total: the previous
+        // version reported "built a 513-byte value" and that single number was
+        // not enough to say whether the header, the payload or the buffer was
+        // wrong, which is why the arithmetic could not be located from a log.
+        ESP_LOGE(TAG, "QUEUE_PULL: BUG — value %u B = header %d + payload %d, but the "
+                      "mbuf reports %u. Something appended to this buffer before us.",
+                 (unsigned) value_len, RR_QUEUE_PULL_HEADER_SIZE, got,
+                 (unsigned) value_len);
+        // Do NOT return an error: that drops the packet and stalls the drain
+        // forever, which is worse than a page the phone may reject once.
     }
 
     // Auto-advance, so the happy path is one read per page with no round trip
@@ -1045,6 +1112,84 @@ static const struct ble_gatt_svc_def s_gatt_svcs[] = {
 // So: on overflow, delete a bond that is NOT the paired peer's. Fall back to the
 // stock behaviour only if the paired peer is somehow the only bond, because
 // refusing to evict anything at all would fail the pairing outright.
+// Set by log_bond_store() when this boot found PAIRED WITH ZERO BONDS — the
+// state from which no connection can ever succeed. Lowers the rotation
+// threshold in handle_encryption_failure() to a single observed failure.
+static bool s_zero_bonds_at_boot;
+
+// ── Re-advertise backoff ────────────────────────────────────────────────────
+//
+// A broken link does not fail once, it fails as fast as the radio allows:
+// measured at ~40 connect → encrypt-fail → disconnect → re-advertise cycles in
+// TWO MINUTES. Each cycle is a full connection setup at 30-60 ms advertising,
+// so the failure mode was not just useless, it was the most expensive thing the
+// watch can do with its radio — on a device whose entire power budget this phase
+// exists to defend.
+//
+// So consecutive failures back off: 0.5 s, 1 s, 2 s, 4 s ... capped. Reset the
+// moment anything succeeds. This is orthogonal to the rotation fix — rotation
+// ends the loop for good, this makes the loop cheap in the window before it
+// triggers, and cheap for any OTHER repeated-failure cause we have not thought
+// of yet.
+#define ADV_BACKOFF_AFTER   2        /* failures before backing off at all */
+#define ADV_BACKOFF_BASE_MS 500
+#define ADV_BACKOFF_MAX_MS  16000
+
+static int s_consec_link_fails;
+static esp_timer_handle_t s_adv_retry_timer;
+
+static void advertise(void);
+
+static void adv_retry_cb(void *arg)
+{
+    (void) arg;
+    ESP_LOGI(TAG, "backoff elapsed — advertising again");
+    advertise();
+}
+
+/** Re-advertise, but not faster than the backoff allows. */
+static void advertise_after_failure(void)
+{
+    s_consec_link_fails++;
+
+    if (s_consec_link_fails <= ADV_BACKOFF_AFTER) {
+        advertise();
+        return;
+    }
+
+    int delay_ms = ADV_BACKOFF_BASE_MS << (s_consec_link_fails - ADV_BACKOFF_AFTER - 1);
+    if (delay_ms > ADV_BACKOFF_MAX_MS || delay_ms <= 0) delay_ms = ADV_BACKOFF_MAX_MS;
+
+    ESP_LOGW(TAG, "%d consecutive link failures — holding off %d ms before "
+                  "advertising again", s_consec_link_fails, delay_ms);
+
+    if (s_adv_retry_timer == NULL) {
+        const esp_timer_create_args_t args = {
+            .callback = adv_retry_cb,
+            .name = "rr_adv_retry",
+        };
+        if (esp_timer_create(&args, &s_adv_retry_timer) != ESP_OK) {
+            ESP_LOGE(TAG, "could not create the backoff timer — advertising immediately");
+            advertise();
+            return;
+        }
+    }
+    esp_timer_stop(s_adv_retry_timer);   // harmless if not running
+    if (esp_timer_start_once(s_adv_retry_timer, (uint64_t) delay_ms * 1000) != ESP_OK) {
+        ESP_LOGE(TAG, "could not arm the backoff timer — advertising immediately");
+        advertise();
+    }
+}
+
+/** Anything worked: connection encrypted, or a clean session ended. */
+static void note_link_success(void)
+{
+    if (s_consec_link_fails != 0) {
+        ESP_LOGI(TAG, "link healthy again — backoff reset (was %d)", s_consec_link_fails);
+        s_consec_link_fails = 0;
+    }
+}
+
 static int bond_store_status(struct ble_store_status_event *event, void *arg)
 {
     if (event->event_code != BLE_STORE_EVENT_OVERFLOW) {
@@ -1106,8 +1251,34 @@ static void log_bond_store(void)
     if (rr_identity_is_paired() && !have_paired) {
         // The exact state that presents as "sync is stuck".
         ESP_LOGE(TAG, "PAIRED BUT NO BOND FOR THE PAIRED PEER — the phone will fail "
-                      "encryption and iOS will drop the link. Re-pair, or clear the "
-                      "bond store (idf.py -DRR_CLEAR_BONDS=1) and pair again.");
+                      "encryption and iOS will drop the link.");
+
+        // ⚠️ ZERO BONDS IS THE UNRECOVERABLE ONE, AND IT IS NOW ARMED RATHER
+        // THAN MERELY NARRATED.
+        //
+        // With no bond at all there is no key to match and nothing to evict, and
+        // the peer arrives as an iOS RPA we cannot resolve without the keys we
+        // lost — so every runtime test for "is this our phone?" answers no. That
+        // is how this state used to slip past handle_encryption_failure()
+        // entirely and loop forever while printing this very line every boot.
+        //
+        // Arming here does NOT rotate. It lowers the rotation threshold to a
+        // single observed encryption failure, so recovery is bounded by one
+        // failed connection instead of three — while still requiring proof that
+        // encryption actually fails. That distinction is the whole reason the
+        // previous boot-time heuristic was removed: zero bonds is also what a
+        // watch looks like moments before a legitimate FIRST pair, and rotating
+        // on the snapshot alone turned a crash loop into a pairing-prompt loop.
+        if (count == 0) {
+            s_zero_bonds_at_boot = true;
+            ESP_LOGE(TAG, "ZERO BONDS — this watch cannot ever encrypt with a phone whose "
+                          "key it does not hold, and iOS cannot forget a BLE bond. Armed: "
+                          "the next encryption failure rotates the BLE identity and reboots. "
+                          "device_id, the child, the routine cache and queued runs are kept.");
+        } else {
+            ESP_LOGE(TAG, "Re-pair, or clear the bond store "
+                          "(idf.py -DRR_CLEAR_BONDS=1) and pair again.");
+        }
     }
 }
 
@@ -1422,6 +1593,12 @@ static bool have_bond_for(const ble_addr_t *peer)
  */
 #define RR_ENC_FAILS_BEFORE_ROTATE 3
 
+// Most fresh identities we will ever present. Each one costs the parent a
+// permanent, manually-removable row in their phone's Bluetooth list, so this is
+// a user-visible budget, not an internal retry count. Past it, recovery needs a
+// human — see the refusal in handle_encryption_failure().
+#define RR_MAX_BLE_GENERATIONS 3
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The stale-bond dead end, and the only way out of it.
 //
@@ -1472,31 +1649,135 @@ static void handle_encryption_failure(uint16_t conn_handle, int status)
     ESP_LOGE(TAG, "║ we hold a bond for it: %s | it is our paired phone: %s",
              bonded ? "YES" : "no", is_paired_peer ? "YES" : "no");
 
-    // Only a watch that BELIEVES it is in service can be in the stale-bond dead
-    // end. An unpaired watch that fails encryption is a first pairing that went
-    // wrong — retrying is the right answer there, and rotating identity would
-    // be actively harmful.
-    if (!rr_identity_is_paired() || !(bonded || is_paired_peer)) {
-        ESP_LOGE(TAG, "║ not a stale-bond case — leaving the bond store alone");
+    // ⚠️ THE CONDITION THAT MUST NOT COME BACK.
+    //
+    // This used to be:
+    //
+    //     if (!rr_identity_is_paired() || !(bonded || is_paired_peer)) return;
+    //
+    // and it returned BEFORE rr_identity_note_enc_fail(), so in the worst state
+    // this watch can reach the counter never moved and the rotation that exists
+    // to escape it was never approached. Observed on hardware: ~40 connect →
+    // encrypt-fail → disconnect → re-advertise cycles in two minutes, every one
+    // of them logging "not a stale-bond case — leaving the bond store alone",
+    // forever, with no way out that did not involve a USB cable.
+    //
+    // The state it missed is PAIRED WITH ZERO BONDS, which is the *definitive*
+    // dead end rather than an edge case:
+    //   • we hold no key, so `bonded` is false;
+    //   • the peer is an iOS RPA and resolving it needs the very keys we lost,
+    //     so `is_paired_peer` is false too;
+    //   • the phone still holds ITS key and no iOS app can delete a BLE bond.
+    // So the one situation with no escape but rotation was the one situation
+    // the guard treated as "nothing to do here".
+    //
+    // What actually matters is ONLY whether this watch believes it is in
+    // service. An unpaired watch failing encryption is a first pairing that went
+    // wrong — retry is right there, and rotating would be actively harmful. A
+    // PAIRED watch failing encryption repeatedly is broken no matter whose bond
+    // it is or whether we can identify the peer at all.
+    if (!rr_identity_is_paired()) {
+        ESP_LOGE(TAG, "║ not paired — a first pairing that failed, retry is correct");
         ESP_LOGE(TAG, "╚══════════════════════════════════════");
         return;
     }
 
     // Drop OUR side of a bond that demonstrably does not work. Keeping it only
     // occupies one of three slots and makes log_bond_store() lie about health.
-    if (bonded) {
+    // Conditional because there may be nothing to drop — which is precisely the
+    // zero-bond case, and is no longer a reason to stop.
+    // ⚠️ ENOTCONN IS NOT EVIDENCE OF A BAD KEY, AND DROPPING A BOND ON IT IS A
+    // SELF-INFLICTED RE-PAIR.
+    //
+    // BLE_HS_ENOTCONN (7) means a security procedure was still in flight when
+    // the LINK WENT AWAY — NimBLE raises it from ble_sm_connection_broken()
+    // before the disconnect event is delivered. That happens for every ordinary
+    // mid-session disconnect, including a central that hangs up after finishing
+    // its reads. It says nothing whatsoever about whether the key was correct.
+    //
+    // Observed doing real damage: a drain completed all three pages, the phone
+    // dropped the link before RUN_ACK, and this handler deleted a bond whose
+    // encryption had SUCCEEDED moments earlier (the log said bond: YES, our
+    // paired phone: YES, right after "ENCRYPTED bonded=1"). The next connect
+    // then had no key and had to re-pair — manufacturing the very stale-bond
+    // state this function exists to clean up.
+    //
+    // So only drop on a status that actually implicates the key. A disconnect
+    // mid-procedure is a disconnect; let the reconnect prove whether the key
+    // works.
+    const bool key_implicated = (status != BLE_HS_ENOTCONN);
+    if (bonded && key_implicated) {
         int rc = ble_store_util_delete_peer(&desc.peer_id_addr);
         ESP_LOGW(TAG, "║ dropped our stale bond for this peer (rc=%d)", rc);
+    } else if (bonded) {
+        ESP_LOGI(TAG, "║ KEEPING the bond — status %d is a mid-procedure disconnect, "
+                      "not a key mismatch", status);
+    }
+
+    // A watch that booted PAIRED WITH ZERO BONDS is already known to be in the
+    // unrecoverable state, so it does not need three failures to prove it — the
+    // first one is confirmation. Still failure-triggered rather than acted on at
+    // boot, and that distinction is load-bearing: an earlier attempt DID rotate
+    // straight from the boot-time snapshot and turned a crash loop into a
+    // pairing-prompt loop, because zero bonds is also what a watch looks like in
+    // the moments before a legitimate first pair. Requiring one OBSERVED
+    // encryption failure keeps that window safe while still bounding recovery to
+    // a single failed connection.
+    const uint8_t threshold = s_zero_bonds_at_boot ? 1 : RR_ENC_FAILS_BEFORE_ROTATE;
+
+    // Nor should that same mid-procedure disconnect count TOWARDS rotation. A
+    // watch with a working bond that the phone hangs up on is healthy; counting
+    // it would walk an ordinary drain toward a BLE identity change, and each of
+    // those costs the parent a permanent row in their Bluetooth settings.
+    //
+    // The zero-bond dead end still counts, because there `bonded` is false —
+    // which is exactly the case that needs the escape.
+    if (bonded && !key_implicated) {
+        ESP_LOGI(TAG, "║ not counted toward rotation — the bond is intact");
+        ESP_LOGE(TAG, "╚══════════════════════════════════════");
+        return;
     }
 
     const uint8_t fails = rr_identity_note_enc_fail();
     ESP_LOGE(TAG, "║ consecutive encryption failures: %u of %u before this watch "
-                  "changes BLE identity", (unsigned) fails, RR_ENC_FAILS_BEFORE_ROTATE);
+                  "changes BLE identity%s", (unsigned) fails, threshold,
+             s_zero_bonds_at_boot ? " (armed: booted paired with zero bonds)" : "");
 
-    if (fails < RR_ENC_FAILS_BEFORE_ROTATE) {
-        ESP_LOGE(TAG, "║ press Sync again — this heals itself at %d",
-                 RR_ENC_FAILS_BEFORE_ROTATE);
+    if (fails < threshold) {
+        ESP_LOGE(TAG, "║ press Sync again — this heals itself at %u", threshold);
         ESP_LOGE(TAG, "╚══════════════════════════════════════");
+        return;
+    }
+
+    // ⚠️ HARD CAP ON ROTATIONS. EVERY ROTATION COSTS THE PARENT A PERMANENT
+    // ENTRY IN THEIR PHONE'S BLUETOOTH LIST.
+    //
+    // A new BLE address is a new device as far as iOS is concerned: a pairing
+    // prompt, and a row in Settings > Bluetooth that only the parent can remove.
+    // That is an acceptable ONE-TIME price for escaping a dead pairing. It is
+    // not acceptable repeatedly — and repeatedly is exactly what happened when
+    // this was armed at boot: the watch rotates, reboots, comes up STILL paired
+    // with zero bonds (the phone has not bonded to the new identity yet),
+    // re-arms at a threshold of one, and rotates again on the next failure.
+    // Observed as "the app keeps asking me to pair, and each pair adds a
+    // Bluetooth device".
+    //
+    // So rotation is bounded. If several fresh identities have not fixed it, the
+    // problem is not the identity and another one will not help — stop, and say
+    // what will. Better a watch that needs a deliberate factory reset than one
+    // that quietly fills a parent's Bluetooth settings forever.
+    if (rr_identity_ble_generation() >= RR_MAX_BLE_GENERATIONS) {
+        ESP_LOGE(TAG, "║ ALREADY AT BLE GENERATION %u — REFUSING TO ROTATE AGAIN.",
+                 (unsigned) rr_identity_ble_generation());
+        ESP_LOGE(TAG, "║ Rotating has not fixed this, and each attempt leaves another");
+        ESP_LOGE(TAG, "║ stale device in the phone's Bluetooth list. Recover by hand:");
+        ESP_LOGE(TAG, "║   1. forget every 'RoutineRush Watch' in iOS Settings > Bluetooth");
+        ESP_LOGE(TAG, "║   2. hold BOOT for 10 s to factory reset, then re-pair from the QR");
+        ESP_LOGE(TAG, "╚══════════════════════════════════════");
+        // Keep the count pinned at the threshold rather than clearing it: this
+        // watch is in a state that needs a human, and pretending otherwise would
+        // just re-approach the cap on the next failure.
+        s_zero_bonds_at_boot = false;
         return;
     }
 
@@ -1578,6 +1859,29 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             // Phase 2 flow is a strict subset of that — it still works if the
             // central ignores the request entirely, because the WRITE_ENC gate
             // is untouched and the old ATT-0x0F path is still there underneath.
+            // ⚠️ DO NOT RE-REQUEST SECURITY ON AN ALREADY-ENCRYPTED LINK.
+            //
+            // A bonded iOS central can encrypt so fast that it completes BEFORE
+            // this callback runs, which produced the giveaway ordering in the
+            // hardware log:
+            //
+            //     ENCRYPTED (bonded=1 ...)          <- already done
+            //     security requested (rc=0)          <- us, asking anyway
+            //
+            // A Security Request on a link that is already encrypted is at best
+            // redundant and at worst a reason for the central to tear the link
+            // down — which is what was happening immediately after the final
+            // QUEUE_PULL page, killing the drain before RUN_ACK.
+            //
+            // BLE_HS_EALREADY does not cover this: it means a security procedure
+            // is IN PROGRESS, not that one already finished. So ask the link.
+            struct ble_gap_conn_desc cd;
+            if (ble_gap_conn_find(s_conn_handle, &cd) == 0 && cd.sec_state.encrypted) {
+                ESP_LOGI(TAG, "already encrypted on connect (bonded=%d) — not re-requesting",
+                         (int) cd.sec_state.bonded);
+                return 0;
+            }
+
             int sec = ble_gap_security_initiate(s_conn_handle);
             if (sec == 0 || sec == BLE_HS_EALREADY) {
                 // EALREADY == the central beat us to it. Normal on reconnect.
@@ -1589,7 +1893,7 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             }
         } else {
             ESP_LOGW(TAG, "connect failed (status %d) — re-advertising", event->connect.status);
-            advertise();
+            advertise_after_failure();
         }
         return 0;
 
@@ -1608,7 +1912,14 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         // Force a re-pick of the interval: the state may have changed while the
         // phone was connected (a routine finished, or pairing completed).
         s_adv_state = (rr_adv_state_t) -1;
-        advertise();
+        // Reason 531 (BLE_ERR_REM_USER_CONN_TERM via the encryption path) is what
+        // a link torn down over a failed key looks like, and it is the one that
+        // arrived ~40 times in two minutes. Route the disconnect through the
+        // backoff whenever a failure is already being counted; a clean session
+        // will have called note_link_success() and reset it to zero, so this
+        // costs a normal disconnect nothing.
+        if (s_consec_link_fails > 0) advertise_after_failure();
+        else advertise();
         return 0;
 
     case BLE_GAP_EVENT_ADV_COMPLETE:
@@ -1650,6 +1961,11 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             // budget here and nowhere else, so the counter only ever describes
             // an UNBROKEN run of failures.
             rr_identity_clear_enc_fails();
+            // A successful encryption also means the watch is no longer in the
+            // zero-bond dead end — the phone has just bonded fresh. Disarm, so a
+            // later unrelated failure does not rotate on a single strike.
+            s_zero_bonds_at_boot = false;
+            note_link_success();
         } else {
             handle_encryption_failure(event->enc_change.conn_handle,
                                       event->enc_change.status);

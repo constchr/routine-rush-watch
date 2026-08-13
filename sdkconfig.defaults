@@ -72,6 +72,33 @@ CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
 CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
 
 # ═════════════════════════════════════════════════════════════════════════════
+# ⚠️ BONDS MUST SURVIVE A REBOOT. THIS IS NOT OPTIONAL ON A BONDED PERIPHERAL.
+#
+# Without NVS_PERSIST, NimBLE keeps bonds in RAM ONLY. Everything looks correct
+# for exactly as long as the watch stays powered: pairing succeeds, the link
+# encrypts, a sync completes. Then it reboots and comes up with ZERO BONDS —
+# while the phone still holds its LTK, because an iOS app cannot delete a BLE
+# bond.
+#
+# From there the watch is permanently broken and cannot fix itself:
+#   • every reconnect fails encryption (enc_change status 7)
+#   • iOS terminates the link (reason 531)
+#   • the drain never runs, so completed runs are never uploaded
+#   • the app re-prompts to pair, and each fresh BLE identity the watch rotates
+#     to leaves ANOTHER stale row in the parent's Bluetooth settings
+#
+# Every one of those was observed on hardware and misdiagnosed as a separate
+# bug — a stale-bond handler, an encryption-failure counter, a BLE-identity
+# rotation, an off-by-one in QUEUE_PULL paging. They were all one missing flag.
+#
+# THE LESSON: "bond store: 0/3 slot(s) used" after a reboot is not a symptom to
+# handle, it is a configuration error. A bonded peripheral that cannot remember
+# a bond has no working state to recover to, and no amount of runtime recovery
+# logic substitutes for persisting the key.
+# ═════════════════════════════════════════════════════════════════════════════
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+
+# ═════════════════════════════════════════════════════════════════════════════
 # LVGL — PARTIAL RENDER. A full framebuffer does not fit.
 #
 # Measured on hardware in Phase 0: only ~274 KiB of dynamic RAM is free at

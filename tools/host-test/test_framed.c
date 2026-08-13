@@ -12,6 +12,11 @@
 #include <unistd.h>
 #include "rr_store.h"
 
+// The real cap the firmware passes to rr_queue_read_framed(). Mirrored rather
+// than included because ble_contract.h pulls in NimBLE headers this host build
+// has no business compiling; run.sh asserts the two agree.
+#define RR_QUEUE_PULL_MAX_PAYLOAD_FOR_TEST 500
+
 // Where the stubbed "filesystem" lives. Must match the -DMOUNT_POINT passed by
 // run.sh, which is what makes this the REAL rr_store.c under test.
 #ifndef RR_HOST_ROOT
@@ -149,6 +154,90 @@ int main(void) {
         check("a 5.8 KB record acks and advances the cursor",
               rr_queue_ack(id) == ESP_OK && rr_queue_count() == 1, NULL);
         free(big);
+    }
+
+    // ── THE ATT CEILING, AT THE EXACT BOUNDARY ──────────────────────────────
+    //
+    // ⚠️ WHAT THE OLD SUITE MISSED. It asserted that pages REASSEMBLE correctly,
+    // and it used a 500 B page — but it never asserted the one thing the ATT
+    // layer actually enforces: that a page NEVER EXCEEDS ITS CAP. Those are
+    // different claims, and a reader that returns cap+1 satisfies the first
+    // (the extra byte is still the right byte, in the right order) while
+    // silently violating the second.
+    //
+    // On hardware that produced a 513-byte ATT value against a 512-byte ceiling,
+    // NimBLE dropped the packet ("ATT handler not found; packet dropped"), and
+    // the drain stalled forever with queued=1. Invisible from the watch side.
+    //
+    // So: sweep record sizes so that frames tile a page EXACTLY, and assert the
+    // hard invariant `n <= cap` at every offset. The interesting sizes are the
+    // ones where a frame boundary lands at cap-1, cap and cap+1 relative to the
+    // page start — i.e. where the reader must decide whether a frame that
+    // exactly fills the remaining space is included.
+    {
+        const size_t CAP = RR_QUEUE_PULL_MAX_PAYLOAD_FOR_TEST;
+        int over = 0, worst = 0;
+        size_t worst_off = 0, worst_len = 0;
+
+        // Record body lengths chosen to walk the frame size (len + 2) across
+        // every alignment against the page cap, including exact multiples.
+        for (size_t body = CAP - 8; body <= CAP + 8; body++) {
+            char *rec = malloc(body + 1);
+            memset(rec, 'x', body);
+            rec[0] = '{'; rec[body - 1] = '}';
+            rec[body] = '\0';
+            const char *lines[4] = { rec, rec, rec, rec };
+            write_queue(lines, 4);
+
+            const uint32_t total = rr_queue_framed_size();
+            unsigned char page[4096];
+            for (uint32_t off = 0; off < total; ) {
+                int n = rr_queue_read_framed(page, off, CAP);
+                if (n < 0) break;
+                if ((size_t) n > CAP) {
+                    over++;
+                    if (n > worst) { worst = n; worst_off = off; worst_len = body; }
+                }
+                if (n == 0) break;
+                off += (uint32_t) n;
+            }
+            free(rec);
+        }
+        char detail[160];
+        snprintf(detail, sizeof(detail),
+                 "%d page(s) exceeded the cap; worst %d B at offset %zu with a %zu B body",
+                 over, worst, worst_off, worst_len);
+        check("no page ever exceeds the payload cap (frame sizes tiling the page exactly)",
+              over == 0, over ? detail : NULL);
+    }
+
+    // ── the exact backlog from hardware: 1489 B queued ──────────────────────
+    //
+    // Reproduces the reported failure shape rather than an abstraction of it: a
+    // 6-step run whose framed stream is ~1489 B, paged at the real 500 B cap.
+    {
+        const size_t CAP = RR_QUEUE_PULL_MAX_PAYLOAD_FOR_TEST;
+        char *r6 = mkjson(6);
+        const char *lines[1] = { r6 };
+        write_queue(lines, 1);
+
+        const uint32_t total = rr_queue_framed_size();
+        unsigned char page[4096];
+        int over = 0, pages = 0;
+        uint32_t off = 0;
+        while (off < total) {
+            int n = rr_queue_read_framed(page, off, CAP);
+            if (n <= 0) break;
+            pages++;
+            if ((size_t) n > CAP) over++;
+            off += (uint32_t) n;
+        }
+        char detail[160];
+        snprintf(detail, sizeof(detail), "framed=%u B, %d page(s), %d over cap",
+                 (unsigned) total, pages, over);
+        check("the hardware backlog case pages entirely within the cap",
+              over == 0 && off == total, detail);
+        free(r6);
     }
 
     printf("\n%s  %d passed, %d failed\n\n", failed ? "FAILED" : "OK", passed, failed);
