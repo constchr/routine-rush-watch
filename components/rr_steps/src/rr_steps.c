@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 #include "nvs.h"
 
+#include "rr_audio.h"
 #include "rr_imu.h"
 #include "rr_rtc.h"
 
@@ -21,6 +22,19 @@ static const char *TAG = "rr_steps";
 #define NVS_NAMESPACE "rr_steps"
 #define NVS_KEY_DAY   "day"      /**< local days since the epoch */
 #define NVS_KEY_COUNT "count"
+#define NVS_KEY_TARGET "target"  /**< daily step target; 0 = disabled */
+#define NVS_KEY_TGTDAY "tgt_day" /**< the day the target tone last fired */
+
+// The parent app pushes the real number with set_step_target on every sync. This
+// is only what an unconfigured watch uses: a target of 0 would mean the tone
+// never exists until a parent goes looking for a setting they do not know about,
+// and 6000 is a reasonable day for a primary-school child.
+#define DEFAULT_STEP_TARGET 6000
+
+// Nothing about the detector breaks at a higher number, but a target no child can
+// reach is indistinguishable from a broken feature, and one this large is far more
+// likely to be a units mistake (metres, milliseconds) than an intent.
+#define MAX_STEP_TARGET 100000
 
 #define TASK_STACK 3072
 #define TASK_PRIO  2             /**< below the UI; a step is never urgent */
@@ -34,6 +48,10 @@ static int32_t  s_day;           /**< local day number the total belongs to */
 
 static uint32_t s_persisted;     /**< s_daily as last written */
 static int64_t  s_persisted_at;  /**< tick ms of that write */
+
+static uint32_t s_target = DEFAULT_STEP_TARGET;
+/** The day the target tone fired. INT32_MIN = not today, and not any day yet. */
+static int32_t  s_target_day = INT32_MIN;
 
 // ── Liveness of the detector's INPUT, not just its output ───────────────────
 //
@@ -115,7 +133,11 @@ static void store_now(void)
     }
     esp_err_t a = nvs_set_i32(h, NVS_KEY_DAY, s_day);
     esp_err_t b = nvs_set_u32(h, NVS_KEY_COUNT, s_daily);
-    if (a == ESP_OK && b == ESP_OK) nvs_commit(h);
+    // Written on the SAME commit as the count it belongs to. Persisting the
+    // fired-day separately would leave a window where a reboot restores a count
+    // above the target with no record that the tone already played.
+    esp_err_t c = nvs_set_i32(h, NVS_KEY_TGTDAY, s_target_day);
+    if (a == ESP_OK && b == ESP_OK && c == ESP_OK) nvs_commit(h);
     nvs_close(h);
 
     s_persisted = s_daily;
@@ -307,6 +329,69 @@ static uint32_t detect(float mag_g, int64_t t_ms)
     return 0;
 }
 
+// ── the daily step target ───────────────────────────────────────────────────
+//
+// Checked where steps are credited, with the lock held. See rr_steps.h for why
+// the guard is a persisted DAY NUMBER and not a flag.
+static void check_target_locked(void)
+{
+    if (s_target == 0) return;              // disabled by the parent
+    if (s_daily < s_target) return;
+    if (!s_day_known) return;               // no honest day to file it on yet
+    if (s_target_day == s_day) return;      // already announced today
+
+    s_target_day = s_day;
+    store_now();                            // the marker outlives a reboot
+
+    // Volume and quiet hours are applied inside rr_audio, exactly as for every
+    // other sound — a target crossed at 21:00 is capped like the alarm would be,
+    // and at volume 0 it plays not at all.
+    ESP_LOGI(TAG, "★ daily step target reached: %" PRIu32 "/%" PRIu32 " — announcing once",
+             s_daily, s_target);
+    rr_audio_play_tone(RR_TONE_STEP_TARGET);
+}
+
+esp_err_t rr_steps_set_target(uint32_t steps)
+{
+    if (steps > MAX_STEP_TARGET) return ESP_ERR_INVALID_ARG;
+
+    if (s_lock != NULL && xSemaphoreTake(s_lock, pdMS_TO_TICKS(100)) != pdTRUE) {
+        return ESP_ERR_TIMEOUT;
+    }
+    s_target = steps;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err == ESP_OK) {
+        err = nvs_set_u32(h, NVS_KEY_TARGET, s_target);
+        if (err == ESP_OK) err = nvs_commit(h);
+        nvs_close(h);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "target applied but NOT persisted — it is lost on reboot");
+    }
+
+    // A LOWERED target can be already met, and the parent who just set it should
+    // hear that rather than wait for tomorrow. A raised one re-arms: the day's
+    // marker only suppresses the tone for a target that was actually reached.
+    if (s_target != 0 && s_daily < s_target && s_target_day == s_day) {
+        s_target_day = INT32_MIN;
+        ESP_LOGI(TAG, "target raised above today's count — re-armed");
+    }
+    ESP_LOGI(TAG, "step target set to %" PRIu32 " (today %" PRIu32 ")", s_target, s_daily);
+    check_target_locked();
+
+    if (s_lock != NULL) xSemaphoreGive(s_lock);
+    return ESP_OK;
+}
+
+uint32_t rr_steps_target(void) { return s_target; }
+
+bool rr_steps_target_reached_today(void)
+{
+    return s_day_known && s_target_day == s_day;
+}
+
 // ── day accounting ──────────────────────────────────────────────────────────
 
 /** Roll the day over if local midnight has passed. Call with the lock held. */
@@ -384,6 +469,7 @@ static void steps_task(void *arg)
         if (credit > 0) {
             s_daily += credit;
             ESP_LOGI(TAG, "steps +%" PRIu32 " -> %" PRIu32 " today", credit, s_daily);
+            check_target_locked();
             maybe_store();
         }
 
@@ -417,6 +503,18 @@ esp_err_t rr_steps_init(void)
         if (nvs_get_i32(h, NVS_KEY_DAY, &stored_day) == ESP_OK &&
             nvs_get_u32(h, NVS_KEY_COUNT, &stored_count) == ESP_OK) {
             have_stored = true;
+        }
+        // The target and the day its tone fired restore independently of the
+        // count: a watch that has never counted a step can still have been given
+        // a target, and the fired-day marker is what stops a reboot from
+        // re-announcing a target already met (rr_steps.h).
+        uint32_t stored_target = 0;
+        if (nvs_get_u32(h, NVS_KEY_TARGET, &stored_target) == ESP_OK) {
+            s_target = stored_target > MAX_STEP_TARGET ? MAX_STEP_TARGET : stored_target;
+        }
+        int32_t stored_tgt_day = INT32_MIN;
+        if (nvs_get_i32(h, NVS_KEY_TGTDAY, &stored_tgt_day) == ESP_OK) {
+            s_target_day = stored_tgt_day;
         }
         nvs_close(h);
     }
@@ -469,6 +567,12 @@ esp_err_t rr_steps_init(void)
 
     ESP_LOGI(TAG, "step counting live — SOFTWARE detector @ %d Hz (the on-chip engine "
                   "is inert on this part, see rr_imu.h)", RR_STEPS_SAMPLE_HZ);
+    if (s_target == 0) {
+        ESP_LOGI(TAG, "  daily target: off");
+    } else {
+        ESP_LOGI(TAG, "  daily target: %" PRIu32 " steps — %s today",
+                 s_target, rr_steps_target_reached_today() ? "ALREADY announced" : "not yet reached");
+    }
     ESP_LOGI(TAG, "  gait: peak>=%.3fg release<%.3fg step %d-%dms entry=%d steps",
              THRESH_HIGH_G, THRESH_LOW_G, MIN_STEP_MS, MAX_STEP_MS, ENTRY_STEPS);
     ESP_LOGW(TAG, "  ⚠ this samples the accelerometer from the CPU %d times a second, "

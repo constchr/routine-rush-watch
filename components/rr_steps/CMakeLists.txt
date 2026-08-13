@@ -6,5 +6,5 @@
 idf_component_register(
     SRCS "src/rr_steps.c"
     INCLUDE_DIRS "include"
-    REQUIRES nvs_flash rr_imu rr_rtc
+    REQUIRES nvs_flash rr_audio rr_imu rr_rtc
 )

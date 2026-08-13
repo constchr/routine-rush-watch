@@ -146,3 +146,28 @@ void rr_steps_refresh(void);
 
 /** Force a persist (before a deliberate reboot, for instance). */
 void rr_steps_flush(void);
+
+// ── Daily step target ───────────────────────────────────────────────────────
+//
+// One sound, once, when today's count first crosses the target. The parent owns
+// the number: it arrives over BLE as RR_CONTROL `set_step_target` and persists in
+// NVS, so a watch out of phone range keeps it.
+//
+// ⚠️ ONCE PER DAY IS THE WHOLE DESIGN, and the guard is on FLASH, not in RAM.
+// The count keeps climbing after the target, and a naive `count >= target` test
+// would fire the tone on every credited step for the rest of the day — a slot
+// machine on a child's wrist. A RAM-only flag would also re-fire after a reboot,
+// which on this watch is a routine event (button wake, a flash, a crash), so the
+// day the tone fired is stored beside the count.
+//
+// The marker is a DAY NUMBER rather than a boolean, so local midnight clears it
+// implicitly: a new day is a different number, and there is no reset to forget.
+
+/** 0 disables the tone. Applied and persisted; the value is range-checked. */
+esp_err_t rr_steps_set_target(uint32_t steps);
+
+/** The current target; 0 when disabled. */
+uint32_t rr_steps_target(void);
+
+/** True if the target has already been reached (and announced) today. */
+bool rr_steps_target_reached_today(void);

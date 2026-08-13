@@ -38,6 +38,7 @@
 #include "rr_store.h"
 #include "rr_routine.h"
 #include "rr_sched.h"
+#include "rr_steps.h"
 #include "rr_audio.h"
 #include "rr_ui.h"
 
@@ -939,6 +940,42 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         ESP_LOGI(TAG, "set_audio applied: volume %u%%, effective right now %u%%%s",
                  p.volume_pct, rr_audio_effective_volume(),
                  rr_audio_in_quiet_hours() ? " (inside quiet hours)" : "");
+        return 0;
+    }
+
+    // ── set_step_target: the daily step count worth celebrating ──────────────
+    //
+    // Additive command, same gate and same reasoning as set_audio and set_tz:
+    // configuration, so conn_is_authorised() rather than peer_is_trusted().
+    //
+    // The watch already counts steps and owns the day boundary; the number to aim
+    // at is the one thing only a parent can supply. 0 disables the tone. rr_steps
+    // holds the once-per-day guard, so this handler is genuinely just a setter.
+    if (strcmp(cmd, "set_step_target") == 0) {
+        if (!conn_is_authorised(conn_handle)) {
+            ESP_LOGW(TAG, "set_step_target REJECTED — connection not authorised");
+            cJSON_Delete(env);
+            return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        }
+
+        const cJSON *js = cJSON_GetObjectItemCaseSensitive(env, "steps");
+        if (!cJSON_IsNumber(js) || js->valuedouble < 0) {
+            ESP_LOGE(TAG, "set_step_target: no valid \"steps\" in the envelope");
+            cJSON_Delete(env);
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        const uint32_t steps = (uint32_t) js->valuedouble;
+        cJSON_Delete(env);
+
+        if (rr_steps_set_target(steps) != ESP_OK) {
+            ESP_LOGE(TAG, "set_step_target REJECTED — %" PRIu32 " out of range", steps);
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+        // The result, not the receipt: rr_steps may fire the tone immediately if
+        // the new target is already met today, and that is worth seeing in a log.
+        ESP_LOGI(TAG, "set_step_target applied: %" PRIu32 " steps (%s today)",
+                 rr_steps_target(),
+                 rr_steps_target_reached_today() ? "already reached" : "not yet reached");
         return 0;
     }
 

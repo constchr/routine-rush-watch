@@ -529,6 +529,7 @@ export function decodeRoutinePush<T = unknown>(bytes: Uint8Array): RoutinePushDe
 //   set_tz         UTC offset for local wall-clock display       (additive)
 //   set_audio      speaker volume + quiet hours                  (additive)
 //   queue_seek     set the QUEUE_PULL read offset                (v3)
+//   set_step_target  daily step target the watch celebrates      (additive)
 // ─────────────────────────────────────────────────────────────
 
 /**
@@ -633,6 +634,20 @@ export type RrControlCommand =
   /** Set the QUEUE_PULL read offset. v3 — see encodeQueueSeek and the
    *  QUEUE_PULL section for cursor semantics. */
   | { cmd: 'queue_seek'; offset: number }
+  /** Set the daily step target the watch celebrates. Additive command.
+   *
+   *  The watch counts steps on the wrist and owns the day boundary (local
+   *  midnight, rr_steps), so the ONLY thing it is missing is the number to aim
+   *  at. `steps: 0` disables the tone entirely.
+   *
+   *  Fires AT MOST ONCE A DAY, and the guard is the watch's, not the app's: the
+   *  day the tone played is persisted next to the count, so neither the next
+   *  credited step nor a reboot re-announces a target already reached.
+   *
+   *  Send it on every sync, like set_tz — it is one small write, and it is what
+   *  makes the target survive a re-pair (the watch's NVS is wiped) without the
+   *  parent having to touch a setting again. */
+  | { cmd: 'set_step_target'; steps: number }
 
 export const RR_CONTROL_LEN_PREFIX_BYTES = 4
 
@@ -688,6 +703,28 @@ export function assertSetAudio(c: Extract<RrControlCommand, { cmd: 'set_audio' }
   }
 }
 
+/**
+ * Bounds for `set_step_target.steps`. 0 is legal and means "no target, no tone".
+ *
+ * The ceiling is not a hardware limit — the counter is a u32 — it is a
+ * plausibility check. A target no child can reach is indistinguishable from a
+ * broken feature, and a number this large is far more likely to be a units
+ * mistake than an intent. rr_steps enforces the same bound.
+ */
+export const STEP_TARGET_MIN = 0
+export const STEP_TARGET_MAX = 100000
+
+/** Validate a set_step_target command before it goes on the wire. */
+export function assertSetStepTarget(
+  c: Extract<RrControlCommand, { cmd: 'set_step_target' }>,
+): void {
+  if (!Number.isInteger(c.steps) || c.steps < STEP_TARGET_MIN || c.steps > STEP_TARGET_MAX) {
+    throw new RangeError(
+      `set_step_target.steps must be an integer ${STEP_TARGET_MIN}..${STEP_TARGET_MAX}, ` +
+      `got ${c.steps}`)
+  }
+}
+
 // ── RR_CONTROL response codes ────────────────────────────────────────────────
 //
 // RR_CONTROL is write-only with NO notify, by design: "the ATT write response
@@ -720,6 +757,7 @@ export const RR_CONTROL_ATT = {
 export function encodeControl(command: RrControlCommand): Uint8Array {
   if (command.cmd === 'set_audio') assertSetAudio(command)
   if (command.cmd === 'queue_seek') assertQueueSeek(command)
+  if (command.cmd === 'set_step_target') assertSetStepTarget(command)
   const json = utf8Encode(JSON.stringify(command))
   const out = new Uint8Array(RR_CONTROL_LEN_PREFIX_BYTES + json.byteLength)
   view(out).setUint32(0, json.byteLength, true)
