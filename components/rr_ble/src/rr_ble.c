@@ -336,12 +336,46 @@ static int queue_pull_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     uint32_t offset = s_pull_offset;
     if (offset > total) offset = total;
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // ⚠️ SIZE THE PAGE TO THE NEGOTIATED MTU, NOT TO THE ATTRIBUTE CEILING.
+    //
+    // TWO DIFFERENT LIMITS, AND CONFLATING THEM IS WHAT BROKE THE DRAIN:
+    //   • RR_QUEUE_PULL_MAX_VALUE (512) is BLE_ATT_ATTR_MAX_LEN — the largest an
+    //     ATT attribute VALUE may be. It bounds what we may ever store.
+    //   • ATT_MTU - 1 is the largest a single ATT_READ_RSP can CARRY. At the
+    //     MTU iOS actually granted (256) that is 253 bytes.
+    //
+    // A 512-byte value under a 256-byte MTU is only fetchable with a LONG READ
+    // (ATT_READ_BLOB_REQ), and we cannot depend on every central issuing one —
+    // ble-plx's readCharacteristicForDevice did not, so the read failed outright
+    // even after MTU negotiation was fixed. Serving a value that needs a long
+    // read is a bet on client behaviour; serving one that fits is not.
+    //
+    // So the page is capped to what THIS connection can actually deliver. The
+    // paging design already carries offset/total/MORE and a per-page `len`, so a
+    // smaller page costs only more pages — there is no correctness question, and
+    // it removes a cross-platform dependency entirely.
+    //
+    // ble_att_mtu() returns 0 for an unknown handle; fall back to the ATT
+    // default (23) rather than to the ceiling, because guessing high here is
+    // exactly the failure being fixed.
+    uint16_t conn_mtu = ble_att_mtu(conn_handle);
+    if (conn_mtu == 0) conn_mtu = BLE_ATT_MTU_DFLT;
+
+    // MTU - 1 is the response capacity (one opcode byte); the page header eats
+    // the rest. Signed, because a tiny MTU can make this negative.
+    int mtu_budget = (int) conn_mtu - 1 - (int) RR_QUEUE_PULL_HEADER_SIZE;
+    if (mtu_budget < 0) mtu_budget = 0;
+
+    int page_cap = mtu_budget < (int) RR_QUEUE_PULL_MAX_PAYLOAD
+                 ? mtu_budget : (int) RR_QUEUE_PULL_MAX_PAYLOAD;
+
     uint8_t *payload = NULL;
     int got = 0;
-    if (offset < total) {
-        payload = malloc(RR_QUEUE_PULL_MAX_PAYLOAD);
+    if (offset < total && page_cap > 0) {
+        payload = malloc((size_t) page_cap);
         if (payload == NULL) return BLE_ATT_ERR_INSUFFICIENT_RES;
-        got = rr_queue_read_framed(payload, offset, RR_QUEUE_PULL_MAX_PAYLOAD);
+        got = rr_queue_read_framed(payload, offset, (size_t) page_cap);
         if (got < 0) {
             free(payload);
             ESP_LOGE(TAG, "QUEUE_PULL: framed read failed at offset %" PRIu32, offset);
@@ -448,10 +482,11 @@ static int queue_pull_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     // to move the cursor. The phone can always override with queue_seek.
     s_pull_offset = offset + (uint32_t) got;
 
-    ESP_LOGI(TAG, "QUEUE_PULL: page @%" PRIu32 " +%d of %" PRIu32 " B%s (value %u B)",
+    ESP_LOGI(TAG, "QUEUE_PULL: page @%" PRIu32 " +%d of %" PRIu32 " B%s (value %u B, "
+                  "mtu %u, cap %d)",
              offset, got, total,
              (hdr.flags & RR_QUEUE_PULL_FLAG_MORE) ? ", MORE" : ", END",
-             (unsigned) value_len);
+             (unsigned) value_len, (unsigned) conn_mtu, page_cap);
     return 0;
 }
 
