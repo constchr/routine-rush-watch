@@ -72,6 +72,34 @@ if(RR_POWERLOG)
     message(STATUS "RR_POWERLOG enabled — battery SOC will be logged every 60 s")
 endif()
 
+# -DRR_PED_SELFTEST=1 re-runs the QMI8658 on-chip step-engine experiment at boot
+# and reports the counter alongside real accelerometer motion, so "inert engine"
+# and "nobody moved it" stay distinguishable. Phase 9 concluded the engine does
+# not count on this part; this is how that conclusion gets re-checked on a new
+# board or a new silicon revision instead of being taken on faith.
+# -DRR_LIGHT_SLEEP=1 enables automatic CPU light sleep. OFF BY DEFAULT: it is
+# implemented and the PM locks are correct, but LVGL's millisecond-period tick
+# timer thrashes against the sleep entry/exit overhead and starves both the IDLE
+# and main tasks (reproduced on hardware — see the comment in main.c). Gating the
+# LVGL tick on the panel being lit is the remaining work.
+if(RR_LIGHT_SLEEP)
+    idf_build_set_property(COMPILE_DEFINITIONS "RR_LIGHT_SLEEP=1" APPEND)
+    message(WARNING "RR_LIGHT_SLEEP is set — KNOWN ISSUE: IDLE/main task starvation via the LVGL tick.")
+endif()
+
+# -DRR_AUDIO_BOOT_TEST=1 plays one tone at boot, to confirm the Phase 10 I2S
+# rewrite (rr_audio owns bring-up so the channel is not left enabled holding a
+# PM lock) did not break the only alerting channel this board has.
+if(RR_AUDIO_BOOT_TEST)
+    idf_build_set_property(COMPILE_DEFINITIONS "RR_AUDIO_BOOT_TEST=1" APPEND)
+    message(WARNING "RR_AUDIO_BOOT_TEST is set — this image plays a tone at every boot.")
+endif()
+
+if(RR_PED_SELFTEST)
+    idf_build_set_property(COMPILE_DEFINITIONS "RR_PED_SELFTEST=1" APPEND)
+    message(WARNING "RR_PED_SELFTEST is set — boot runs a 30 s pedometer test. WALK WITH THE WATCH.")
+endif()
+
 # ── littlefs image: the emoji set ────────────────────────────────────────────
 # The manifest expects the images under an "emoji/" directory INSIDE the
 # partition, so stage them into that shape at configure time rather than

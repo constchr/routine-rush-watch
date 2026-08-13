@@ -109,12 +109,67 @@ CONFIG_FREERTOS_HZ=1000
 CONFIG_COMPILER_OPTIMIZATION_SIZE=y
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 
-# ── Power management (Phase 10) ─────────────────────────────────────────────
-# Enabled but not tuned; light-sleep is where the multi-day battery target
-# comes from. Do not enable automatic light-sleep until raise-to-wake is
-# proven on the IMU interrupt lines (see console warning above).
+# ═════════════════════════════════════════════════════════════════════════════
+# Power management (Phase 10) — automatic light sleep is now ON
+#
+# The precondition set here in Phase 8 ("do not enable automatic light-sleep
+# until raise-to-wake is proven on the IMU interrupt lines") has been met: the
+# interrupt path works, and rr_imu now registers INT1 as a light-sleep GPIO wake
+# source, which is a separate requirement the precondition did not anticipate.
+# Light sleep POWERS THE CPU DOWN, so an ordinary GPIO ISR does not run — see
+# the wake-source registration in rr_imu.c and rr_reset_button.c.
+# ═════════════════════════════════════════════════════════════════════════════
 CONFIG_PM_ENABLE=y
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+
+# Real measurement instead of a config echo. Without this, rr_pm can only report
+# what light sleep was CONFIGURED to do, which is how "ls=0" came to be read as
+# evidence when it was nothing of the kind. Costs two counters on the idle path.
+CONFIG_PM_LIGHT_SLEEP_CALLBACKS=y
+
+# ── THE BLE BLOCKER, AND WHY IT WAS NOT ACTUALLY A BLOCKER ──────────────────
+#
+# Without BT_LE_SLEEP_ENABLE, components/bt/controller/esp32c6/bt.c never
+# registers its sleep/wakeup callbacks and never calls
+# esp_sleep_enable_bt_wakeup(). Light sleep would then stop the controller's
+# clock with nothing arranged to bring it back for the next advertising event,
+# and BLE would quietly rot — missed adverts, dropped links.
+#
+# docs/POWER.md concluded this could not be fixed on this board, because BLE
+# sleep "wants a 32.768 kHz low-power clock" and the C6's XTAL_32K pins
+# (GPIO0/GPIO1) are QSPI_SCL and QSPI_SIO0 for the display. The premise is true;
+# the conclusion was not. BT_LE_LP_CLK_SRC_MAIN_XTAL exists for precisely this
+# board — IDF's own help text calls it "recommended if external 32.768k XTAL is
+# not available". The trade it makes is real and worth stating: light sleep can
+# no longer power down the main XTAL, so the sleeping floor is higher than it
+# would be with a crystal. Higher floor beats no sleep at all.
+#
+# MAC_BB_PD is not optional here, it is a build requirement: esp32c6/bt.c has
+# `#error "CONFIG_MAC_BB_PD required for BLE light sleep to run properly"` under
+# SOC_PM_RETENTION_HAS_CLOCK_BUG, which the C6 sets. Costs ~2 KB of RAM.
+CONFIG_BT_LE_SLEEP_ENABLE=y
+CONFIG_BT_LE_LP_CLK_SRC_MAIN_XTAL=y
+CONFIG_ESP_PHY_MAC_BB_PD=y
+
+# ── Keep the console usable, at zero cost to battery ────────────────────────
+#
+# USB-Serial-JTAG CANNOT operate across light sleep — the CDC link drops and the
+# log simply stops. The first light-sleep build went dark ~9 s after boot, the
+# moment the screen slept, and a silent console is indistinguishable from a
+# crash. This makes IDF hold a NO_LIGHT_SLEEP lock for exactly as long as a USB
+# host is attached.
+#
+# It costs nothing that matters: VBUS present means the watch is on a charger,
+# which is the one state where draw is irrelevant — and rr_powerlog refuses to
+# measure on USB for that same reason. Off the cable, the lock is released and
+# the watch sleeps normally.
+#
+# ⚠️ CONSEQUENCE FOR VERIFICATION: `ls`/`slp%` in the heartbeat will read 0 the
+# whole time the watch is plugged in, and that is CORRECT rather than a
+# regression. Because rr_pm's counters are cumulative, the way to prove sleep
+# works is to unplug, wait, replug, and read the numbers that accrued while the
+# cable was out. See docs/POWER.md.
+CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION=y
 
 # ── LVGL QR code widget (Phase 2 pairing screen) ────────────────────────────
 # lv_qrcode renders into an LV_COLOR_FORMAT_I1 (1 bpp) canvas, so a 320x320

@@ -15,7 +15,10 @@
 #include "nvs.h"
 
 #include "bsp/esp-bsp.h"
+#include "driver/i2s_std.h"
+#include "es8311_codec.h"
 #include "esp_codec_dev.h"
+#include "esp_codec_dev_defaults.h"
 
 #include "rr_rtc.h"
 
@@ -470,20 +473,155 @@ static void player_task(void *arg)
 
 // ── API ─────────────────────────────────────────────────────────────────────
 
-esp_err_t rr_audio_init(void)
+// ═════════════════════════════════════════════════════════════════════════════
+// I2S bring-up is OURS, not the BSP's — and this is a power decision (Phase 10)
+//
+// ⚠️ THIS IS WHAT WAS BLOCKING LIGHT SLEEP FOR THE ENTIRE DEVICE. Not the
+// display, not BLE — the speaker.
+//
+// bsp_audio_init() calls i2s_channel_enable() on BOTH channels and never
+// disables them. i2s_channel_enable() acquires an ESP_PM_APB_FREQ_MAX lock, so
+// from boot onwards the chip held two of them, forever, and automatic light
+// sleep could never engage for a single millisecond. It was invisible: audio
+// worked perfectly, the display slept, BLE behaved, and the only symptom was a
+// battery that drained as if none of the power work existed. The evidence is
+// esp_pm_dump_locks() (rr_pm_dump_locks()) — two `i2s_driver APB_FREQ_MAX`
+// entries with Active=1 while the watch was "asleep".
+//
+// The channels cannot be fixed from outside: the BSP keeps both handles in
+// file-statics and exposes no accessor and no deinit — the same trap
+// docs/POWER.md records for the panel handle. So this takes ownership, which is
+// a faithful transcription of bsp_audio_init() + bsp_audio_codec_speaker_init()
+// with two deliberate differences:
+//
+//   1. NO RX CHANNEL IS CREATED AT ALL. v1 never uses the microphone (§10B: the
+//      ES7210 path is reserved for a possible future voice feature), so the BSP
+//      was holding a PM lock and DMA buffers for a peripheral nothing reads.
+//   2. THE CHANNEL IS NOT ENABLED HERE. It does not need to be: esp_codec_dev's
+//      I2S data interface already calls i2s_channel_enable() on open and
+//      i2s_channel_disable() on close (audio_codec_data_i2s.c), and the player
+//      opens and closes per clip. So the lock is now held for the ~2 seconds a
+//      sound is playing instead of for the life of the device, and the play
+//      path did not have to change at all.
+//
+// The alarm is the only thing that makes a scheduled routine noticeable (there
+// is no vibration motor, §2), so the failure mode of getting this wrong is a
+// silent watch. Every error path below therefore says so in as many words.
+// ═════════════════════════════════════════════════════════════════════════════
+static esp_err_t audio_hw_init(void)
 {
-    esp_err_t err = bsp_audio_init(NULL);   // NULL = mono, 16-bit, 22050 Hz
+    // ⚠️ TRANSCRIBED FROM THE BSP, BECAUSE THE MACRO IS PRIVATE.
+    // BSP_I2S_DUPLEX_MONO_CFG lives in esp32_c6_touch_amoled_2_06.c, not in any
+    // header, so it cannot be reused — only copied. THE PIN SYMBOLS BELOW ARE
+    // PUBLIC and are referenced rather than hard-coded, so a board revision that
+    // moves a pin still lands here correctly; what is genuinely duplicated is
+    // only the SHAPE (Philips slots, 16-bit, mono, 22.05 kHz), which is fixed by
+    // the ES8311 wiring and the clip format rather than by the board.
+    //
+    // If audio ever comes up distorted or silent after a BSP version bump, diff
+    // this against that macro first.
+    const i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(22050),
+        .slot_cfg = I2S_STD_PHILIP_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                       I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = BSP_I2S_MCLK,
+            .bclk = BSP_I2S_SCLK,
+            .ws   = BSP_I2S_LCLK,
+            .dout = BSP_I2S_DOUT,
+            .din  = BSP_I2S_DSIN,
+            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false },
+        },
+    };
+
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(CONFIG_BSP_I2S_NUM,
+                                                            I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;   // clear stale DMA data, as the BSP does
+
+    // TX handle only; passing NULL for RX is what stops the mic channel from
+    // being created.
+    i2s_chan_handle_t tx = NULL;
+    esp_err_t err = i2s_new_channel(&chan_cfg, &tx, NULL);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "bsp_audio_init failed: %s — THE ALARM WILL BE SILENT",
+        ESP_LOGE(TAG, "i2s_new_channel failed: %s — THE ALARM WILL BE SILENT",
                  esp_err_to_name(err));
         return err;
     }
 
-    s_spk = bsp_audio_codec_speaker_init();
-    if (s_spk == NULL) {
-        ESP_LOGE(TAG, "ES8311 speaker init returned NULL — THE ALARM WILL BE SILENT");
+    err = i2s_channel_init_std_mode(tx, &std_cfg);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "i2s_channel_init_std_mode failed: %s — THE ALARM WILL BE SILENT",
+                 esp_err_to_name(err));
+        i2s_del_channel(tx);
+        return err;
+    }
+    // NOTE THE ABSENCE of i2s_channel_enable() here. See the block comment.
+
+    const audio_codec_i2s_cfg_t i2s_cfg = {
+        .port = CONFIG_BSP_I2S_NUM,
+        .tx_handle = tx,
+        .rx_handle = NULL,
+    };
+    const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_cfg);
+    if (data_if == NULL) {
+        ESP_LOGE(TAG, "audio_codec_new_i2s_data failed — THE ALARM WILL BE SILENT");
+        i2s_del_channel(tx);
         return ESP_FAIL;
     }
+
+    // ── ES8311 over the shared board I2C bus ────────────────────────────────
+    // Phase 0 verified this chain end to end: codec at 0x18 in slave mode, power
+    // amplifier on GPIO 6 driven by esp_codec_dev off open/close.
+    const audio_codec_i2c_cfg_t i2c_cfg = {
+        .port = BSP_I2C_NUM,
+        .addr = ES8311_CODEC_DEFAULT_ADDR,
+        .bus_handle = bsp_i2c_get_handle(),
+    };
+    const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&i2c_cfg);
+    if (ctrl_if == NULL) {
+        ESP_LOGE(TAG, "audio_codec_new_i2c_ctrl failed — THE ALARM WILL BE SILENT");
+        return ESP_FAIL;
+    }
+
+    const es8311_codec_cfg_t es8311_cfg = {
+        .ctrl_if = ctrl_if,
+        .gpio_if = audio_codec_new_gpio(),
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
+        .pa_pin = BSP_POWER_AMP_IO,
+        .pa_reverted = false,
+        .master_mode = false,
+        .use_mclk = true,
+        .digital_mic = false,
+        .invert_mclk = false,
+        .invert_sclk = false,
+        .hw_gain = { .pa_voltage = 5.0, .codec_dac_voltage = 3.3 },
+    };
+    const audio_codec_if_t *es8311 = es8311_codec_new(&es8311_cfg);
+    if (es8311 == NULL) {
+        ESP_LOGE(TAG, "es8311_codec_new failed — THE ALARM WILL BE SILENT");
+        return ESP_FAIL;
+    }
+
+    const esp_codec_dev_cfg_t dev_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_OUT,
+        .codec_if = es8311,
+        .data_if = data_if,
+    };
+    s_spk = esp_codec_dev_new(&dev_cfg);
+    if (s_spk == NULL) {
+        ESP_LOGE(TAG, "esp_codec_dev_new failed — THE ALARM WILL BE SILENT");
+        return ESP_FAIL;
+    }
+
+    ESP_LOGI(TAG, "I2S TX-only, channel left DISABLED until a clip plays "
+                  "(no APB lock held while idle; no RX channel created)");
+    return ESP_OK;
+}
+
+esp_err_t rr_audio_init(void)
+{
+    esp_err_t err = audio_hw_init();
+    if (err != ESP_OK) return err;
 
     const size_t pcm_cap = ADPCM_PCM_BYTES > PCM_CHUNK_BYTES ? ADPCM_PCM_BYTES
                                                              : PCM_CHUNK_BYTES;
