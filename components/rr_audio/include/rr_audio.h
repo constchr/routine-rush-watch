@@ -11,15 +11,18 @@
 //   Power-amp enable is GPIO 6 — driven automatically by esp_codec_dev on
 //   open/close. DO NOT toggle GPIO 6 from this module.
 //
-// ── TWO ENCODINGS ───────────────────────────────────────────────────────────
+// ── ONE ENCODING, ONE PATH ──────────────────────────────────────────────────
 //
-// Tones are WAV PCM s16le; voice prompts are WAV IMA ADPCM at 4 bits/sample.
-// That split exists because the 16-bit voice set is 2.5 MB and the littlefs
-// partition already holds 4.1 MB of emoji — it did not fit, which is why
-// Phase 7 shipped tones only. At 4:1 the whole set fits with ~560 KB spare.
-// Tones stayed PCM because they are small and the alarm's path is the verified
-// one. rr_audio picks the decoder from each file's WAV format tag, so nothing
-// upstream has to know or care which a clip is.
+// Every clip is WAV PCM s16le at the BSP's native rate and streams straight to
+// the I2S DMA ring. There is no decoder and no second format.
+//
+// It was not always so: Phase 8 added an IMA ADPCM path for 36 pre-rendered
+// voice prompts, because the 16-bit voice set was 2.5 MB against a partition
+// already holding 4.1 MB of emoji. Those prompts are gone — `template_step.label`
+// is free text a parent types, so pre-rendered speech only ever covered the 16
+// hardcoded starter templates and the common case was a lookup miss falling back
+// to a tone. Removing them returned ~625 KB of littlefs and left the playback
+// path that was verified on hardware as the only one.
 //
 // ── ORDERING ────────────────────────────────────────────────────────────────
 //
@@ -32,7 +35,7 @@
 #include <stdint.h>
 #include "esp_err.h"
 
-#include "audio_manifest.h"   // generated: rr_tone_id_t, tone + voice tables
+#include "audio_manifest.h"   // generated: rr_tone_id_t + the tone table
 
 /** Bring up I2S + the ES8311 and start the player task. */
 esp_err_t rr_audio_init(void);
@@ -42,20 +45,6 @@ bool rr_audio_is_ready(void);
 
 /** Queue one of the generated tones. Non-blocking, safe from any task. */
 esp_err_t rr_audio_play_tone(rr_tone_id_t id);
-
-/**
- * Speak a step in the child's language, if a clip exists for it.
- *
- * Matched on the step's EMOJI first and its label second — step labels are
- * whatever a parent typed, in whatever language, so an English-label lookup
- * matches nothing for a Greek family. Emoji come from the app's icon set and
- * survive translation.
- *
- * ESP_ERR_NOT_FOUND means "no clip for this step", which is a NORMAL answer:
- * 16 prompts exist against routines a parent invents freely. Callers should
- * fall silent rather than substitute an unrelated sound.
- */
-esp_err_t rr_audio_play_voice(const char *emoji, const char *label, const char *lang);
 
 /** Queue an arbitrary clip from littlefs. */
 esp_err_t rr_audio_play_file(const char *path);
@@ -99,14 +88,3 @@ bool rr_audio_in_quiet_hours(void);
 
 /** The volume the next clip will actually use, after the quiet-hours cap. */
 uint8_t rr_audio_effective_volume(void);
-
-/**
- * Decode an ADPCM clip without playing it and log sample count, peak, RMS and an
- * order-sensitive checksum, for comparison against a host-side reference decode
- * of the same file.
- *
- * The point is that a wrong nibble order or a mis-stepped index table yields a
- * plausible-looking stream of noise, and the person who would otherwise discover
- * that is a child wearing the watch. The checksum either matches or it does not.
- */
-esp_err_t rr_audio_selftest_decode(const char *path);

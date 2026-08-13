@@ -1,632 +1,65 @@
 {
   "generator": "tools/watch-audio/gen-watch-audio.mjs",
-  "label_source": "packages/shared/src/types/app.ts ROUTINE_TEMPLATES (starter templates)",
-  "coverage_warning": "Starter-template labels only. template_step.label is free text; custom steps have no clip.",
   "format": {
-    "tones": {
-      "encoding": "WAV PCM s16le",
-      "bits": 16
-    },
-    "voices": {
-      "encoding": "WAV IMA ADPCM",
-      "bits": 4,
-      "block_bytes": 512,
-      "samples_per_block": 1017,
-      "reason": "the 16-bit voice set is 2.5 MB and overflows the 6.875 MiB littlefs partition"
-    },
+    "encoding": "WAV PCM s16le",
+    "bits": 16,
     "rate_hz": 22050,
-    "channels": 1
-  },
-  "tts": {
-    "tool": "piper (offline ONNX)",
-    "voices": {
-      "en": "en_US-amy-medium",
-      "el": "el_GR-joy-medium"
-    },
-    "volume": "0.9"
+    "channels": 1,
+    "note": "the ES8311/I2S BSP default — nothing is resampled or decoded on device"
   },
   "mount": "/lfs/audio",
   "counts": {
-    "voice": 36,
-    "tone": 5,
-    "total": 41
+    "tone": 6,
+    "total": 6
   },
-  "total_bytes": 857342,
+  "total_bytes": 222530,
   "clips": [
     {
-      "file": "voice_en_get_up.wav",
-      "bytes": 13884,
-      "ms": 1228,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "get_up",
-      "lang": "en",
-      "label": "Get Up",
-      "emoji": [
-        "⏰"
-      ],
-      "text": "Time to get up",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_get_up.wav",
-      "bytes": 16956,
-      "ms": 1492,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "get_up",
-      "lang": "el",
-      "label": "Get Up",
-      "emoji": [
-        "⏰"
-      ],
-      "text": "Ώρα να σηκωθείς",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_toilet.wav",
-      "bytes": 14396,
-      "ms": 1275,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "toilet",
-      "lang": "en",
-      "label": "Toilet",
-      "emoji": [
-        "🚽",
-        "🧻"
-      ],
-      "text": "Time for the toilet",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_toilet.wav",
-      "bytes": 17980,
-      "ms": 1595,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "toilet",
-      "lang": "el",
-      "label": "Toilet",
-      "emoji": [
-        "🚽",
-        "🧻"
-      ],
-      "text": "Ώρα για την τουαλέτα",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_brush_teeth.wav",
-      "bytes": 17980,
-      "ms": 1611,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "brush_teeth",
-      "lang": "en",
-      "label": "Brush Teeth",
-      "emoji": [
-        "🪥"
-      ],
-      "text": "Time to brush your teeth",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_brush_teeth.wav",
-      "bytes": 23612,
-      "ms": 2082,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "brush_teeth",
-      "lang": "el",
-      "label": "Brush Teeth",
-      "emoji": [
-        "🪥"
-      ],
-      "text": "Ώρα να πλύνεις τα δόντια σου",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_get_dressed.wav",
-      "bytes": 14908,
-      "ms": 1330,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "get_dressed",
-      "lang": "en",
-      "label": "Get Dressed",
-      "emoji": [
-        "👕"
-      ],
-      "text": "Time to get dressed",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_get_dressed.wav",
-      "bytes": 13884,
-      "ms": 1225,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "get_dressed",
-      "lang": "el",
-      "label": "Get Dressed",
-      "emoji": [
-        "👕"
-      ],
-      "text": "Ώρα να ντυθείς",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_bag_shoes.wav",
-      "bytes": 21052,
-      "ms": 1862,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "bag_shoes",
-      "lang": "en",
-      "label": "Bag & Shoes",
-      "emoji": [
-        "🎒",
-        "👟"
-      ],
-      "text": "Time for your bag and shoes",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_bag_shoes.wav",
-      "bytes": 27196,
-      "ms": 2443,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "bag_shoes",
-      "lang": "el",
-      "label": "Bag & Shoes",
-      "emoji": [
-        "🎒",
-        "👟"
-      ],
-      "text": "Ώρα για την τσάντα και τα παπούτσια",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_bath.wav",
-      "bytes": 13372,
-      "ms": 1191,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "bath",
-      "lang": "en",
-      "label": "Bath",
-      "emoji": [
-        "🛁",
-        "🧼"
-      ],
-      "text": "Time for your bath",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_bath.wav",
-      "bytes": 11836,
-      "ms": 1050,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "bath",
-      "lang": "el",
-      "label": "Bath",
-      "emoji": [
-        "🛁",
-        "🧼"
-      ],
-      "text": "Ώρα για μπάνιο",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_pyjamas.wav",
-      "bytes": 14396,
-      "ms": 1260,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "pyjamas",
-      "lang": "en",
-      "label": "Pyjamas",
-      "emoji": [
-        "😴"
-      ],
-      "text": "Time for pyjamas",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_pyjamas.wav",
-      "bytes": 17468,
-      "ms": 1550,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "pyjamas",
-      "lang": "el",
-      "label": "Pyjamas",
-      "emoji": [
-        "😴"
-      ],
-      "text": "Ώρα για τις πιτζάμες",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_read.wav",
-      "bytes": 10812,
-      "ms": 964,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "read",
-      "lang": "en",
-      "label": "Read",
-      "emoji": [
-        "📖"
-      ],
-      "text": "Time to read",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_read.wav",
-      "bytes": 16956,
-      "ms": 1492,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "read",
-      "lang": "el",
-      "label": "Read",
-      "emoji": [
-        "📖"
-      ],
-      "text": "Ώρα να διαβάσεις",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_lights_out.wav",
-      "bytes": 14396,
-      "ms": 1291,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "lights_out",
-      "lang": "en",
-      "label": "Lights Out",
-      "emoji": [
-        "💤"
-      ],
-      "text": "Time for lights out",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_lights_out.wav",
-      "bytes": 22588,
-      "ms": 2002,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "lights_out",
-      "lang": "el",
-      "label": "Lights Out",
-      "emoji": [
-        "💤"
-      ],
-      "text": "Ώρα να σβήσουν τα φώτα",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_unpack_bag.wav",
-      "bytes": 17980,
-      "ms": 1609,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "unpack_bag",
-      "lang": "en",
-      "label": "Unpack Bag",
-      "emoji": [],
-      "text": "Time to unpack your bag",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_unpack_bag.wav",
-      "bytes": 23612,
-      "ms": 2095,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "unpack_bag",
-      "lang": "el",
-      "label": "Unpack Bag",
-      "emoji": [],
-      "text": "Ώρα να αδειάσεις την τσάντα",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_task_1.wav",
-      "bytes": 16444,
-      "ms": 1441,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "task_1",
-      "lang": "en",
-      "label": "Task 1",
-      "emoji": [
-        "✏️"
-      ],
-      "text": "Time for task one",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_task_1.wav",
-      "bytes": 24124,
-      "ms": 2138,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "task_1",
-      "lang": "el",
-      "label": "Task 1",
-      "emoji": [
-        "✏️"
-      ],
-      "text": "Ώρα για την πρώτη εργασία",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_task_2.wav",
-      "bytes": 15932,
-      "ms": 1399,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "task_2",
-      "lang": "en",
-      "label": "Task 2",
-      "emoji": [
-        "📐"
-      ],
-      "text": "Time for task two",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_task_2.wav",
-      "bytes": 25148,
-      "ms": 2231,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "task_2",
-      "lang": "el",
-      "label": "Task 2",
-      "emoji": [
-        "📐"
-      ],
-      "text": "Ώρα για τη δεύτερη εργασία",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_pack_bag.wav",
-      "bytes": 16444,
-      "ms": 1469,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "pack_bag",
-      "lang": "en",
-      "label": "Pack Bag",
-      "emoji": [
-        "📦"
-      ],
-      "text": "Time to pack your bag",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_pack_bag.wav",
-      "bytes": 23100,
-      "ms": 2050,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "pack_bag",
-      "lang": "el",
-      "label": "Pack Bag",
-      "emoji": [
-        "📦"
-      ],
-      "text": "Ώρα να ετοιμάσεις την τσάντα",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_tidy_room.wav",
-      "bytes": 16956,
-      "ms": 1497,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "tidy_room",
-      "lang": "en",
-      "label": "Tidy Room",
-      "emoji": [
-        "🛏️"
-      ],
-      "text": "Time to tidy your room",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_tidy_room.wav",
-      "bytes": 30780,
-      "ms": 2739,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "tidy_room",
-      "lang": "el",
-      "label": "Tidy Room",
-      "emoji": [
-        "🛏️"
-      ],
-      "text": "Ώρα να τακτοποιήσεις το δωμάτιο",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_vacuum.wav",
-      "bytes": 12348,
-      "ms": 1107,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "vacuum",
-      "lang": "en",
-      "label": "Vacuum",
-      "emoji": [
-        "🧹"
-      ],
-      "text": "Time to vacuum",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_vacuum.wav",
-      "bytes": 17468,
-      "ms": 1538,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "vacuum",
-      "lang": "el",
-      "label": "Vacuum",
-      "emoji": [
-        "🧹"
-      ],
-      "text": "Ώρα για σκούπισμα",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_dishes.wav",
-      "bytes": 17980,
-      "ms": 1577,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "dishes",
-      "lang": "en",
-      "label": "Dishes",
-      "emoji": [
-        "🍽️",
-        "🥣"
-      ],
-      "text": "Time to do the dishes",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_dishes.wav",
-      "bytes": 21564,
-      "ms": 1920,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "dishes",
-      "lang": "el",
-      "label": "Dishes",
-      "emoji": [
-        "🍽️",
-        "🥣"
-      ],
-      "text": "Ώρα να πλύνεις τα πιάτα",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_well_done.wav",
-      "bytes": 17980,
-      "ms": 1580,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "well_done",
-      "lang": "en",
-      "label": null,
-      "emoji": [],
-      "text": "Well done, you did it!",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_well_done.wav",
-      "bytes": 21052,
-      "ms": 1868,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "well_done",
-      "lang": "el",
-      "label": null,
-      "emoji": [],
-      "text": "Μπράβο σου, τα κατάφερες!",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
-      "file": "voice_en_all_done.wav",
-      "bytes": 20028,
-      "ms": 1777,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "all_done",
-      "lang": "en",
-      "label": null,
-      "emoji": [],
-      "text": "All done! Great job!",
-      "source": "piper en_US-amy-medium"
-    },
-    {
-      "file": "voice_el_all_done.wav",
-      "bytes": 20028,
-      "ms": 1787,
-      "encoding": "ima_adpcm",
-      "kind": "voice",
-      "id": "all_done",
-      "lang": "el",
-      "label": null,
-      "emoji": [],
-      "text": "Τέλειωσες! Μπράβο σου!",
-      "source": "piper el_GR-joy-medium"
-    },
-    {
       "file": "tone_alarm.wav",
+      "id": "alarm",
       "bytes": 109412,
       "ms": 2480,
       "encoding": "pcm_s16le",
-      "kind": "tone",
-      "id": "alarm",
-      "lang": null,
-      "label": null,
-      "text": null,
       "source": "synthesised (sine + AR envelope)"
     },
     {
       "file": "tone_routine_start.wav",
+      "id": "routine_start",
       "bytes": 22094,
       "ms": 500,
       "encoding": "pcm_s16le",
-      "kind": "tone",
-      "id": "routine_start",
-      "lang": null,
-      "label": null,
-      "text": null,
       "source": "synthesised (sine + AR envelope)"
     },
     {
       "file": "tone_step_done.wav",
+      "id": "step_done",
       "bytes": 6218,
       "ms": 140,
       "encoding": "pcm_s16le",
-      "kind": "tone",
-      "id": "step_done",
-      "lang": null,
-      "label": null,
-      "text": null,
       "source": "synthesised (sine + AR envelope)"
     },
     {
       "file": "tone_xp_chime.wav",
+      "id": "xp_chime",
       "bytes": 11510,
       "ms": 260,
       "encoding": "pcm_s16le",
-      "kind": "tone",
-      "id": "xp_chime",
-      "lang": null,
-      "label": null,
-      "text": null,
       "source": "synthesised (sine + AR envelope)"
     },
     {
       "file": "tone_routine_complete.wav",
+      "id": "routine_complete",
       "bytes": 45468,
       "ms": 1030,
       "encoding": "pcm_s16le",
-      "kind": "tone",
-      "id": "routine_complete",
-      "lang": null,
-      "label": null,
-      "text": null,
+      "source": "synthesised (sine + AR envelope)"
+    },
+    {
+      "file": "tone_step_target.wav",
+      "id": "step_target",
+      "bytes": 27828,
+      "ms": 630,
+      "encoding": "pcm_s16le",
       "source": "synthesised (sine + AR envelope)"
     }
   ]

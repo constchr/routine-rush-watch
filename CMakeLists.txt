@@ -111,6 +111,16 @@ endif()
 # disposable by design and refills on the next ROUTINE_PUSH — but it does mean
 # a firmware flash with FLASH_IN_PROJECT un-caches the watch's routines.
 set(LFS_STAGE "${CMAKE_BINARY_DIR}/lfs_image")
+
+# ⚠️ WIPE THE STAGING DIRECTORY FIRST. file(COPY) only ever ADDS, so an asset
+# deleted from the repo stays in build/lfs_image forever and keeps being packed
+# into the image. Removing the 36 voice clips proved it: the source directory
+# dropped 647 KiB and the staged audio directory still measured 956 KiB, so the
+# partition would have carried every deleted clip until someone ran a clean
+# build. Re-copying costs a moment at configure time and makes the image a
+# function of the repo rather than of build history.
+file(REMOVE_RECURSE "${LFS_STAGE}")
+
 file(MAKE_DIRECTORY "${LFS_STAGE}/emoji")
 file(GLOB RR_EMOJI_BINS "${CMAKE_SOURCE_DIR}/assets/emoji/*.bin")
 file(COPY ${RR_EMOJI_BINS} DESTINATION "${LFS_STAGE}/emoji")
@@ -133,25 +143,25 @@ file(COPY ${RR_AVATAR_BINS} DESTINATION "${LFS_STAGE}/avatars")
 # silently. Flashing the app alone (idf.py app-flash) does NOT fix it — the
 # asset image has to go down with it at least once.
 #
-# Everything fits now, measured against the 6.875 MiB partition:
-#     emoji    4236 KB
-#     avatars  1400 KB
-#     audio     843 KB   (190 KB PCM tones + 653 KB ADPCM voices)
+# Measured in build/lfs_image against the 6.875 MiB partition, after the voice
+# prompts were removed:
+#     emoji    4200 KB
+#     avatars  1392 KB
+#     audio     228 KB   (6 PCM tones; was 843 KB with the ADPCM voice set)
 #     ─────────────────
-#     total    6479 KB   into 7040 KB — ~560 KB spare
+#     total    5820 KB   into 7040 KB — 1220 KB spare (was ~560 KB)
 #
-# Phase 7 could only stage the tones: the voice set was 2546 KB as 16-bit PCM
-# and the whole thing overflowed by 1.4 MB. Phase 8 encodes the voices as IMA
-# ADPCM (4 bits/sample, 4:1), which is the format spec §10B.3 names and which
-# the generator verifies by round-tripping every clip through a reference
-# decoder (mean 22.9 dB, worst 15.9 dB; the build fails below 15 dB).
+# The voice set was 36 clips: 2546 KB as 16-bit PCM, 653 KB as IMA ADPCM, which
+# is why Phase 8 needed a second decoder at all. It is gone because pre-rendered
+# speech cannot cover free-text step labels (see the generator header) — so the
+# partition got 625 KB back, rr_audio lost its ADPCM path, and the tones that
+# remain use the one playback path verified on hardware.
 #
-# The glob is still explicit about what it takes. If the emoji set or the voice
-# list grows, this is where it will overflow, and a silent overflow at image
-# build time would present as "some clips just do not play".
+# The glob is still explicit about what it takes. If the emoji set grows, this is
+# where it will overflow, and a silent overflow at image build time would present
+# as "some clips just do not play".
 file(MAKE_DIRECTORY "${LFS_STAGE}/audio")
-file(GLOB RR_AUDIO_WAVS "${CMAKE_SOURCE_DIR}/assets/audio/tone_*.wav"
-              "${CMAKE_SOURCE_DIR}/assets/audio/voice_*.wav")
+file(GLOB RR_AUDIO_WAVS "${CMAKE_SOURCE_DIR}/assets/audio/tone_*.wav")
 file(COPY ${RR_AUDIO_WAVS} DESTINATION "${LFS_STAGE}/audio")
 
 # ⚠️ NOT FLASH_IN_PROJECT — deliberately.

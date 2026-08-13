@@ -1,10 +1,9 @@
-// rr_audio — ES8311 playback: PCM tones, ADPCM voice prompts, volume policy.
-// See rr_audio.h for the encoding split, the ordering rules and why they exist.
+// rr_audio — ES8311 playback: PCM tones and the volume/quiet-hours policy.
+// See rr_audio.h for the ordering rules and why they exist.
 
 #include "rr_audio.h"
 
 #include <inttypes.h>
-#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -29,11 +28,6 @@ static const char *TAG = "rr_audio";
 // second's worth of RAM to play a two-second sound.
 #define PCM_CHUNK_BYTES 2048
 
-// One ADPCM block decodes to RR_AUDIO_ADPCM_SAMPLES_PER_BLOCK 16-bit samples.
-// Both buffers are allocated once for the life of the player task rather than
-// per clip, so playback never fails for want of a 2 KB allocation.
-#define ADPCM_PCM_BYTES (RR_AUDIO_ADPCM_SAMPLES_PER_BLOCK * 2)
-
 #define PLAYER_STACK 4096
 #define PLAYER_PRIO  4          /* below LVGL: a late tone beats a torn frame */
 
@@ -46,12 +40,15 @@ static const char *TAG = "rr_audio";
 
 // ── Defaults ────────────────────────────────────────────────────────────────
 //
-// Quiet hours default ON. There is no parent UI for this yet, and of the two
-// possible wrong defaults — "a bedroom gets a full-volume alarm at 21:30" and
-// "a morning alarm is quieter than it could be" — only one of them wakes a
-// household. The window ends at 06:30 so a school-morning routine still rings
-// at full volume, and the cap is a reduction rather than a mute so a bedtime
-// routine is still noticeable. Parents override all of it via `set_audio`.
+// Quiet hours default ON. Of the two possible wrong defaults — "a bedroom gets
+// a full-volume alarm at 21:30" and "a morning alarm is quieter than it could
+// be" — only one of them wakes a household. The window ends at 06:30 so a
+// school-morning routine still rings at full volume, and the cap is a reduction
+// rather than a mute so a bedtime routine is still noticeable.
+//
+// These are now only the pre-parent defaults: the parent app owns this policy
+// (child screen → Watch sounds) and pushes it with `set_audio` on every sync, so
+// a watch runs on these values only until the first sync after pairing.
 #define DEFAULT_VOLUME_PCT       70
 #define DEFAULT_QUIET_FROM_MIN   (20 * 60 + 30)
 #define DEFAULT_QUIET_TO_MIN     (6 * 60 + 30)
@@ -60,8 +57,7 @@ static const char *TAG = "rr_audio";
 static esp_codec_dev_handle_t s_spk;
 static QueueHandle_t s_requests;
 static volatile bool s_stop;
-static uint8_t *s_pcm_buf;      /* PCM_CHUNK_BYTES, or ADPCM_PCM_BYTES if larger */
-static uint8_t *s_blk_buf;      /* one ADPCM block */
+static uint8_t *s_pcm_buf;      /* PCM_CHUNK_BYTES, allocated once for the task */
 
 static rr_audio_policy_t s_policy = {
     .volume_pct = DEFAULT_VOLUME_PCT,
@@ -158,13 +154,13 @@ void rr_audio_get_policy(rr_audio_policy_t *out)
 
 // ── WAV parsing ─────────────────────────────────────────────────────────────
 //
-// Walks the RIFF chunk list instead of assuming the PCM starts at byte 44. The
-// generated clips no longer agree on a header size anyway — ADPCM's is 60 bytes
-// with a `fact` chunk — and a fixed offset would play the header as if it were
-// audio: a burst of noise, at alarm volume, on a child's wrist.
+// Walks the RIFF chunk list instead of assuming the PCM starts at byte 44. Every
+// clip the generator emits does start there, but a fixed offset would play a
+// header as if it were audio the moment one did not — a burst of noise, at alarm
+// volume, on a child's wrist. Walking the list costs a few reads and removes the
+// whole class.
 
 #define WAV_FMT_PCM   0x0001
-#define WAV_FMT_IMA   0x0011
 
 typedef struct {
     FILE *f;
@@ -172,10 +168,7 @@ typedef struct {
     uint32_t rate;
     uint16_t bits;
     uint16_t channels;
-    uint16_t block_bytes;        /**< ADPCM only */
-    uint16_t samples_per_block;  /**< ADPCM only */
     uint32_t data_bytes;
-    uint32_t total_samples;      /**< from `fact`; 0 if absent */
 } wav_t;
 
 static esp_err_t wav_open(const char *path, wav_t *w)
@@ -209,39 +202,28 @@ static esp_err_t wav_open(const char *path, wav_t *w)
             w->format      = (uint16_t) (fmt[0] | (fmt[1] << 8));
             w->channels    = (uint16_t) (fmt[2] | (fmt[3] << 8));
             w->rate        = (uint32_t) (fmt[4] | (fmt[5] << 8) | (fmt[6] << 16) | (fmt[7] << 24));
-            w->block_bytes = (uint16_t) (fmt[12] | (fmt[13] << 8));
             w->bits        = (uint16_t) (fmt[14] | (fmt[15] << 8));
-            if (want >= 20) w->samples_per_block = (uint16_t) (fmt[18] | (fmt[19] << 8));
             have_fmt = true;
             if (size > want) fseek(f, (long) (size - want), SEEK_CUR);
-        } else if (memcmp(id, "fact", 4) == 0) {
-            uint32_t n = 0;
-            if (size >= 4 && fread(&n, 1, 4, f) == 4) w->total_samples = n;
-            if (size > 4) fseek(f, (long) (size - 4), SEEK_CUR);
         } else if (memcmp(id, "data", 4) == 0) {
             if (!have_fmt) break;
             w->f = f;
             w->data_bytes = size;
 
-            if (w->format != WAV_FMT_PCM && w->format != WAV_FMT_IMA) {
-                ESP_LOGE(TAG, "%s: format 0x%04X is neither PCM nor IMA ADPCM",
+            // PCM ONLY. The IMA ADPCM path was here for the voice set, which is
+            // gone (pre-rendered speech cannot cover free-text step labels), and
+            // with it the only decoder this component ever needed. A clip in any
+            // other format is refused rather than streamed as noise.
+            if (w->format != WAV_FMT_PCM) {
+                ESP_LOGE(TAG, "%s: format 0x%04X is not PCM — this build plays PCM only",
                          path, w->format);
                 fclose(f);
                 return ESP_ERR_NOT_SUPPORTED;
             }
-            if (w->format == WAV_FMT_IMA &&
-                (w->block_bytes == 0 || w->block_bytes > RR_AUDIO_ADPCM_BLOCK_BYTES ||
-                 w->samples_per_block == 0 ||
-                 w->samples_per_block > RR_AUDIO_ADPCM_SAMPLES_PER_BLOCK)) {
-                // The decode buffers are sized from the manifest's geometry at
-                // compile time, so a clip claiming a bigger block would overrun
-                // them. Refuse rather than trust the file.
-                ESP_LOGE(TAG, "%s: ADPCM block %u/%u samples exceeds the built-in "
-                              "buffers (%d/%d)", path, w->block_bytes,
-                         w->samples_per_block, RR_AUDIO_ADPCM_BLOCK_BYTES,
-                         RR_AUDIO_ADPCM_SAMPLES_PER_BLOCK);
+            if (w->bits != 16) {
+                ESP_LOGE(TAG, "%s: %u-bit PCM; the I2S path is 16-bit", path, w->bits);
                 fclose(f);
-                return ESP_ERR_INVALID_SIZE;
+                return ESP_ERR_NOT_SUPPORTED;
             }
             return ESP_OK;
         } else {
@@ -253,70 +235,6 @@ static esp_err_t wav_open(const char *path, wav_t *w)
     ESP_LOGE(TAG, "%s has no usable fmt/data chunk pair", path);
     fclose(f);
     return ESP_ERR_INVALID_ARG;
-}
-
-// ── IMA ADPCM decode ────────────────────────────────────────────────────────
-//
-// Mirrors imaDecode() in tools/watch-audio/gen-watch-audio.mjs, which is the
-// reference the generator verifies its own encoder against (--verify measures
-// the round trip: mean 22.9 dB, worst 15.9 dB across the voice set — normal for
-// 4-bit IMA on speech, and the check fails the build below 15 dB).
-//
-// Every block restarts the predictor from a sample stored in its own header, so
-// an error cannot propagate past one 46 ms block.
-
-static const int16_t IMA_STEP[89] = {
-    7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
-    50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230,
-    253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658, 724, 796, 876, 963,
-    1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024, 3327,
-    3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442,
-    11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794,
-    32767,
-};
-static const int8_t IMA_INDEX[16] = { -1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8 };
-
-static inline int16_t clamp_i16(int32_t v)
-{
-    if (v < -32768) return -32768;
-    if (v > 32767) return 32767;
-    return (int16_t) v;
-}
-
-/** Decode one block into s16le. Returns the sample count written. */
-static size_t ima_decode_block(const uint8_t *blk, size_t blk_len,
-                               uint16_t samples_per_block, int16_t *out)
-{
-    if (blk_len < 4) return 0;
-
-    int32_t pred = (int16_t) (blk[0] | (blk[1] << 8));
-    int index = blk[2];
-    if (index > 88) index = 88;
-
-    size_t n = 0;
-    out[n++] = (int16_t) pred;          /* the header sample IS sample 0 */
-
-    for (uint16_t i = 0; i + 1 < samples_per_block; i++) {
-        const size_t byte_off = 4 + (i >> 1);
-        if (byte_off >= blk_len) break;
-        const uint8_t byte = blk[byte_off];
-        const uint8_t code = (i & 1) ? (uint8_t) (byte >> 4) : (uint8_t) (byte & 0x0F);
-
-        const int32_t step = IMA_STEP[index];
-        int32_t delta = step >> 3;
-        if (code & 1) delta += step >> 2;
-        if (code & 2) delta += step >> 1;
-        if (code & 4) delta += step;
-
-        pred = (code & 8) ? pred - delta : pred + delta;
-        pred = clamp_i16(pred);
-        index += IMA_INDEX[code];
-        if (index < 0) index = 0;
-        if (index > 88) index = 88;
-
-        out[n++] = (int16_t) pred;
-    }
-    return n;
 }
 
 // ── Playback ────────────────────────────────────────────────────────────────
@@ -338,9 +256,6 @@ static void play_blocking(const char *path)
     // enable (GPIO 6) off open/close, so holding it open would leave the
     // amplifier powered between sounds — a constant draw on a watch that makes
     // a noise a handful of times a day.
-    //
-    // ADPCM decodes to 16-bit before it reaches I2S, so the codec is always
-    // opened at 16 bits regardless of the file's 4.
     esp_codec_dev_sample_info_t fs = {
         .bits_per_sample = 16,
         .channel = (uint8_t) w.channels,
@@ -355,45 +270,19 @@ static void play_blocking(const char *path)
     }
     esp_codec_dev_set_out_vol(s_spk, (int) vol);
 
-    ESP_LOGI(TAG, "playing %s (%s, %" PRIu32 " B, %" PRIu32 " Hz, %u ch, vol %u%%%s)",
-             path, w.format == WAV_FMT_IMA ? "ADPCM" : "PCM",
-             w.data_bytes, w.rate, w.channels, vol,
+    ESP_LOGI(TAG, "playing %s (PCM, %" PRIu32 " B, %" PRIu32 " Hz, %u ch, vol %u%%%s)",
+             path, w.data_bytes, w.rate, w.channels, vol,
              rr_audio_in_quiet_hours() ? ", quiet hours" : "");
 
     uint32_t remaining = w.data_bytes;
-    uint32_t samples_left = w.total_samples;   /* 0 = unknown, PCM case */
-
     while (remaining > 0 && !s_stop) {
-        if (w.format == WAV_FMT_IMA) {
-            const size_t want = remaining < w.block_bytes ? remaining : w.block_bytes;
-            const size_t got = fread(s_blk_buf, 1, want, w.f);
-            if (got == 0) break;
-            remaining -= got;
-
-            size_t n = ima_decode_block(s_blk_buf, got, w.samples_per_block,
-                                        (int16_t *) s_pcm_buf);
-            // The final block is zero-padded to a full block by the encoder;
-            // `fact` says how many samples are real, so the padding is not
-            // played as a tail of silence-shaped noise.
-            if (w.total_samples != 0) {
-                if (n > samples_left) n = samples_left;
-                samples_left -= n;
-            }
-            if (n == 0) break;
-            if (esp_codec_dev_write(s_spk, s_pcm_buf, (int) (n * 2)) != ESP_OK) {
-                ESP_LOGE(TAG, "codec write failed — stopping playback");
-                break;
-            }
-            if (w.total_samples != 0 && samples_left == 0) break;
-        } else {
-            const size_t want = remaining < PCM_CHUNK_BYTES ? remaining : PCM_CHUNK_BYTES;
-            const size_t got = fread(s_pcm_buf, 1, want, w.f);
-            if (got == 0) break;
-            remaining -= got;
-            if (esp_codec_dev_write(s_spk, s_pcm_buf, (int) got) != ESP_OK) {
-                ESP_LOGE(TAG, "codec write failed — stopping playback");
-                break;
-            }
+        const size_t want = remaining < PCM_CHUNK_BYTES ? remaining : PCM_CHUNK_BYTES;
+        const size_t got = fread(s_pcm_buf, 1, want, w.f);
+        if (got == 0) break;
+        remaining -= got;
+        if (esp_codec_dev_write(s_spk, s_pcm_buf, (int) got) != ESP_OK) {
+            ESP_LOGE(TAG, "codec write failed — stopping playback");
+            break;
         }
     }
 
@@ -401,61 +290,6 @@ static void play_blocking(const char *path)
     esp_codec_dev_close(s_spk);
 
     if (s_stop) ESP_LOGI(TAG, "playback stopped early");
-}
-
-esp_err_t rr_audio_selftest_decode(const char *path)
-{
-    // Decode a clip WITHOUT playing it, and report statistics that can be
-    // compared against a host-side reference decode of the same file.
-    //
-    // This exists because I cannot hear the watch. A 4-bit ADPCM decoder with a
-    // wrong nibble order or a mis-stepped index table produces a file-shaped
-    // stream of noise that looks entirely healthy in a log — and the person who
-    // finds out is a child. An order-sensitive checksum over every decoded
-    // sample either matches the reference exactly or it does not.
-    wav_t w;
-    if (wav_open(path, &w) != ESP_OK) return ESP_FAIL;
-    if (w.format != WAV_FMT_IMA) {
-        ESP_LOGW(TAG, "selftest: %s is not ADPCM — nothing to check", path);
-        fclose(w.f);
-        return ESP_ERR_INVALID_ARG;
-    }
-
-    uint32_t remaining = w.data_bytes, samples_left = w.total_samples, n_total = 0;
-    uint32_t acc = 0;
-    int32_t peak = 0;
-    double sq = 0;
-
-    while (remaining > 0) {
-        const size_t want = remaining < w.block_bytes ? remaining : w.block_bytes;
-        const size_t got = fread(s_blk_buf, 1, want, w.f);
-        if (got == 0) break;
-        remaining -= got;
-
-        size_t n = ima_decode_block(s_blk_buf, got, w.samples_per_block,
-                                    (int16_t *) s_pcm_buf);
-        if (w.total_samples != 0) {
-            if (n > samples_left) n = samples_left;
-            samples_left -= n;
-        }
-        const int16_t *pcm = (const int16_t *) s_pcm_buf;
-        for (size_t i = 0; i < n; i++) {
-            const int16_t v = pcm[i];
-            acc = acc * 31u + (uint32_t) (uint16_t) v;
-            const int32_t a = v < 0 ? -v : v;
-            if (a > peak) peak = a;
-            sq += (double) v * v;
-        }
-        n_total += n;
-        if (w.total_samples != 0 && samples_left == 0) break;
-    }
-    fclose(w.f);
-
-    const uint32_t rms = n_total ? (uint32_t) sqrt(sq / n_total) : 0;
-    ESP_LOGI(TAG, "ADPCM selftest %s: samples=%" PRIu32 " peak=%" PRId32
-                  " rms=%" PRIu32 " fnv31=0x%08" PRIx32,
-             path, n_total, peak, rms, acc);
-    return ESP_OK;
 }
 
 static void player_task(void *arg)
@@ -623,12 +457,11 @@ esp_err_t rr_audio_init(void)
     esp_err_t err = audio_hw_init();
     if (err != ESP_OK) return err;
 
-    const size_t pcm_cap = ADPCM_PCM_BYTES > PCM_CHUNK_BYTES ? ADPCM_PCM_BYTES
-                                                             : PCM_CHUNK_BYTES;
-    s_pcm_buf = malloc(pcm_cap);
-    s_blk_buf = malloc(RR_AUDIO_ADPCM_BLOCK_BYTES);
-    if (s_pcm_buf == NULL || s_blk_buf == NULL) {
-        ESP_LOGE(TAG, "could not allocate the %u B playback buffers", (unsigned) pcm_cap);
+    // Allocated once for the life of the player task rather than per clip, so
+    // playback never fails for want of a 2 KB allocation.
+    s_pcm_buf = malloc(PCM_CHUNK_BYTES);
+    if (s_pcm_buf == NULL) {
+        ESP_LOGE(TAG, "could not allocate the %u B playback buffer", PCM_CHUNK_BYTES);
         return ESP_ERR_NO_MEM;
     }
 
@@ -642,10 +475,10 @@ esp_err_t rr_audio_init(void)
 
     policy_load();
     ESP_LOGI(TAG, "ES8311 ready — volume %u%% (effective %u%%), quiet hours %s, "
-                  "buffers %u+%u B",
+                  "buffer %u B",
              s_policy.volume_pct, rr_audio_effective_volume(),
              s_policy.quiet_from_min == RR_AUDIO_QUIET_DISABLED ? "off" : "on",
-             (unsigned) pcm_cap, RR_AUDIO_ADPCM_BLOCK_BYTES);
+             PCM_CHUNK_BYTES);
     return ESP_OK;
 }
 
@@ -675,13 +508,6 @@ esp_err_t rr_audio_play_tone(rr_tone_id_t id)
 {
     if ((int) id < 0 || (int) id >= RR_AUDIO_TONE_COUNT) return ESP_ERR_INVALID_ARG;
     return rr_audio_play_file(RR_TONE_TABLE[id]);
-}
-
-esp_err_t rr_audio_play_voice(const char *emoji, const char *label, const char *lang)
-{
-    const char *p = rr_audio_voice_path(emoji, label, lang);
-    if (p == NULL) return ESP_ERR_NOT_FOUND;
-    return rr_audio_play_file(p);
 }
 
 esp_err_t rr_audio_play_alarm(void)

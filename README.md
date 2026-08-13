@@ -111,9 +111,10 @@ components/
   rr_sync/         sync engine: pull / push / reconcile       (Phase 5)
   rr_routine/      routine runtime, single-step-focus loop    (Phase 4)
   rr_ui/           LVGL screens + idle watch face             (Phase 4/6)
-  rr_audio/        ES8311 effect + jingle playback            (Phase 8)
-  rr_steps/        QMI8658 pedometer + daily count            (Phase 9)
-  rr_power/        sleep, raise-to-wake, battery              (Phase 10)
+  rr_audio/        ES8311 tone playback + volume/quiet policy (Phase 8)
+  rr_steps/        pedometer, daily count + step target       (Phase 9)
+  rr_battery/      AXP2101 fuel gauge (below rr_ble/rr_power)
+  rr_power/        sleep, raise-to-wake, light sleep          (Phase 10)
 assets/            WAV clips, fonts, emoji
 tools/             BLE contract vendoring + generator
 ```

@@ -271,20 +271,17 @@ static void show_current_step(void)
     rr_ui_show_step(&v, on_done, on_skip);
     log_heap(s.step_idx == 0 ? "after first step screen" : "after step advance");
 
-    // §10B.4: read the step aloud in the child's language. Genuinely useful for
-    // pre-readers, which is the same audience the emoji are there for.
+    // NO SOUND ON A STEP SCREEN, deliberately. This used to speak the step in the
+    // child's language (§10B.4), which read well for pre-readers but only worked
+    // for the 16 starter templates — `template_step.label` is free text, so a
+    // parent's own wording matched nothing and the step was silent anyway. The
+    // voice set is gone; the screen (emoji + label + ring) is the prompt, and the
+    // sounds that remain mark EVENTS: routine start, each tap, completion, XP,
+    // the step target, and the alarm.
     //
-    // A MISS IS NORMAL, not a failure: prompts are pre-rendered for the starter
-    // templates only, and a parent can type any label they like. A custom step
-    // gets the screen and no voice — deliberately silent rather than falling
-    // back to an unrelated tone, which would teach the child that a sound means
-    // nothing in particular.
-    rr_child_t child;
-    const char *lang = (rr_store_get_child(&child) == ESP_OK) ? child.language : "en";
-    esp_err_t voiced = rr_audio_play_voice(v.emoji, v.label, lang);
-    if (voiced == ESP_ERR_NOT_FOUND) {
-        ESP_LOGI(TAG, "no voice clip for '%s' %s (%s) — screen only", v.label, v.emoji, lang);
-    }
+    // Substituting a tone here was considered and rejected: a sound on every step
+    // screen as well as every step tap teaches a child that a sound means nothing
+    // in particular, which costs the alarm its meaning too.
 
     if (v.time_limit_s > 0) {
         s.tick = lv_timer_create(tick_cb, 1000, NULL);

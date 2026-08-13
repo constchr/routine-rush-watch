@@ -3,51 +3,26 @@
 // Pre-baked audio for the watch (spec §10B.3), 1 ch @ 22050 Hz — the
 // ES8311/I2S BSP default, so nothing is ever resampled.
 //
-// TWO ENCODINGS, on purpose:
-//   • TONES  are WAV PCM s16le and stream straight to the I2S DMA ring.
-//   • VOICES are WAV IMA ADPCM (4 bits/sample) and are decoded a block at a
-//     time by rr_audio. The 16-bit voice set is 2.5 MB against a 6.875 MiB
-//     partition already holding 4.1 MB of emoji, so it did not fit; at 4:1 it
-//     does, with room to spare. Tones stay PCM because they are only 190 KB and
-//     the alarm's playback path is the one verified on hardware.
-// rr_audio picks the path from the WAV format tag, so nothing here needs to
-// tell it which is which.
+// ONE ENCODING, ONE PATH. Every clip is WAV PCM s16le and streams straight to
+// the I2S DMA ring. The IMA ADPCM voice set is gone (see the generator header:
+// pre-rendered speech cannot cover free-text step labels), and with it the only
+// reason rr_audio ever had a second decoder.
 //
-// This header carries ONLY the lookup tables. The PCM lives in the littlefs
+// This header carries ONLY the lookup table. The PCM lives in the littlefs
 // partition, never in the app slot.
 //
-//   const char *p = rr_audio_voice_path(step->emoji, step->label, child_lang);
-//   if (p) rr_audio_play_file(p);      /* speaks in the child's language */
-//   else   /* nothing — the screen is the prompt */
-//
-// ⚠️ MATCHED ON EMOJI FIRST, label second. Step labels are whatever a parent
-// typed, in whatever language: the family this was tested against has «Σήκω»
-// and «Δόντια», which match no English starter label at all. Emoji come from the
-// app's icon set, are already cached on the watch, and survive translation, so
-// they are the primary key. The label is tried afterwards for the English case.
-//
-// ⚠️ COVERAGE IS PARTIAL BY NATURE. There are 16 prompts against routines a
-// parent invents freely — the real watch's 11-step morning routine matches 5.
-// A miss is a NORMAL answer, not a fault, and the caller should fall silent
-// rather than substitute an unrelated tone.
+//   rr_audio_play_tone(RR_TONE_STEP_DONE);
+//   rr_audio_play_alarm();              /* preempts — see rr_audio.h */
 
 #pragma once
 
-#include <stdbool.h>
 #include <stddef.h>
 
 #define RR_AUDIO_MOUNT      "/lfs/audio"
 #define RR_AUDIO_RATE_HZ    22050
 #define RR_AUDIO_BITS       16
 #define RR_AUDIO_CHANNELS   1
-#define RR_AUDIO_VOICE_COUNT 36
-#define RR_AUDIO_TONE_COUNT  5
-
-/* IMA ADPCM geometry of the voice clips. rr_audio reads these from each file's
- * fmt chunk rather than trusting them, but a decode buffer has to be sized at
- * compile time and this is what it is sized against. */
-#define RR_AUDIO_ADPCM_BLOCK_BYTES      512
-#define RR_AUDIO_ADPCM_SAMPLES_PER_BLOCK 1017
+#define RR_AUDIO_TONE_COUNT  6
 
 typedef enum {
     RR_TONE_ALARM = 0,
@@ -55,16 +30,8 @@ typedef enum {
     RR_TONE_STEP_DONE = 2,
     RR_TONE_XP_CHIME = 3,
     RR_TONE_ROUTINE_COMPLETE = 4,
+    RR_TONE_STEP_TARGET = 5,
 } rr_tone_id_t;
-
-#define RR_AUDIO_VOICE_MAX_EMOJI 2
-
-typedef struct {
-    const char *emoji[RR_AUDIO_VOICE_MAX_EMOJI]; /**< step emoji, NULL-padded — the primary key */
-    const char *label; /**< starter-template label — the English fallback key */
-    const char *lang;  /**< "en" | "el" — from child.language */
-    const char *path;
-} rr_voice_entry_t;
 
 static const char *const RR_TONE_TABLE[RR_AUDIO_TONE_COUNT] = {
     RR_AUDIO_MOUNT "/tone_alarm.wav",
@@ -72,83 +39,11 @@ static const char *const RR_TONE_TABLE[RR_AUDIO_TONE_COUNT] = {
     RR_AUDIO_MOUNT "/tone_step_done.wav",
     RR_AUDIO_MOUNT "/tone_xp_chime.wav",
     RR_AUDIO_MOUNT "/tone_routine_complete.wav",
-};
-
-static const rr_voice_entry_t RR_VOICE_TABLE[RR_AUDIO_VOICE_COUNT] = {
-    { { "⏰", NULL }, "Get Up", "en", RR_AUDIO_MOUNT "/voice_en_get_up.wav" },
-    { { "⏰", NULL }, "Get Up", "el", RR_AUDIO_MOUNT "/voice_el_get_up.wav" },
-    { { "🚽", "🧻" }, "Toilet", "en", RR_AUDIO_MOUNT "/voice_en_toilet.wav" },
-    { { "🚽", "🧻" }, "Toilet", "el", RR_AUDIO_MOUNT "/voice_el_toilet.wav" },
-    { { "🪥", NULL }, "Brush Teeth", "en", RR_AUDIO_MOUNT "/voice_en_brush_teeth.wav" },
-    { { "🪥", NULL }, "Brush Teeth", "el", RR_AUDIO_MOUNT "/voice_el_brush_teeth.wav" },
-    { { "👕", NULL }, "Get Dressed", "en", RR_AUDIO_MOUNT "/voice_en_get_dressed.wav" },
-    { { "👕", NULL }, "Get Dressed", "el", RR_AUDIO_MOUNT "/voice_el_get_dressed.wav" },
-    { { "🎒", "👟" }, "Bag & Shoes", "en", RR_AUDIO_MOUNT "/voice_en_bag_shoes.wav" },
-    { { "🎒", "👟" }, "Bag & Shoes", "el", RR_AUDIO_MOUNT "/voice_el_bag_shoes.wav" },
-    { { "🛁", "🧼" }, "Bath", "en", RR_AUDIO_MOUNT "/voice_en_bath.wav" },
-    { { "🛁", "🧼" }, "Bath", "el", RR_AUDIO_MOUNT "/voice_el_bath.wav" },
-    { { "😴", NULL }, "Pyjamas", "en", RR_AUDIO_MOUNT "/voice_en_pyjamas.wav" },
-    { { "😴", NULL }, "Pyjamas", "el", RR_AUDIO_MOUNT "/voice_el_pyjamas.wav" },
-    { { "📖", NULL }, "Read", "en", RR_AUDIO_MOUNT "/voice_en_read.wav" },
-    { { "📖", NULL }, "Read", "el", RR_AUDIO_MOUNT "/voice_el_read.wav" },
-    { { "💤", NULL }, "Lights Out", "en", RR_AUDIO_MOUNT "/voice_en_lights_out.wav" },
-    { { "💤", NULL }, "Lights Out", "el", RR_AUDIO_MOUNT "/voice_el_lights_out.wav" },
-    { { NULL, NULL }, "Unpack Bag", "en", RR_AUDIO_MOUNT "/voice_en_unpack_bag.wav" },
-    { { NULL, NULL }, "Unpack Bag", "el", RR_AUDIO_MOUNT "/voice_el_unpack_bag.wav" },
-    { { "✏️", NULL }, "Task 1", "en", RR_AUDIO_MOUNT "/voice_en_task_1.wav" },
-    { { "✏️", NULL }, "Task 1", "el", RR_AUDIO_MOUNT "/voice_el_task_1.wav" },
-    { { "📐", NULL }, "Task 2", "en", RR_AUDIO_MOUNT "/voice_en_task_2.wav" },
-    { { "📐", NULL }, "Task 2", "el", RR_AUDIO_MOUNT "/voice_el_task_2.wav" },
-    { { "📦", NULL }, "Pack Bag", "en", RR_AUDIO_MOUNT "/voice_en_pack_bag.wav" },
-    { { "📦", NULL }, "Pack Bag", "el", RR_AUDIO_MOUNT "/voice_el_pack_bag.wav" },
-    { { "🛏️", NULL }, "Tidy Room", "en", RR_AUDIO_MOUNT "/voice_en_tidy_room.wav" },
-    { { "🛏️", NULL }, "Tidy Room", "el", RR_AUDIO_MOUNT "/voice_el_tidy_room.wav" },
-    { { "🧹", NULL }, "Vacuum", "en", RR_AUDIO_MOUNT "/voice_en_vacuum.wav" },
-    { { "🧹", NULL }, "Vacuum", "el", RR_AUDIO_MOUNT "/voice_el_vacuum.wav" },
-    { { "🍽️", "🥣" }, "Dishes", "en", RR_AUDIO_MOUNT "/voice_en_dishes.wav" },
-    { { "🍽️", "🥣" }, "Dishes", "el", RR_AUDIO_MOUNT "/voice_el_dishes.wav" },
-    { { NULL, NULL }, "well_done", "en", RR_AUDIO_MOUNT "/voice_en_well_done.wav" },
-    { { NULL, NULL }, "well_done", "el", RR_AUDIO_MOUNT "/voice_el_well_done.wav" },
-    { { NULL, NULL }, "all_done", "en", RR_AUDIO_MOUNT "/voice_en_all_done.wav" },
-    { { NULL, NULL }, "all_done", "el", RR_AUDIO_MOUNT "/voice_el_all_done.wav" },
+    RR_AUDIO_MOUNT "/tone_step_target.wav",
 };
 
 static inline const char *rr_audio_tone_path(rr_tone_id_t id)
 {
     if ((size_t)id >= RR_AUDIO_TONE_COUNT) return NULL;
     return RR_TONE_TABLE[id];
-}
-
-static inline bool rr_audio__streq(const char *a, const char *b)
-{
-    if (a == NULL || b == NULL) return false;
-    while (*a && *a == *b) { a++; b++; }
-    return *a == '\0' && *b == '\0';
-}
-
-/**
- * Find the clip for a step: EMOJI first, then the English label, both filtered
- * by language. NULL means "no clip for this step", which is normal — see the
- * coverage note at the top of this file. Callers should fall silent, not
- * substitute an unrelated sound.
- */
-static inline const char *rr_audio_voice_path(const char *emoji, const char *label,
-                                              const char *lang)
-{
-    if (lang == NULL) return NULL;
-
-    for (size_t i = 0; i < RR_AUDIO_VOICE_COUNT; i++) {
-        if (!rr_audio__streq(lang, RR_VOICE_TABLE[i].lang)) continue;
-        for (size_t e = 0; e < RR_AUDIO_VOICE_MAX_EMOJI; e++) {
-            if (RR_VOICE_TABLE[i].emoji[e] == NULL) break;
-            if (rr_audio__streq(emoji, RR_VOICE_TABLE[i].emoji[e])) {
-                return RR_VOICE_TABLE[i].path;
-            }
-        }
-    }
-    for (size_t i = 0; i < RR_AUDIO_VOICE_COUNT; i++) {
-        if (!rr_audio__streq(lang, RR_VOICE_TABLE[i].lang)) continue;
-        if (rr_audio__streq(label, RR_VOICE_TABLE[i].label)) return RR_VOICE_TABLE[i].path;
-    }
-    return NULL;
 }

@@ -1,6 +1,8 @@
 // Routine Rush Watch — application entry point.
 //
-// PHASE 8: full audio — ADPCM voice prompts, effects, volume + quiet hours.
+// AUDIO: tonal cues (alarm, routine start/complete, step tap, XP, daily step
+// target) plus the volume + quiet-hours policy. The Phase 8 ADPCM voice prompts
+// were removed — pre-rendered speech cannot cover free-text step labels.
 //
 // The watch mints a persistent device_id, generates an ephemeral pairing
 // nonce, renders both as a QR on the AMOLED, and waits. The parent app scans
@@ -160,7 +162,7 @@ static bool idle_suspended(void)
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "Routine Rush Watch — Phase 8 (voice prompts + audio policy)");
+    ESP_LOGI(TAG, "Routine Rush Watch — tonal audio + policy, steps, paged sync");
     ESP_LOGI(TAG, "ESP-IDF %s", esp_get_idf_version());
 
     // ── Power management: DFS ON, and light sleep ON as of Phase 10 ─────────
