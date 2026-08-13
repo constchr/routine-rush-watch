@@ -288,10 +288,38 @@ static int queue_status_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     return os_mbuf_append(ctxt->om, &st, sizeof(st)) == 0 ? 0 : BLE_ATT_ERR_INSUFFICIENT_RES;
 }
 
-// QUEUE_PULL — read (multi-packet) — a stream of [u16 len][JSON] frames.
+// ═════════════════════════════════════════════════════════════════════════════
+// QUEUE_PULL — read, PAGED (contract v3)
 //
-// NimBLE appends the WHOLE value here and handles ATT Read Blob fragmentation
-// itself, so this callback runs once per logical read regardless of MTU.
+// The framing constant is contract and is generated; rr_store restates it
+// because including ble_contract.h there would be a dependency cycle (rr_ble
+// already depends on rr_store). This file sees both, so it is where the two can
+// actually be checked — a contract change that is not mirrored fails the build
+// instead of silently corrupting every frame on the wire.
+_Static_assert(RR_QUEUE_FRAME_PREFIX_BYTES == RR_QUEUE_PULL_LEN_PREFIX_BYTES,
+               "rr_store's frame prefix disagrees with the generated contract");
+
+// The read cursor, in WIRE bytes from the head of the unacked region.
+//
+// SEPARATE FROM THE ACK CURSOR, AND THAT SEPARATION IS THE DESIGN. The ack
+// cursor (in rr_store, on flash) is what makes a record retired; this one only
+// tracks how far the phone has READ. A record that is pulled but never acked
+// stays queued and gets re-sent, which is the idempotency guarantee v3 had to
+// preserve while adding paging.
+//
+// It is RAM-only and deliberately so: it resets to 0 on connect, on disconnect
+// and on every accepted RUN_ACK, so a reconnect always restarts from a record
+// boundary rather than from wherever a dropped link happened to stop.
+static uint32_t s_pull_offset;
+
+static void pull_offset_reset(const char *why)
+{
+    if (s_pull_offset != 0) {
+        ESP_LOGI(TAG, "QUEUE_PULL: read offset reset to 0 (%s)", why);
+    }
+    s_pull_offset = 0;
+}
+
 static int queue_pull_access_cb(uint16_t conn_handle, uint16_t attr_handle,
                                 struct ble_gatt_access_ctxt *ctxt, void *arg)
 {
@@ -299,47 +327,65 @@ static int queue_pull_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     if (ctxt->op != BLE_GATT_ACCESS_OP_READ_CHR) return BLE_ATT_ERR_REQ_NOT_SUPPORTED;
     if (!conn_is_authorised(conn_handle)) return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
 
-    int need = rr_queue_read_unacked(NULL, 0);
-    if (need <= 0) {
-        ESP_LOGI(TAG, "QUEUE_PULL: queue empty");
-        return 0;   // zero-length value == nothing queued
-    }
-    if (need > RR_QUEUE_PULL_MAX) {
-        ESP_LOGW(TAG, "QUEUE_PULL: %d bytes queued, capping the read at %d",
-                 need, RR_QUEUE_PULL_MAX);
-        need = RR_QUEUE_PULL_MAX;
-    }
+    const uint32_t total = rr_queue_framed_size();
 
-    char *ndjson = malloc((size_t) need + 1);
-    if (ndjson == NULL) return BLE_ATT_ERR_INSUFFICIENT_RES;
-    int got = rr_queue_read_unacked(ndjson, (size_t) need);
-    if (got <= 0) { free(ndjson); return 0; }
-    ndjson[got] = '\0';
+    // Past the end (including an empty queue) is a normal answer, not an error:
+    // an empty page tells the phone "nothing more here" in the same shape as
+    // every other page, so its loop has exactly one termination condition.
+    uint32_t offset = s_pull_offset;
+    if (offset > total) offset = total;
 
-    // The queue is stored NDJSON but the contract frames each record as
-    // [u16 len][json] (§6B.3 QUEUE_PULL), so convert line-by-line here rather
-    // than changing the on-flash format — the log stays greppable and
-    // append-only, and the wire stays exactly what the phone decodes.
-    int rc = 0, frames = 0;
-    char *line = ndjson;
-    while (line != NULL && *line != '\0') {
-        char *nl = strchr(line, '\n');
-        size_t len = nl ? (size_t) (nl - line) : strlen(line);
-        if (len > 0 && len <= 0xFFFF) {
-            uint16_t l16 = (uint16_t) len;
-            if (os_mbuf_append(ctxt->om, &l16, sizeof(l16)) != 0 ||
-                os_mbuf_append(ctxt->om, line, len) != 0) {
-                rc = BLE_ATT_ERR_INSUFFICIENT_RES;
-                break;
-            }
-            frames++;
+    uint8_t *payload = NULL;
+    int got = 0;
+    if (offset < total) {
+        payload = malloc(RR_QUEUE_PULL_MAX_PAYLOAD);
+        if (payload == NULL) return BLE_ATT_ERR_INSUFFICIENT_RES;
+        got = rr_queue_read_framed(payload, offset, RR_QUEUE_PULL_MAX_PAYLOAD);
+        if (got < 0) {
+            free(payload);
+            ESP_LOGE(TAG, "QUEUE_PULL: framed read failed at offset %" PRIu32, offset);
+            return BLE_ATT_ERR_UNLIKELY;
         }
-        line = nl ? nl + 1 : NULL;
     }
-    free(ndjson);
 
-    ESP_LOGI(TAG, "QUEUE_PULL: streamed %d frame(s), %d bytes", frames, got);
-    return rc;
+    // ⚠️ The page header is built from the GENERATED struct, so its byte layout
+    // cannot drift from the phone's decoder.
+    rr_queue_pull_header_t hdr = {
+        .version = RR_QUEUE_PULL_VERSION,
+        .flags   = (offset + (uint32_t) got < total) ? RR_QUEUE_PULL_FLAG_MORE : 0,
+        .offset  = offset,
+        .total   = total,
+        .len     = (uint16_t) got,
+    };
+
+    int rc = 0;
+    if (os_mbuf_append(ctxt->om, &hdr, sizeof(hdr)) != 0 ||
+        (got > 0 && os_mbuf_append(ctxt->om, payload, (uint16_t) got) != 0)) {
+        rc = BLE_ATT_ERR_INSUFFICIENT_RES;
+    }
+    free(payload);
+    if (rc != 0) return rc;
+
+    // A page is header + at most RR_QUEUE_PULL_MAX_PAYLOAD by construction, so
+    // it cannot exceed the ATT ceiling. Assert it anyway: an over-long value is
+    // the exact defect v3 exists to remove, and it is invisible from this side —
+    // the phone just silently fails to read the tail.
+    const uint16_t value_len = OS_MBUF_PKTLEN(ctxt->om);
+    if (value_len > RR_QUEUE_PULL_MAX_VALUE) {
+        ESP_LOGE(TAG, "QUEUE_PULL: BUG — built a %u-byte value, over the %d-byte ATT ceiling",
+                 (unsigned) value_len, RR_QUEUE_PULL_MAX_VALUE);
+        return BLE_ATT_ERR_UNLIKELY;
+    }
+
+    // Auto-advance, so the happy path is one read per page with no round trip
+    // to move the cursor. The phone can always override with queue_seek.
+    s_pull_offset = offset + (uint32_t) got;
+
+    ESP_LOGI(TAG, "QUEUE_PULL: page @%" PRIu32 " +%d of %" PRIu32 " B%s (value %u B)",
+             offset, got, total,
+             (hdr.flags & RR_QUEUE_PULL_FLAG_MORE) ? ", MORE" : ", END",
+             (unsigned) value_len);
+    return 0;
 }
 
 // RUN_ACK — write — 38 bytes LE (see rr_run_ack_t).
@@ -378,6 +424,14 @@ static int run_ack_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "RUN_ACK: queue ack failed: %s", esp_err_to_name(err));
     }
+
+    // ⚠️ AN ACK MOVES THE BASE OF THE UNACKED STREAM, so every outstanding
+    // QUEUE_PULL offset now points somewhere else. Reset rather than try to
+    // rebase: 0 is the head of whatever is left, which is a record boundary and
+    // therefore always safe. The phone re-seeks per drain pass anyway; this
+    // makes the watch correct even if it does not.
+    pull_offset_reset("RUN_ACK advanced the queue");
+
     rr_ble_notify_queue_status();
     return 0;
 }
@@ -603,6 +657,39 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     // The offset is applied to the SCREEN only; the RTC keeps UTC. See
     // rr_rtc.h for why that split is load-bearing (run records are UTC "Z"
     // instants and would silently be wrong by the offset otherwise).
+    // ── queue_seek: set the QUEUE_PULL read offset (contract v3) ─────────────
+    //
+    // The paging recovery primitive. Reads auto-advance, so a normal drain never
+    // needs this; it exists so the phone can make its own view authoritative
+    // instead of the two sides inferring position from each other:
+    //   • seek(0) to start a drain, or to resume after a dropped link
+    //   • seek(n) to resync if a page arrives with an unexpected offset
+    //
+    // An offset past the end is deliberately NOT an error — the next read simply
+    // returns an empty page. Clamping-by-answering keeps the phone's loop to a
+    // single termination condition.
+    if (strcmp(cmd, "queue_seek") == 0) {
+        const cJSON *joff = cJSON_GetObjectItemCaseSensitive(env, "offset");
+        const bool have = cJSON_IsNumber(joff) && joff->valuedouble >= 0
+                          && joff->valuedouble <= (double) UINT32_MAX;
+        const uint32_t want = have ? (uint32_t) joff->valuedouble : 0;
+        cJSON_Delete(env);
+
+        if (!conn_is_authorised(conn_handle)) {
+            ESP_LOGW(TAG, "queue_seek REJECTED — connection not authorised");
+            return BLE_ATT_ERR_INSUFFICIENT_AUTHEN;
+        }
+        if (!have) {
+            ESP_LOGE(TAG, "queue_seek: no valid u32 \"offset\" in the envelope");
+            return BLE_ATT_ERR_UNLIKELY;
+        }
+
+        s_pull_offset = want;
+        ESP_LOGI(TAG, "queue_seek: read offset -> %" PRIu32 " (of %" PRIu32 " B queued)",
+                 want, rr_queue_framed_size());
+        return 0;
+    }
+
     if (strcmp(cmd, "set_tz") == 0) {
         const cJSON *joff = cJSON_GetObjectItemCaseSensitive(env, "offset_s");
         const bool have = cJSON_IsNumber(joff);
@@ -1054,20 +1141,42 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg);
 // value from that list connects reliably; an arbitrary one in between does not.
 // min == max on purpose — a RANGE lets the controller pick something off-list.
 //
-//   417.5 ms idle: still ~10x fewer transmissions than the 30-60 ms this
-//     replaced, so most of the estimated saving survives, and it is comfortably
-//     inside what iOS connects to. 852.5 ms would save more; it is one step away
-//     if a measurement says the extra is worth re-testing connectivity for.
+//   852.5 ms idle: Phase 10 took the step the previous comment here left open.
+//     See the discovery-budget note below for why this is the ceiling and not
+//     1022.5 ms.
 //   152.5 ms eager: Apple's fastest listed value, for the 30 s after a run is
 //     queued when a phone may be in the next room.
 //   30-60 ms pairing: fast is explicitly allowed for the first 30 s of a
 //     connectable accessory, and a parent is standing there holding the QR.
+//
+// ── Why 852.5 and not the top of Apple's list (Phase 10) ────────────────────
+//
+// DISCOVERY BUDGET. A scanner sees an advertiser once their windows coincide;
+// with the app scanning a full 8 s window, worst-case discovery measured 1.2 s
+// at 417.5 ms — ~2.9x the interval, which is the usual ratio once the three
+// channels and the 0-10 ms random delay are accounted for. Doubling the
+// interval doubles that: ~2.4 s worst case, leaving 5.6 s (3.3x) of margin
+// inside the 8 s window. That is still comfortable.
+//
+// The ceiling is NOT set by discovery, it is set by CONNECTION SETUP, and that
+// is the part this file has been burned by before (see the four-retry incident
+// above). Establishing a link needs the central to catch a SUBSEQUENT
+// advertising event inside its connect timeout, and 1000-1500 ms failed that
+// every time. 1022.5 ms is Apple-listed and would be another ~17% saving, but
+// it sits right on top of the value that broke, and IDLE is the state a Sync
+// press arrives in — adv_state() only escalates to EAGER on locally-known work
+// (a run queued), never on a connection the phone is about to attempt, so idle
+// advertising must be reliably CONNECTABLE, not merely discoverable.
+//
+// 852.5 ms is the largest Apple-listed value with real daylight between it and
+// the failure, so it is the maximum that is safe without re-running the
+// connect-reliability test on iOS.
 #define ADV_ITVL_PAIRING_MIN  0x0030   /*    30 ms */
 #define ADV_ITVL_PAIRING_MAX  0x0060   /*    60 ms */
 #define ADV_ITVL_EAGER_MIN    0x00F4   /*   152.5 ms — Apple-listed */
 #define ADV_ITVL_EAGER_MAX    0x00F4
-#define ADV_ITVL_IDLE_MIN     0x029C   /*   417.5 ms — Apple-listed */
-#define ADV_ITVL_IDLE_MAX     0x029C
+#define ADV_ITVL_IDLE_MIN     0x0554   /*   852.5 ms — Apple-listed */
+#define ADV_ITVL_IDLE_MAX     0x0554
 
 /** How long a freshly-queued run keeps advertising brisk. */
 #define ADV_EAGER_MS (30 * 1000)
@@ -1223,6 +1332,197 @@ void rr_ble_note_queue_activity(void)
     adv_refresh("run queued");
 }
 
+// ═════════════════════════════════════════════════════════════════════════════
+// Making an encryption failure legible
+//
+// "encryption change: status=7" was the entire diagnostic surface, and it sent
+// this project down the wrong path twice. Two things about that number:
+//
+//   1. IT IS NOT AN SMP CODE. It is a NimBLE ble_hs error, and the SMP pairing
+//      reasons live at a +0x400/+0x500 offset (BLE_HS_ERR_SM_US_BASE /
+//      _SM_PEER_BASE). Reading 7 as SMP "Command Not Supported" is a natural
+//      mistake and completely wrong.
+//   2. 7 IS BLE_HS_ENOTCONN, AND IT HAS EXACTLY ONE MEANING HERE: a security
+//      procedure was still in flight when the link went away. NimBLE raises it
+//      from ble_sm_connection_broken(), which runs from ble_gap_conn_broken()
+//      BEFORE the disconnect event is delivered — which is why the log always
+//      shows it immediately above "disconnected (reason 531)".
+//
+// Crucially, NimBLE only raises it if an SM proc EXISTED (ble_sm_process_result
+// returns early on proc == NULL). So seeing this at all PROVES the central
+// started a security procedure. It is the opposite of "iOS never initiates
+// pairing", which is what Phase 7 inferred from the macOS harnesses.
+// ═════════════════════════════════════════════════════════════════════════════
+static const char *sec_status_str(int status, char *buf, size_t buflen)
+{
+    // The SMP "pairing failed" reasons, shared by both direction bases.
+    static const char *const sm_reason[] = {
+        [0x01] = "passkey entry failed",        [0x02] = "OOB not available",
+        [0x03] = "authentication requirements", [0x04] = "confirm value failed",
+        [0x05] = "pairing not supported",       [0x06] = "encryption key size",
+        [0x07] = "command not supported",       [0x08] = "unspecified",
+        [0x09] = "repeated attempts",           [0x0A] = "invalid parameters",
+        [0x0B] = "DHKey check failed",          [0x0C] = "numeric comparison failed",
+        [0x0D] = "BR/EDR pairing in progress",  [0x0E] = "cross-transport key derivation",
+    };
+    const size_t sm_reason_n = sizeof(sm_reason) / sizeof(sm_reason[0]);
+
+    if (status == 0) {
+        snprintf(buf, buflen, "success");
+    } else if (status == BLE_HS_ENOTCONN) {
+        snprintf(buf, buflen,
+                 "BLE_HS_ENOTCONN — the link dropped while security was still in "
+                 "progress (the peer gave up and terminated)");
+    } else if (status == BLE_HS_ETIMEOUT) {
+        snprintf(buf, buflen, "BLE_HS_ETIMEOUT — the peer stopped responding mid-pairing");
+    } else if (status >= BLE_HS_ERR_HCI_BASE && status < BLE_HS_ERR_L2C_BASE) {
+        const int hci = status - BLE_HS_ERR_HCI_BASE;
+        snprintf(buf, buflen, "HCI 0x%02x%s", hci,
+                 hci == 0x06 ? " — PIN OR KEY MISSING (we do not hold the peer's key)"
+               : hci == 0x13 ? " — remote user terminated"
+               : hci == 0x3D ? " — MIC failure"
+               : "");
+    } else if (status >= BLE_HS_ERR_SM_US_BASE && status < BLE_HS_ERR_SM_PEER_BASE) {
+        const int r = status - BLE_HS_ERR_SM_US_BASE;
+        snprintf(buf, buflen, "SMP fail (we sent it) 0x%02x — %s", r,
+                 (r > 0 && (size_t) r < sm_reason_n && sm_reason[r]) ? sm_reason[r] : "unknown");
+    } else if (status >= BLE_HS_ERR_SM_PEER_BASE && status < BLE_HS_ERR_HW_BASE) {
+        const int r = status - BLE_HS_ERR_SM_PEER_BASE;
+        snprintf(buf, buflen, "SMP fail (PEER sent it) 0x%02x — %s", r,
+                 (r > 0 && (size_t) r < sm_reason_n && sm_reason[r]) ? sm_reason[r] : "unknown");
+    } else if (status >= BLE_HS_ERR_ATT_BASE && status < BLE_HS_ERR_HCI_BASE) {
+        snprintf(buf, buflen, "ATT 0x%02x", status - BLE_HS_ERR_ATT_BASE);
+    } else {
+        snprintf(buf, buflen, "ble_hs error %d", status);
+    }
+    return buf;
+}
+
+/** Do we hold a bond for this peer? Answers "stale bond" vs "no bond at all". */
+static bool have_bond_for(const ble_addr_t *peer)
+{
+    ble_addr_t peers[MYNEWT_VAL(BLE_STORE_MAX_BONDS)];
+    int count = 0;
+    if (ble_store_util_bonded_peers(peers, &count, sizeof(peers) / sizeof(peers[0])) != 0) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        if (peers[i].type == peer->type && memcmp(peers[i].val, peer->val, 6) == 0) return true;
+    }
+    return false;
+}
+
+/**
+ * How many consecutive encryption failures before the watch changes identity.
+ *
+ * Each Sync press is one attempt, so this is "press Sync three times and it
+ * heals itself" — slow enough that a single RF glitch, or a parent walking out
+ * of range mid-pairing, never triggers it; fast enough that a parent finds it
+ * before they find support. See rr_identity.h for why it must be > 1.
+ */
+#define RR_ENC_FAILS_BEFORE_ROTATE 3
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The stale-bond dead end, and the only way out of it.
+//
+// THE STATE. The phone holds an LTK for this watch's BLE address; the watch
+// does not hold the matching key. iOS opens the link, goes straight to
+// encryption with the key it has (it never sends a Pairing Request, so
+// BLE_GAP_EVENT_REPEAT_PAIRING — our existing handler for "bonded before, keys
+// disagree" — CANNOT fire), NimBLE answers the controller's LTK request with a
+// negative reply, and iOS terminates. Forever, identically, every attempt.
+//
+// WHY DROPPING OUR BOND IS NOT ENOUGH. It is correct hygiene and we do it, but
+// it changes nothing on its own: the phone still holds its key and still tries
+// it, and an iOS app CANNOT delete a BLE bond — a BLE-only watch is not even
+// listed in Settings > Bluetooth, so there is nothing for a parent to forget.
+//
+// WHAT ACTUALLY WORKS is presenting a BLE address the phone has never seen, so
+// it bonds fresh. That is what rr_identity's generation counter is for, and it
+// keeps device_id — so the server-side pairing, the child, and the routine
+// cache all survive. The cost is one dead entry in the phone's bond list.
+//
+// Until now the only recovery was erasing NVS, which regenerates device_id and
+// costs a QR re-registration for what is purely a link-layer problem.
+// ─────────────────────────────────────────────────────────────────────────────
+static void handle_encryption_failure(uint16_t conn_handle, int status)
+{
+    char why[160];
+    ESP_LOGE(TAG, "╔══ ENCRYPTION FAILED — status=%d ══", status);
+    ESP_LOGE(TAG, "║ %s", sec_status_str(status, why, sizeof(why)));
+
+    // The connection still exists here even when the failure IS the teardown:
+    // ble_gap_conn_broken() calls into SMP before it deletes the conn, so
+    // conn_find works and the peer identity is readable.
+    struct ble_gap_conn_desc desc;
+    if (ble_gap_conn_find(conn_handle, &desc) != 0) {
+        ESP_LOGE(TAG, "║ peer already gone — cannot tell whether the bond was stale");
+        ESP_LOGE(TAG, "╚══════════════════════════════════════");
+        return;
+    }
+
+    const bool bonded = have_bond_for(&desc.peer_id_addr);
+    const bool is_paired_peer =
+        rr_identity_is_paired_peer(desc.peer_id_addr.val, desc.peer_id_addr.type);
+
+    ESP_LOGE(TAG, "║ peer %02x:%02x:%02x:%02x:%02x:%02x (type %u)",
+             desc.peer_id_addr.val[5], desc.peer_id_addr.val[4], desc.peer_id_addr.val[3],
+             desc.peer_id_addr.val[2], desc.peer_id_addr.val[1], desc.peer_id_addr.val[0],
+             (unsigned) desc.peer_id_addr.type);
+    ESP_LOGE(TAG, "║ we hold a bond for it: %s | it is our paired phone: %s",
+             bonded ? "YES" : "no", is_paired_peer ? "YES" : "no");
+
+    // Only a watch that BELIEVES it is in service can be in the stale-bond dead
+    // end. An unpaired watch that fails encryption is a first pairing that went
+    // wrong — retrying is the right answer there, and rotating identity would
+    // be actively harmful.
+    if (!rr_identity_is_paired() || !(bonded || is_paired_peer)) {
+        ESP_LOGE(TAG, "║ not a stale-bond case — leaving the bond store alone");
+        ESP_LOGE(TAG, "╚══════════════════════════════════════");
+        return;
+    }
+
+    // Drop OUR side of a bond that demonstrably does not work. Keeping it only
+    // occupies one of three slots and makes log_bond_store() lie about health.
+    if (bonded) {
+        int rc = ble_store_util_delete_peer(&desc.peer_id_addr);
+        ESP_LOGW(TAG, "║ dropped our stale bond for this peer (rc=%d)", rc);
+    }
+
+    const uint8_t fails = rr_identity_note_enc_fail();
+    ESP_LOGE(TAG, "║ consecutive encryption failures: %u of %u before this watch "
+                  "changes BLE identity", (unsigned) fails, RR_ENC_FAILS_BEFORE_ROTATE);
+
+    if (fails < RR_ENC_FAILS_BEFORE_ROTATE) {
+        ESP_LOGE(TAG, "║ press Sync again — this heals itself at %d",
+                 RR_ENC_FAILS_BEFORE_ROTATE);
+        ESP_LOGE(TAG, "╚══════════════════════════════════════");
+        return;
+    }
+
+    ESP_LOGE(TAG, "║ THRESHOLD REACHED — rotating the BLE address so the phone");
+    ESP_LOGE(TAG, "║ bonds fresh. device_id, the child and the queued runs are kept.");
+    ESP_LOGE(TAG, "╚══════════════════════════════════════");
+
+    if (rr_identity_bump_ble_generation("repeated encryption failure (stale bond)") != ESP_OK) {
+        ESP_LOGE(TAG, "could not persist a new BLE generation — NOT rebooting, because "
+                      "a reboot that did not change the address would just loop");
+        return;
+    }
+    // Clear the count for the new identity: it is a fresh peripheral and gets a
+    // fresh budget. Leaving it at the threshold would rotate again on the next
+    // single failure, which is how the old boot-time heuristic reached gen 7.
+    rr_identity_clear_enc_fails();
+
+    // Reboot rather than re-address in place. The address is applied once in
+    // on_sync(), and unwinding live NimBLE/advertising state from inside a GAP
+    // callback during a teardown is exactly the kind of thing rr_ble_factory_reset
+    // already refuses to do. The parent presses Sync again ~2 s later.
+    ESP_LOGW(TAG, "rebooting to adopt the new BLE identity...");
+    vTaskDelay(pdMS_TO_TICKS(400));   // let the log drain over USB-JTAG
+    esp_restart();
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // GAP events
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1238,6 +1538,8 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             s_authed_conn = BLE_HS_CONN_HANDLE_NONE;
             ctl_reset();
             rx_reset();
+            // A new peer inherits no paging position from the previous one.
+            pull_offset_reset("new connection");
             ESP_LOGI(TAG, "connected (handle %u)", (unsigned) s_conn_handle);
 
             // Connection parameters are NOT requested here — see
@@ -1246,24 +1548,45 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
             // way to upset a link, and a mid-drain disconnect was observed on the
             // first hardware run with it here. Waiting for encryption costs
             // nothing: the drain cannot start before then anyway.
-#ifdef RR_DEV_NONCE_WHEN_PAIRED
-            // TEST BUILDS ONLY (see the root CMakeLists).
+            // ── ASK FOR SECURITY OURSELVES. NOW IN PRODUCTION. ───────────────
             //
-            // NimBLE answers a write to a WRITE_ENC characteristic on an
-            // unencrypted link with ATT 0x0F (Insufficient Encryption).
-            // CoreBluetooth starts pairing on 0x05 but NOT on 0x0F, so a macOS
-            // central retries forever and never bonds — which is what blocked
-            // the laptop harnesses. Asking for security from this side makes
-            // the bond happen.
+            // WHAT THIS SENDS: an SMP Security Request. It is a request, not a
+            // command — the central decides what to do with it. A central that
+            // holds a key starts encryption with it; a central that holds none
+            // starts pairing. Either way the link is encrypted before the first
+            // ATT write instead of after a failed one.
             //
-            // NOT enabled in shipping builds on purpose: the phone's pairing
-            // flow was validated against the current behaviour in Phase 2, and
-            // changing when security is requested is a change to that flow, not
-            // to the scheduler. Worth revisiting on its own (it likely affects
-            // the iOS app too) — but on its own, with the phone in hand.
+            // WHAT IT REPLACES. Until now the watch said nothing and relied on
+            // the central reacting to an ATT error: every characteristic is
+            // WRITE_ENC, so NimBLE answers a write on an unencrypted link with
+            // ATT 0x0F (Insufficient Encryption), and the central is supposed to
+            // pair and retry. iOS does. macOS does NOT — CoreBluetooth pairs on
+            // 0x05 but not on 0x0F — which is what blocked the laptop harnesses
+            // and is why this line existed behind a dev flag at all.
+            //
+            // ⚠️ WHAT IT DOES *NOT* FIX: the stale-bond failure below. A central
+            // that holds a key uses that key whether it was asked to encrypt or
+            // volunteered — NimBLE routes both into the same LTK-restore path.
+            // Shipping this is a robustness change, not the cure for status=7.
+            //
+            // WHY IT IS SAFE TO SHIP. Pairing stays Just Works with no IO
+            // capability, so no prompt appears and nothing about the QR/nonce
+            // handshake moves; the nonce is still what authenticates, and
+            // conn_is_authorised() is unchanged. What changes is ORDER: a first
+            // pairing now encrypts on connect rather than on the first rejected
+            // write, and a reconnect encrypts a few ms earlier than it did. The
+            // Phase 2 flow is a strict subset of that — it still works if the
+            // central ignores the request entirely, because the WRITE_ENC gate
+            // is untouched and the old ATT-0x0F path is still there underneath.
             int sec = ble_gap_security_initiate(s_conn_handle);
-            ESP_LOGW(TAG, "DEV BUILD: security_initiate -> %d", sec);
-#endif
+            if (sec == 0 || sec == BLE_HS_EALREADY) {
+                // EALREADY == the central beat us to it. Normal on reconnect.
+                ESP_LOGI(TAG, "security requested (rc=%d)", sec);
+            } else {
+                // Not fatal: the ATT 0x0F path still prompts a compliant central.
+                ESP_LOGW(TAG, "security_initiate failed (rc=%d) — falling back to the "
+                              "ATT 0x0F path; iOS handles it, macOS does not", sec);
+            }
         } else {
             ESP_LOGW(TAG, "connect failed (status %d) — re-advertising", event->connect.status);
             advertise();
@@ -1279,6 +1602,9 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         s_authed_conn = BLE_HS_CONN_HANDLE_NONE;
         rx_reset();
         ctl_reset();
+        // Drop the paging position: a resumed drain must restart from a record
+        // boundary, never from wherever the link happened to die.
+        pull_offset_reset("peer disconnected");
         // Force a re-pick of the interval: the state may have changed while the
         // phone was connected (a routine finished, or pairing completed).
         s_adv_state = (rr_adv_state_t) -1;
@@ -1311,10 +1637,23 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
         // any relaxation belongs AFTER the drain completes, not before it. The
         // CONN_UPDATE logging below is kept so the link's actual parameters are
         // visible in any capture.
-        // Bonding completed (or failed). Phase 1 does not gate TIME_SYNC on
-        // encryption, so this is informational — it tells us the bond path
-        // works before Phase 2 starts depending on it.
-        ESP_LOGI(TAG, "encryption change: status=%d", event->enc_change.status);
+        if (event->enc_change.status == 0) {
+            struct ble_gap_conn_desc desc;
+            if (ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0) {
+                ESP_LOGI(TAG, "ENCRYPTED (bonded=%d authenticated=%d key_size=%d)",
+                         (int) desc.sec_state.bonded, (int) desc.sec_state.authenticated,
+                         (int) desc.sec_state.key_size);
+            } else {
+                ESP_LOGI(TAG, "encryption change: success");
+            }
+            // Whatever was wrong is no longer wrong. Reset the escape-hatch
+            // budget here and nowhere else, so the counter only ever describes
+            // an UNBROKEN run of failures.
+            rr_identity_clear_enc_fails();
+        } else {
+            handle_encryption_failure(event->enc_change.conn_handle,
+                                      event->enc_change.status);
+        }
         return 0;
 
     case BLE_GAP_EVENT_SUBSCRIBE:

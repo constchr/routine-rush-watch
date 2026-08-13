@@ -138,3 +138,28 @@ uint8_t rr_identity_ble_generation(void);
 
 /** Bump and persist. Call only when a fresh BLE identity is genuinely needed. */
 esp_err_t rr_identity_bump_ble_generation(const char *reason);
+
+// ── Consecutive encryption failures — the trigger for the escape above ───────
+//
+// The stale-bond dead end is only escapable by rotating the BLE address, and
+// rotating is disruptive enough that it must never be inferred from a static
+// snapshot of state. An earlier attempt DID infer it — "paired with zero bonds
+// at boot" — and turned a crash loop into a pairing-prompt loop, because zero
+// bonds is also what a watch looks like moments before a legitimate first pair.
+//
+// So the trigger is now an OBSERVED, REPEATED failure of the exact operation
+// that is broken: the phone tried to encrypt and could not. A crash loop
+// produces none of these. A parent walking out of range mid-pairing produces
+// one, not three. Only a genuinely stale key produces them forever.
+//
+// Counted in rr_ble's BLE_GAP_EVENT_ENC_CHANGE and cleared the moment any
+// connection encrypts successfully.
+
+/** Consecutive failed encryption attempts since the last successful one. */
+uint8_t rr_identity_enc_fail_count(void);
+
+/** Record one failure; returns the new count. */
+uint8_t rr_identity_note_enc_fail(void);
+
+/** Reset the count. Called on every successful encryption. */
+void rr_identity_clear_enc_fails(void);

@@ -92,7 +92,31 @@ const layouts = {
   QUEUE_STATUS: parseLayout('QUEUE_STATUS'),
   TIME_SYNC: parseLayout('TIME_SYNC'),
   RUN_ACK: parseLayout('RUN_ACK'),
+  // v3: QUEUE_PULL's page header is a fixed layout like any other, so it gets
+  // the same offset/size validation and the same _Static_assert on the C side.
+  QUEUE_PULL_HEADER: parseLayout('QUEUE_PULL_HEADER'),
 }
+
+// ── v3 paging constants ─────────────────────────────────────────────────────
+// Parsed, never retyped. If the firmware and the contract disagreed about the
+// 512-byte ceiling or the 12-byte header, the result would be a value that
+// overflows an ATT read — which is the exact bug v3 exists to remove, so it is
+// the last thing that should be duplicated by hand.
+const num = (name) => Number(
+  src.match(new RegExp(`export const ${name}\\s*=\\s*(0x[0-9a-f]+|\\d+)`, 'i'))?.[1]
+  ?? fail(`could not find ${name} in the contract`),
+)
+const pullMaxValue = num('QUEUE_PULL_MAX_VALUE')
+const pullHeaderSize = num('QUEUE_PULL_HEADER_SIZE')
+const pullVersion = num('QUEUE_PULL_VERSION')
+const pullFlagMore = num('QUEUE_PULL_FLAG_MORE')
+const pullMaxPayload = pullMaxValue - pullHeaderSize
+
+if (pullHeaderSize !== layouts.QUEUE_PULL_HEADER.size) {
+  fail(`QUEUE_PULL_MAX_VALUE/HEADER_SIZE disagree with the parsed header layout `
+       + `(${pullHeaderSize} vs ${layouts.QUEUE_PULL_HEADER.size})`)
+}
+if (pullMaxPayload <= 0) fail('QUEUE_PULL header does not leave room for a payload')
 
 // ── RR_CONTROL response codes ───────────────────────────────────────────────
 // The ATT statuses a command handler returns. They ARE contract — the phone
@@ -172,8 +196,14 @@ for (const [name, { fields, size }] of Object.entries(layouts)) {
 
 h += `
 // ── Variable-length framing ──────────────────────────────────────────────────
-// QUEUE_PULL:    [u16 len][len bytes UTF-8 JSON]  repeated, one frame per run.
-//                A trailing PARTIAL frame is legal — retain the tail and resume.
+// QUEUE_PULL:    PAGED since v3. Every read is [12-byte page header][payload],
+//                payload <= ${pullMaxPayload} B, so the value can never exceed the
+//                ${pullMaxValue}-byte ATT ceiling (BLE_ATT_ATTR_MAX_LEN).
+//                The concatenated payloads form the frame stream:
+//                  [u16 len][len bytes UTF-8 JSON]  repeated, one frame per run.
+//                A FRAME MAY SPAN PAGES — that is what lets a run record of any
+//                step count through. A trailing PARTIAL frame is legal; retain
+//                the tail and resume with the next page.
 // ROUTINE_PUSH:  [u32 len][len bytes UTF-8 JSON]  one blob (u32 because a full
 //                routine set can exceed 64 KB). v2: PURE routine data.
 // RR_CONTROL:    [u32 len][len bytes UTF-8 JSON]  one command envelope,
@@ -181,6 +211,21 @@ h += `
 #define RR_QUEUE_PULL_LEN_PREFIX_BYTES   2
 #define RR_ROUTINE_PUSH_LEN_PREFIX_BYTES 4
 #define RR_CONTROL_LEN_PREFIX_BYTES      ${controlPrefix}
+
+// ── QUEUE_PULL paging (contract v3) ──────────────────────────────────────────
+// RR_QUEUE_PULL_MAX_VALUE is a HARD BLUETOOTH CEILING, not a tunable: it is the
+// maximum length of an ATT attribute value, so a central cannot read more than
+// this from one characteristic whatever the MTU is. Serving more silently
+// produces a value the phone can never fully read — which is what made every
+// run record over ~2 steps permanently undrainable before v3.
+// (RR_QUEUE_PULL_HEADER_SIZE is emitted above with the header's struct layout.)
+#define RR_QUEUE_PULL_VERSION            ${pullVersion}
+#define RR_QUEUE_PULL_MAX_VALUE          ${pullMaxValue}
+#define RR_QUEUE_PULL_MAX_PAYLOAD        ${pullMaxPayload}
+#define RR_QUEUE_PULL_FLAG_MORE          0x${pullFlagMore.toString(16).padStart(2, '0')}
+_Static_assert(RR_QUEUE_PULL_HEADER_SIZE + RR_QUEUE_PULL_MAX_PAYLOAD
+               <= RR_QUEUE_PULL_MAX_VALUE,
+               "a QUEUE_PULL page must fit inside the ATT attribute ceiling");
 
 // ── RR_CONTROL response codes ────────────────────────────────────────────────
 // RR_CONTROL is write-only with NO notify: the ATT write response IS the reply

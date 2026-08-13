@@ -83,6 +83,21 @@ jobs:
           esp_idf_version: ${{ env.IDF_VERSION }}
           target: esp32c6
 
+      # The queue's wire-format arithmetic, run on the host against the REAL
+      # rr_store.c. Contract v3 pages QUEUE_PULL at 500 bytes, so a page boundary
+      # can land inside a frame's 2-byte length prefix — arithmetic that is wrong
+      # only at particular alignments and cannot be seen from the watch's own log.
+      #
+      # This is the test class that was missing when v2 shipped a QUEUE_PULL that
+      # could not carry any routine longer than two steps.
+      - name: Queue framing tests (host)
+        run: |
+          # esp-idf-ci-action leaves the IDF checkout behind; find cJSON in it.
+          IDF_PATH="${IDF_PATH:-$(find / -maxdepth 6 -type d -name 'esp-idf' 2>/dev/null | head -1)}"
+          export IDF_PATH
+          echo "IDF_PATH=$IDF_PATH"
+          tools/host-test/run.sh
+
       # Guard the Phase 0 lessons that are easy to undo by accident. These are
       # asserted against the GENERATED sdkconfig, not sdkconfig.defaults, so a
       # setting silently overridden by a component's Kconfig is still caught.
@@ -120,6 +135,34 @@ jobs:
             exit 1
           fi
           echo "wifi not linked OK"
+
+      # The dev hooks weaken the two things that make a watch someone's watch:
+      # RR_DEV_NONCE mints a pairing nonce on an ALREADY-PAIRED watch (anyone in
+      # BLE range who can read the log gets full authorisation, including
+      # factory_reset) and churns the BLE identity every boot. RR_CLEAR_BONDS
+      # erases the bond store at boot.
+      #
+      # A default `idf.py build` sets none of them — this asserts that property
+      # against the LINKED IMAGE rather than against the CMake input, so a stray
+      # -D, a cached CMake variable, or a component that appends the define is
+      # caught too. The marker strings are the log lines those paths print;
+      # if they are in the binary, the code is in the binary.
+      - name: Assert no dev/test hooks in the release image
+        run: |
+          BIN=build/routine_rush_watch.bin
+          fail=0
+          check() {
+            if strings "$BIN" | grep -qF "$1"; then
+              echo "::error::$2"
+              fail=1
+            fi
+          }
+          check "DEV BUILD: nonce auth enabled on a PAIRED watch" \
+            "RR_DEV_NONCE is compiled in — a paired watch would mint a pairing nonce and churn its BLE address. Build without -DRR_DEV_NONCE."
+          check "RR_CLEAR_BONDS: BLE bond store cleared" \
+            "RR_CLEAR_BONDS is compiled in — this image erases all BLE bonds at boot. Build without -DRR_CLEAR_BONDS."
+          [ "$fail" -eq 0 ] || exit 1
+          echo "no dev hooks in the image OK"
 
       - name: Report binary size
         run: |

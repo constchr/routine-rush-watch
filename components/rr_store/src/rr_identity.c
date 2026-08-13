@@ -265,3 +265,72 @@ esp_err_t rr_identity_bump_ble_generation(const char *reason)
              (unsigned) (next - 1), (unsigned) next, reason ? reason : "unspecified");
     return ESP_OK;
 }
+
+// ── Consecutive encryption failures (see rr_identity.h) ──────────────────────
+//
+// PERSISTED, not a RAM counter, and that is the whole point. The watch does not
+// reboot between Sync presses on a desk — but in the field the parent tries
+// twice, puts the watch on the charger, and tries again tomorrow. A RAM counter
+// resets on every boot and so never reaches the threshold, which means the
+// escape hatch never opens for the only user who actually needs it.
+//
+// Three NVS writes per broken pairing is nothing against the wear budget.
+
+#define NVS_KEY_ENC_FAILS "enc_fails"
+
+static uint8_t s_enc_fails;
+static bool    s_enc_fails_loaded;
+
+uint8_t rr_identity_enc_fail_count(void)
+{
+    if (s_enc_fails_loaded) return s_enc_fails;
+
+    nvs_handle_t h;
+    if (nvs_open(NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
+        uint8_t v = 0;
+        if (nvs_get_u8(h, NVS_KEY_ENC_FAILS, &v) == ESP_OK) s_enc_fails = v;
+        nvs_close(h);
+    }
+    s_enc_fails_loaded = true;
+    return s_enc_fails;
+}
+
+static esp_err_t enc_fails_store(uint8_t v)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u8(h, NVS_KEY_ENC_FAILS, v);
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    if (err != ESP_OK) return err;
+
+    s_enc_fails = v;
+    s_enc_fails_loaded = true;
+    return ESP_OK;
+}
+
+uint8_t rr_identity_note_enc_fail(void)
+{
+    const uint8_t next = (uint8_t) (rr_identity_enc_fail_count() + 1);
+    // A failed write is not worth failing the caller over: the counter is a
+    // heuristic for opening an escape hatch, and losing it costs one more
+    // retry, not correctness.
+    if (enc_fails_store(next) != ESP_OK) {
+        ESP_LOGW(TAG, "could not persist the encryption-failure count");
+        s_enc_fails = next;          // at least count within this boot
+        s_enc_fails_loaded = true;
+    }
+    return next;
+}
+
+void rr_identity_clear_enc_fails(void)
+{
+    // Cheap guard against writing NVS on every single successful connection.
+    if (s_enc_fails_loaded && s_enc_fails == 0) return;
+    if (rr_identity_enc_fail_count() == 0) return;
+
+    ESP_LOGI(TAG, "encryption succeeded — clearing the failure count (was %u)",
+             (unsigned) s_enc_fails);
+    enc_fails_store(0);
+}

@@ -29,6 +29,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>   // uint8_t/uint32_t below; do not rely on a transitive include
 #include "esp_err.h"
 
 /** Mount the littlefs partition (formats it on first boot). Logs free space. */
@@ -124,8 +125,48 @@ int rr_queue_count(void);
 /**
  * Copy every unacked record into `out` as NDJSON. Returns bytes written, or
  * -1 on error. Pass NULL to query the required size.
+ *
+ * ⚠️ NOT the BLE path. This needs the whole unacked region to fit in `cap`, and
+ * a real backlog does not fit anywhere sensible. QUEUE_PULL uses the paged
+ * framed-stream API below. Kept for tooling and tests.
  */
 int rr_queue_read_unacked(char *out, size_t cap);
+
+// ── The FRAMED stream (contract v3 paging) ───────────────────────────────────
+//
+// The frame prefix width is contract, and the contract's generated copy is
+// RR_QUEUE_PULL_LEN_PREFIX_BYTES in ble_contract.h. It is restated here rather
+// than included because ble_contract.h lives in rr_ble, and rr_ble already
+// depends on rr_store — including it back would be a dependency cycle.
+//
+// It cannot drift silently: rr_ble.c sees BOTH headers and carries a
+// _Static_assert that the two agree, so a change to the contract that is not
+// mirrored here fails the build rather than corrupting the wire.
+#define RR_QUEUE_FRAME_PREFIX_BYTES 2
+//
+// The wire format is not the storage format. On flash a record is `json\n`; on
+// the wire it is `[u16 len][json]`. So record i occupies (len_i + 1) bytes on
+// flash and (len_i + 2) bytes on the wire, and the two coordinate spaces do not
+// line up. These functions work exclusively in WIRE offsets, measured from the
+// head of the UNACKED region (i.e. offset 0 is the first byte of the first
+// frame the phone still needs).
+//
+// They exist because QUEUE_PULL must serve at most 500 bytes at a time and a
+// single record can be several KB: a page boundary can land anywhere, including
+// in the middle of a frame's 2-byte length prefix. Neither function ever
+// materialises the whole stream — they walk lines and read only the slice asked
+// for, so memory is O(1) in the size of the backlog.
+
+/** Total bytes the unacked region occupies as a framed wire stream. */
+uint32_t rr_queue_framed_size(void);
+
+/**
+ * Copy up to `cap` bytes of the framed stream starting at wire offset `offset`.
+ *
+ * Returns bytes written (0 at or past the end — not an error), or -1.
+ * A partial frame is a normal, expected result: the caller is paging.
+ */
+int rr_queue_read_framed(uint8_t *out, uint32_t offset, size_t cap);
 
 /**
  * Ack the record at the head of the queue if its local_id matches, advancing

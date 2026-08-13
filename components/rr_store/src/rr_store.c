@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -29,7 +30,11 @@ static const char *TAG = "rr_store";
 // Mounted at /lfs, not /littlefs: the generated emoji manifest hardcodes
 // "/lfs/emoji/<cp>.bin" and it is generated in the app repo, so the firmware
 // matches the manifest rather than the other way round.
+// Overridable so tools/host-test can point the same code at a temp directory
+// and exercise it on a workstation. The firmware never defines it.
+#ifndef MOUNT_POINT
 #define MOUNT_POINT   "/lfs"
+#endif
 #define PARTITION_LBL "littlefs"
 #define CACHE_DIR     MOUNT_POINT "/cache"
 #define ROUTINES_PATH CACHE_DIR "/routines.json"
@@ -422,10 +427,17 @@ static void queue_changed(void)
 #define RUNS_PATH    QUEUE_DIR "/runs.log"
 #define CURSOR_PATH  QUEUE_DIR "/cursor.json"
 
-// Longest run-record line handled in one read. Records measured ~600 B for a
-// real routine; 1 KB is comfortable. Allocated on the HEAP wherever it is used —
-// see rr_queue_ack() on why a stack buffer this size is not safe here.
-#define QUEUE_LINE_MAX 1024
+// ⚠️ SANITY BOUND, NOT A WORKING SIZE. Nothing here reads a record into a
+// buffer of this size — readers measure each line and allocate to fit (see
+// line_len_at / read_line_at). This exists only so a corrupt log with no
+// newline in it cannot make a scan run to the end of the filesystem.
+//
+// It replaced QUEUE_LINE_MAX = 1024, which WAS a working size and was wrong:
+// a record costs ~260 B + ~113 B/step, so an 8-step routine exceeded it and
+// fgets silently truncated. See the note above rr_queue_ack().
+//
+// 64 KB is also the real ceiling on a record: the wire frame length is a u16.
+#define QUEUE_RECORD_MAX 65535
 
 static long cursor_get(void)
 {
@@ -535,6 +547,55 @@ int rr_queue_read_unacked(char *out, size_t cap)
     return (int) got;
 }
 
+// ── Line geometry, without a fixed-size line buffer ──────────────────────────
+//
+// ⚠️ WHAT THIS REPLACES, AND WHY IT MATTERED. Every reader here used
+// `fgets(buf, QUEUE_LINE_MAX, f)` with QUEUE_LINE_MAX = 1024. A run record
+// costs ~260 B plus ~113 B per step, so an 8-step routine crosses 1024 bytes —
+// and past that fgets silently returns a TRUNCATED line. In rr_queue_ack that
+// was not cosmetic: the truncated JSON failed to parse, local_id never matched,
+// the ack was logged as "does not match the queue head — ignoring", and the
+// cursor never advanced. The record became permanently un-ackable.
+//
+// So paging QUEUE_PULL alone would not have fixed the drain: the phone would
+// finally have been able to READ an 11-step record and still never able to
+// retire it. Both ends of the pipe had the same fixed-size assumption.
+//
+// Nothing here assumes a line length. Lengths are measured by scanning, and
+// content is read in bounded slices.
+
+/**
+ * Byte length of the line beginning at `off`, excluding the newline.
+ * Returns -1 if there is no line there or it exceeds QUEUE_RECORD_MAX.
+ */
+static long line_len_at(FILE *f, long off)
+{
+    if (fseek(f, off, SEEK_SET) != 0) return -1;
+    long n = 0;
+    int c;
+    while ((c = fgetc(f)) != EOF) {
+        if (c == '\n') return n;
+        if (++n > QUEUE_RECORD_MAX) return -1;   // corrupt or runaway
+    }
+    return n > 0 ? n : -1;   // final line with no trailing newline
+}
+
+/** Read the line at `off` into a fresh NUL-terminated heap buffer. */
+static char *read_line_at(FILE *f, long off, long *len_out)
+{
+    long len = line_len_at(f, off);
+    if (len < 0) return NULL;
+    char *buf = malloc((size_t) len + 1);
+    if (buf == NULL) return NULL;
+    if (fseek(f, off, SEEK_SET) != 0 || fread(buf, 1, (size_t) len, f) != (size_t) len) {
+        free(buf);
+        return NULL;
+    }
+    buf[len] = '\0';
+    if (len_out) *len_out = len;
+    return buf;
+}
+
 esp_err_t rr_queue_ack(const char *local_id)
 {
     if (!s_mounted || local_id == NULL) return ESP_ERR_INVALID_ARG;
@@ -549,18 +610,20 @@ esp_err_t rr_queue_ack(const char *local_id)
 
     FILE *f = fopen(RUNS_PATH, "rb");
     if (f == NULL) return ESP_FAIL;
-    fseek(f, off, SEEK_SET);
 
     // HEAP, not stack. This runs on the nimble_host task (RUN_ACK arrives as a
     // GATT write), whose stack is ~4 KB — and a 1 KB frame here nested inside
     // another 1 KB frame in rr_queue_oldest_ts() overflowed it outright:
     // "Guru Meditation Error: Core 0 panic'ed (Stack protection fault),
     //  task nimble_host", reproducibly, on every ack. Two 1 KB stack buffers in
-    // a library reachable from a BLE callback is simply too much to ask.
-    char *line = malloc(QUEUE_LINE_MAX);
-    if (line == NULL) { fclose(f); return ESP_ERR_NO_MEM; }
-    if (fgets(line, QUEUE_LINE_MAX, f) == NULL) { free(line); fclose(f); return ESP_FAIL; }
-    long next = ftell(f);
+    // a library reachable from a BLE callback is simply too much to ask. It is
+    // now sized to the record instead of to a guess, which is also why the
+    // guess no longer has to be big enough for the worst case.
+    long len = 0;
+    char *line = read_line_at(f, off, &len);
+    if (line == NULL) { fclose(f); return ESP_FAIL; }
+    // +1 for the newline, unless this was a final line without one.
+    long next = off + len + ((off + len < st.st_size) ? 1 : 0);
     fclose(f);
 
     cJSON *j = cJSON_Parse(line);
@@ -588,25 +651,128 @@ esp_err_t rr_queue_ack(const char *local_id)
 
 uint32_t rr_queue_oldest_ts(void)
 {
-    // HEAP, for the same reason as rr_queue_ack: QUEUE_STATUS is read from the
-    // nimble_host task, and this used to put 1 KB on a 4 KB stack.
-    char *buf = malloc(QUEUE_LINE_MAX);
-    if (buf == NULL) return 0;
+    if (!s_mounted) return 0;
+    struct stat st;
+    if (stat(RUNS_PATH, &st) != 0) return 0;
+    long off = cursor_get();
+    if (off >= st.st_size) return 0;
 
-    int n = rr_queue_read_unacked(buf, QUEUE_LINE_MAX - 1);
-    if (n <= 0) { free(buf); return 0; }
-    buf[n] = '\0';
-    char *nl = strchr(buf, '\n');
-    if (nl) *nl = '\0';
-    cJSON *j = cJSON_Parse(buf);
+    FILE *f = fopen(RUNS_PATH, "rb");
+    if (f == NULL) return 0;
+    // Only the HEAD line, sized to itself. This used to pull the whole unacked
+    // region into a 1 KB buffer and return -1 (reported as 0) the moment the
+    // backlog outgrew it — so a watch with real work to do reported
+    // "oldest_ts = 0", i.e. "nothing queued", in QUEUE_STATUS.
+    char *line = read_line_at(f, off, NULL);
+    fclose(f);
+    if (line == NULL) return 0;
+
+    cJSON *j = cJSON_Parse(line);
     uint32_t ts = 0;
     if (j) {
         const cJSON *e = cJSON_GetObjectItemCaseSensitive(j, "completed_epoch");
         if (cJSON_IsNumber(e)) ts = (uint32_t) e->valuedouble;
         cJSON_Delete(j);
     }
-    free(buf);
+    free(line);
     return ts;
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The framed wire stream (contract v3)
+//
+// Storage is `json\n` per record; the wire is `[u16 len][json]`. Record i is
+// therefore (len_i + 1) bytes on flash and (len_i + 2) on the wire, so the two
+// coordinate spaces drift apart by one byte per record and cannot be used
+// interchangeably. Everything below is in WIRE offsets from the head of the
+// unacked region.
+//
+// Neither function materialises the stream. They walk the line geometry — which
+// costs one scan per record and no heap — and read only the requested slice.
+// That matters: the whole point of v3 is that a backlog may be far larger than
+// anything the watch can hold in RAM at once.
+// ═════════════════════════════════════════════════════════════════════════════
+
+uint32_t rr_queue_framed_size(void)
+{
+    if (!s_mounted) return 0;
+    struct stat st;
+    if (stat(RUNS_PATH, &st) != 0) return 0;
+    long off = cursor_get();
+    if (off >= st.st_size) return 0;
+
+    FILE *f = fopen(RUNS_PATH, "rb");
+    if (f == NULL) return 0;
+
+    uint32_t framed = 0;
+    while (off < st.st_size) {
+        long len = line_len_at(f, off);
+        if (len < 0) break;
+        framed += (uint32_t) len + RR_QUEUE_FRAME_PREFIX_BYTES;
+        off += len + 1;
+    }
+    fclose(f);
+    return framed;
+}
+
+int rr_queue_read_framed(uint8_t *out, uint32_t offset, size_t cap)
+{
+    if (!s_mounted || out == NULL || cap == 0) return -1;
+    struct stat st;
+    if (stat(RUNS_PATH, &st) != 0) return 0;
+    long off = cursor_get();
+    if (off >= st.st_size) return 0;
+
+    FILE *f = fopen(RUNS_PATH, "rb");
+    if (f == NULL) return -1;
+
+    uint32_t framed_base = 0;   // wire offset of the frame starting at `off`
+    size_t written = 0;
+
+    while (off < st.st_size && written < cap) {
+        long len = line_len_at(f, off);
+        if (len < 0) break;
+        const uint32_t frame_size = (uint32_t) len + RR_QUEUE_FRAME_PREFIX_BYTES;
+
+        if (offset >= framed_base + frame_size) {
+            // Entirely before the window — skip without reading its bytes.
+            framed_base += frame_size;
+            off += len + 1;
+            continue;
+        }
+
+        // `within` is where the copy starts INSIDE this frame: 0 or 1 means it
+        // starts inside the 2-byte length prefix, which is exactly the case a
+        // page boundary can land on and the reason this cannot be done by
+        // seeking to a file offset alone.
+        uint32_t within = (offset > framed_base) ? offset - framed_base : 0;
+
+        // 1. the u16 LE length prefix, if the window covers any of it
+        while (within < RR_QUEUE_FRAME_PREFIX_BYTES && written < cap) {
+            const uint16_t l16 = (uint16_t) len;
+            out[written++] = (uint8_t) ((l16 >> (8 * within)) & 0xFF);
+            within++;
+        }
+        // 2. the JSON body, read straight out of the file at the right place
+        if (written < cap && within >= RR_QUEUE_FRAME_PREFIX_BYTES) {
+            const long json_skip = (long) within - RR_QUEUE_FRAME_PREFIX_BYTES;
+            long avail = len - json_skip;
+            if (avail > 0) {
+                size_t want = (size_t) avail;
+                if (want > cap - written) want = cap - written;
+                if (fseek(f, off + json_skip, SEEK_SET) != 0) break;
+                size_t got = fread(out + written, 1, want, f);
+                written += got;
+                if (got != want) break;   // short read: stop, report what we have
+            }
+        }
+
+        framed_base += frame_size;
+        off += len + 1;
+    }
+
+    fclose(f);
+    return (int) written;
 }
 
 // ── Phase 6/7: schedule matching ─────────────────────────────────────────────

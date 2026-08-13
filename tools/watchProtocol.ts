@@ -1,12 +1,21 @@
 // ─────────────────────────────────────────────────────────────
 // RR_SYNC — GATT contract for the Routine Rush watch companion
 //
-// CONTRACT VERSION 2 — re-frozen 2026-08-11.
+// CONTRACT VERSION 3 — re-frozen 2026-08-13.
+//   v3 makes QUEUE_PULL PAGED: every read returns a 12-byte page header plus
+//   at most 500 bytes, so a value can never exceed the 512-byte ATT ceiling.
+//   A run record may now span pages, which removes the hard limit of ~2 steps
+//   per routine that made every longer run permanently undrainable. Adds the
+//   RR_CONTROL `queue_seek` command as the paging recovery primitive.
+//   No UUID changed; QUEUE_STATUS, RUN_ACK, TIME_SYNC, ROUTINE_PUSH and the
+//   frame layer are untouched.
+//
 //   v2 adds RR_CONTROL (6th characteristic) and moves command traffic
 //   (nonce_auth, factory_reset) off the ROUTINE_PUSH envelope onto it.
 //   ROUTINE_PUSH is once again PURELY routine data.
-//   This was a deliberate, coordinated amendment — the freeze exists to
-//   prevent SILENT drift, not to prevent evolution. Both sides regenerated.
+//
+//   Each of these was a deliberate, coordinated amendment — the freeze exists
+//   to prevent SILENT drift, not to prevent evolution. Both sides regenerated.
 //
 // Firmware spec §6B.3.  THIS FILE IS THE CONTRACT between two codebases:
 // the phone (TypeScript, here) and the watch firmware (C, elsewhere) implement
@@ -38,7 +47,7 @@ export const RR_SYNC_SERVICE_UUID = 'fc19364a-c250-4477-928d-28c55ac1c2bd'
 export const RR_SYNC_CHARACTERISTICS = {
   /** read | notify — fixed 9-byte status block. */
   QUEUE_STATUS: '4f42f9af-8944-4c5e-b5c0-1cf72cdaf9ac',
-  /** read (multi-packet) — length-prefixed stream of queued run records. */
+  /** read (PAGED, v3) — 12-byte page header + ≤500 B of the framed run stream. */
   QUEUE_PULL: '0cc5aba4-0c21-46ba-afcf-fac7f9d2aa73',
   /** write — fixed 38-byte authoritative ack for one relayed run. */
   RUN_ACK: '80d6e7d2-1921-4655-a48a-4a2f43aeeac2',
@@ -212,8 +221,176 @@ export function decodeRunAck(bytes: Uint8Array): RunAck {
   }
 }
 
+// ═════════════════════════════════════════════════════════════
+// QUEUE_PULL — PAGED. CHANGED IN v3.
+//
+// ── WHY v3 EXISTS ───────────────────────────────────────────
+//
+// 512 bytes is BLE_ATT_ATTR_MAX_LEN: the maximum length of an ATT attribute
+// VALUE. It is a hard protocol ceiling, independent of MTU and independent of
+// how either side fragments — a central simply cannot read more than that from
+// one characteristic, ever.
+//
+// v2 served the whole unacked queue as one value and assumed it fit. A run
+// record costs ~260 B fixed plus ~113 B per step, so:
+//
+//      2 steps ->  489 B framed   fits
+//      3 steps ->  602 B framed   UNFETCHABLE
+//      6 steps ->  941 B framed   UNFETCHABLE
+//     11 steps -> 1506 B framed   UNFETCHABLE
+//
+// Past two steps the record could not be read, so it could never be acked, so
+// it blocked every record behind it — permanently, and silently, because a
+// blocked drain and an empty one looked identical. The v2 tests used a 2-step
+// record, which is the ONLY size that fits, and that is why this shipped.
+//
+// Shrinking the record was considered and REJECTED: routines have no bounded
+// step count, so it only moves the ceiling from 3 steps to ~15 and the bug
+// returns in the field. Paging removes the ceiling instead of relocating it.
+//
+// ── THE TWO LAYERS ──────────────────────────────────────────
+//
+// PAGE layer (new in v3): each read returns a 12-byte header plus at most 500
+// bytes of raw stream. A page NEVER exceeds 512 B by construction.
+// FRAME layer (unchanged from v2): the concatenated pages form the same
+// `[u16 len][json] ‖ [u16 len][json] ‖ …` stream v2 had.
+//
+// A FRAME MAY SPAN PAGES. That is the whole point — it is what lets a record of
+// any size through. The reader concatenates page payloads and decodes whole
+// frames out of the accumulated buffer, retaining a partial tail for the next
+// page. decodeQueuePull already did exactly this (see `bytesConsumed`), so the
+// frame layer needed no change at all.
+//
+// ── CURSOR SEMANTICS ────────────────────────────────────────
+//
+// `offset` is a byte offset into the UNACKED STREAM — the framed bytes starting
+// at the queue's ack cursor. Not a file offset, not a record index.
+//
+//   • The watch AUTO-ADVANCES its read offset by `len` after serving a page, so
+//     the happy path is one read per page with no extra round trip.
+//   • Every page ECHOES the offset it starts at. The reader asserts this
+//     matches what it expected, so a desync is caught at the page that causes
+//     it rather than surfacing later as a corrupt frame.
+//   • RR_CONTROL `queue_seek` sets the read offset explicitly. That is the
+//     recovery primitive: seek(0) restarts from the head unacked record.
+//   • The watch RESETS the read offset to 0 on connect, on disconnect, and on
+//     every accepted RUN_ACK.
+//
+// ⚠️ ANY RUN_ACK INVALIDATES OUTSTANDING OFFSETS. An ack advances the ack
+// cursor, so the unacked stream's base moves and every offset within it shifts.
+// A reader must re-seek to 0 after acking — which is exactly what a drain pass
+// does naturally. The watch's own reset makes this safe even if the reader
+// forgets.
+//
+// Appends during a drain are safe and need no special handling: the log is
+// append-only, so bytes already addressed keep their offsets and `total` simply
+// grows.
+//
+// ── ACK IS PER RECORD, NEVER PER PAGE ───────────────────────
+//
+// A record that spans pages is acked ONCE, after the whole record has been
+// reassembled AND relayed. Ack-before-advance is unchanged and is what makes a
+// mid-drain drop safe:
+//
+//   Link drops halfway through a 3-page record -> nothing was acked -> the ack
+//   cursor never moved -> on reconnect the reader seeks 0 and re-pulls that
+//   record FROM ITS START. Nothing is lost (the record is still queued) and
+//   nothing is duplicated (a partial record is never relayed, so the server
+//   never saw it; and even a full re-relay dedupes on client_local_id).
+//
+// The alternative — acking each page — would let the cursor advance past bytes
+// that never reached the server, which is the one loss the durable queue exists
+// to prevent.
+//
+// ── PAGE HEADER ─────────────────────────────────────────────
+//
+// QUEUE_PULL_HEADER  (read) — fixed 12 bytes, little-endian
+//
+//   offset  size  field    type   notes
+//   0       1     version  u8     = 3; a reader MUST reject anything else
+//   1       1     flags    u8     bit0 = MORE (bytes remain after this page)
+//   2       4     offset   u32    byte offset of this page in the unacked stream
+//   6       4     total    u32    total bytes in the unacked stream right now
+//   10      2     len      u16    payload bytes following this header
 // ─────────────────────────────────────────────────────────────
-// QUEUE_PULL  (read, multi-packet) — stream of length-prefixed run records
+
+/** The ATT ceiling on one attribute value. Not a tunable — see above. */
+export const QUEUE_PULL_MAX_VALUE = 512
+export const QUEUE_PULL_HEADER_SIZE = 12
+/** Largest payload that keeps a whole page inside the ATT ceiling. */
+export const QUEUE_PULL_MAX_PAYLOAD = QUEUE_PULL_MAX_VALUE - QUEUE_PULL_HEADER_SIZE // 500
+export const QUEUE_PULL_VERSION = 3
+/** flags bit0 — more bytes remain in the unacked stream after this page. */
+export const QUEUE_PULL_FLAG_MORE = 0x01
+
+export interface QueuePullPageWire {
+  version: number
+  more: boolean
+  offset: number
+  total: number
+  payload: Uint8Array
+}
+
+export function encodeQueuePullPage(
+  offset: number, total: number, payload: Uint8Array,
+): Uint8Array {
+  if (payload.byteLength > QUEUE_PULL_MAX_PAYLOAD) {
+    throw new RangeError(
+      `QUEUE_PULL page payload ${payload.byteLength} B exceeds ${QUEUE_PULL_MAX_PAYLOAD} B ` +
+      `(would put the value over the ${QUEUE_PULL_MAX_VALUE} B ATT ceiling)`,
+    )
+  }
+  const out = new Uint8Array(QUEUE_PULL_HEADER_SIZE + payload.byteLength)
+  const dv = view(out)
+  out[0] = QUEUE_PULL_VERSION
+  out[1] = offset + payload.byteLength < total ? QUEUE_PULL_FLAG_MORE : 0
+  dv.setUint32(2, offset, true)
+  dv.setUint32(6, total, true)
+  dv.setUint16(10, payload.byteLength, true)
+  out.set(payload, QUEUE_PULL_HEADER_SIZE)
+  return out
+}
+
+export function decodeQueuePullPage(bytes: Uint8Array): QueuePullPageWire {
+  if (bytes.byteLength < QUEUE_PULL_HEADER_SIZE) {
+    throw new RangeError(
+      `QUEUE_PULL page must be at least ${QUEUE_PULL_HEADER_SIZE} bytes, got ${bytes.byteLength}`,
+    )
+  }
+  if (bytes.byteLength > QUEUE_PULL_MAX_VALUE) {
+    // A page over the ceiling means one side is not honouring the contract.
+    // Fail here rather than let a silently truncated read become a corrupt frame.
+    throw new RangeError(
+      `QUEUE_PULL page is ${bytes.byteLength} B, over the ${QUEUE_PULL_MAX_VALUE} B ATT ceiling`,
+    )
+  }
+  const dv = view(bytes)
+  const version = bytes[0]
+  if (version !== QUEUE_PULL_VERSION) {
+    throw new RangeError(
+      `QUEUE_PULL page version ${version}, expected ${QUEUE_PULL_VERSION} — ` +
+      'the watch firmware and the app disagree on the contract',
+    )
+  }
+  const len = dv.getUint16(10, true)
+  const end = QUEUE_PULL_HEADER_SIZE + len
+  if (end > bytes.byteLength) {
+    throw new RangeError(
+      `QUEUE_PULL page declares ${len} payload bytes but only ` +
+      `${bytes.byteLength - QUEUE_PULL_HEADER_SIZE} arrived`,
+    )
+  }
+  return {
+    version,
+    more: (bytes[1] & QUEUE_PULL_FLAG_MORE) !== 0,
+    offset: dv.getUint32(2, true),
+    total: dv.getUint32(6, true),
+    payload: bytes.subarray(QUEUE_PULL_HEADER_SIZE, end),
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// QUEUE_PULL frame layer — unchanged since v2.
 //
 // Each record frame:
 //   offset  size  field   type   notes
@@ -221,9 +398,10 @@ export function decodeRunAck(bytes: Uint8Array): RunAck {
 //   2       len   json    utf8   JSON.stringify(WatchRunRecord)
 //
 // The stream is frame ‖ frame ‖ …  The watch emits one frame per queued run.
-// decodeQueuePull tolerates a trailing PARTIAL frame (the last MTU packet may
-// not have arrived yet) and reports how many bytes it consumed so the caller
-// can retain the remainder and resume.
+// decodeQueuePull tolerates a trailing PARTIAL frame — in v2 that meant "the
+// last MTU packet has not arrived"; in v3 it also means "this frame continues
+// in the next page". It reports how many bytes it consumed so the caller can
+// retain the remainder and resume.
 // ─────────────────────────────────────────────────────────────
 
 const LEN16_MAX = 0xffff
@@ -325,7 +503,40 @@ export function decodeRoutinePush<T = unknown>(bytes: Uint8Array): RoutinePushDe
 //   start_routine  start a routine on the watch, now, at step 1  (additive)
 //   set_tz         UTC offset for local wall-clock display       (additive)
 //   set_audio      speaker volume + quiet hours                  (additive)
+//   queue_seek     set the QUEUE_PULL read offset                (v3)
 // ─────────────────────────────────────────────────────────────
+
+/**
+ * `queue_seek` — set the byte offset the next QUEUE_PULL read serves from.
+ *
+ *   { "cmd": "queue_seek", "offset": <u32> }
+ *
+ * The offset is into the UNACKED STREAM (see the QUEUE_PULL section), so 0 is
+ * always the first byte of the head unacked record — a record boundary, and
+ * therefore always a safe place to restart.
+ *
+ * NOT normally needed: the watch auto-advances after each page, so a drain is
+ * just repeated reads. This exists for the two cases that need to be explicit
+ * rather than inferred:
+ *
+ *   • RESYNC. A page whose echoed `offset` is not what the reader expected
+ *     means the two sides disagree about position. Seeking makes the reader's
+ *     view authoritative instead of guessing.
+ *   • RESTART. Beginning a drain, or resuming after a dropped link, seeks 0 so
+ *     paging starts from a record boundary rather than wherever the previous
+ *     attempt happened to stop.
+ *
+ * An offset beyond the end of the unacked stream is not an error: the next read
+ * returns an empty page (len 0, MORE clear), which reads as "nothing there".
+ *
+ * Validated by encodeControl, like every other command — there is deliberately
+ * no second encoder for it, so there is only one way to put it on the wire.
+ */
+export function assertQueueSeek(c: Extract<RrControlCommand, { cmd: 'queue_seek' }>): void {
+  if (!Number.isInteger(c.offset) || c.offset < 0 || c.offset > 0xffffffff) {
+    throw new RangeError(`queue_seek.offset must be a u32, got ${c.offset}`)
+  }
+}
 
 export type RrControlCommand =
   /** Present the pairing nonce from the QR. Authenticates the CONNECTION for
@@ -387,6 +598,9 @@ export type RrControlCommand =
       quiet_to?: string
       quiet_volume_pct?: number
     }
+  /** Set the QUEUE_PULL read offset. v3 — see encodeQueueSeek and the
+   *  QUEUE_PULL section for cursor semantics. */
+  | { cmd: 'queue_seek'; offset: number }
 
 export const RR_CONTROL_LEN_PREFIX_BYTES = 4
 
@@ -473,6 +687,7 @@ export const RR_CONTROL_ATT = {
 
 export function encodeControl(command: RrControlCommand): Uint8Array {
   if (command.cmd === 'set_audio') assertSetAudio(command)
+  if (command.cmd === 'queue_seek') assertQueueSeek(command)
   const json = utf8Encode(JSON.stringify(command))
   const out = new Uint8Array(RR_CONTROL_LEN_PREFIX_BYTES + json.byteLength)
   view(out).setUint32(0, json.byteLength, true)

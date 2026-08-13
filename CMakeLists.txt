@@ -18,16 +18,24 @@ endif()
 project(routine_rush_watch)
 
 # ⚠️ TEMPORARY TEST SWITCH — never build a shipping image with it.
+# CI asserts it is unset for release builds (.github/workflows/build.yml).
 #
 # -DRR_DEV_NONCE=1 does two things, both only to let the laptop BLE harnesses
 # (tools/*.py) drive an ALREADY-PAIRED watch without unpairing the phone:
 #   • main.c mints and prints a pairing nonce even when paired
-#   • rr_ble advertises a DIFFERENT static address, so a host holding a stale
-#     bond for the real address does not try to encrypt with a key the watch
-#     no longer has (macOS does exactly this, and reports it as ATT 0x0F with
-#     no attempt to re-pair)
+#   • rr_ble advertises a DIFFERENT static address at EVERY BOOT, so a host
+#     holding a stale bond for the real address does not try to encrypt with a
+#     key the watch no longer has
 # The second one deliberately changes identity rather than weakening the
 # encryption gate — the gate is the thing under test everywhere else.
+#
+# IT USED TO DO A THIRD THING: call ble_gap_security_initiate() on connect.
+# That is now unconditional production behaviour (see BLE_GAP_EVENT_CONNECT in
+# rr_ble.c) because relying on the central to react to ATT 0x0F is exactly the
+# fragility the harnesses kept tripping over, and asking for security ourselves
+# is correct for the phone too. What remains behind this flag is only what is
+# genuinely test-only: a nonce that should not exist on a paired watch, and an
+# identity that deliberately churns.
 if(RR_DEV_NONCE)
     idf_build_set_property(COMPILE_DEFINITIONS "RR_DEV_NONCE_WHEN_PAIRED=1" APPEND)
     message(WARNING "RR_DEV_NONCE is set — dev nonce + alternate BLE address. TEST BUILDS ONLY.")
