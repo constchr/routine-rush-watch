@@ -143,15 +143,38 @@ int rr_ui_iso_weekday(int y, int m, int d);
 /** True if the last screen rendered was the idle watch face. */
 bool rr_ui_last_screen_is_watchface(void);
 
-// ── Phase 7: the alarm screen (§7) ───────────────────────────────────────────
+// ── Phase 7: the READY screen (§7, §8 screen 1) ──────────────────────────────
 
 /**
- * The screen a scheduled routine rings on: time, routine, "Let's go", snooze.
+ * "Ready to start": routine, step count, START and NOT NOW. No countdown.
  *
- * on_start is what actually begins the routine, and it must go through
- * rr_routine_request_start() — this screen starts nothing itself. Both
- * callbacks run on the LVGL task.
+ * ONE screen for BOTH start paths — the scheduler firing and the parent app's
+ * RR_CONTROL start_routine. It replaced the old alarm screen rather than
+ * sitting beside it: a remote start used to drop the child straight into step
+ * 1 with the clock already running, so a child who was not looking at their
+ * wrist lost the first step before they saw it. Starting is now a deliberate
+ * tap on either path, and there is exactly one screen to get right.
+ *
+ * NOTHING here starts a routine. on_start goes through rr_routine_start() at
+ * the far end, and the timer begins there — not on this screen. Both callbacks
+ * run on the LVGL task.
+ *
+ * The scheduled HH:MM the alarm screen used to show is GONE. A remote start
+ * has no scheduled time to print, and one screen shape for both paths is worth
+ * more than that line.
  */
-esp_err_t rr_ui_show_alarm(const char *routine_name, const char *routine_emoji,
-                           int hour, int minute, const char *language,
-                           rr_ui_step_cb_t on_start, rr_ui_step_cb_t on_snooze);
+esp_err_t rr_ui_show_ready(const char *routine_name, const char *routine_emoji,
+                           int step_count, const char *language,
+                           rr_ui_step_cb_t on_start, rr_ui_step_cb_t on_not_now);
+
+/**
+ * True while a READY offer is the screen on display.
+ *
+ * main.c's watch-face gate uses it to stay idempotent: the gate is polled
+ * twice a second, and re-rendering READY on every poll would re-read the
+ * routine emoji off littlefs at 2 Hz and eat the touch it is waiting for.
+ */
+bool rr_ui_last_screen_is_ready(void);
+
+/** Take READY down and put back whatever screen it covered (face / QR / paired). */
+esp_err_t rr_ui_dismiss_ready(void);

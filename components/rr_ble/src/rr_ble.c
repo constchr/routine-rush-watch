@@ -778,8 +778,14 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
 
         switch (rr_routine_request_start(routine_id)) {
         case RR_START_OK:
+            // ⚠️ OK MEANS "THE WATCH IS SHOWING READY", NOT "RUNNING". Since the
+            // READY screen went in, the routine begins when the child taps
+            // START. The wire protocol and the ATT codes are FROZEN and
+            // unchanged — nothing here moved — but the parent app still
+            // surfaces this as "started on the watch", which is now wrong.
+            // Re-wording is an app-side change, tracked separately.
             ESP_LOGI(TAG, "╔══════════════════════════════════════════════════");
-            ESP_LOGI(TAG, "║ REMOTE START accepted — routine %s", routine_id);
+            ESP_LOGI(TAG, "║ REMOTE START accepted — READY shown for %s", routine_id);
             ESP_LOGI(TAG, "╚══════════════════════════════════════════════════");
             return 0;
         case RR_START_BUSY:

@@ -47,7 +47,15 @@ bool rr_routine_is_active(void);
 // hand-off are all here precisely so a second start path never gets written.
 
 typedef enum {
-    /** Accepted. The routine will be on screen within a frame or two. */
+    /**
+     * Accepted — the READY screen will be up within a frame or two.
+     *
+     * ⚠️ OK NO LONGER MEANS "RUNNING". Since the READY screen went in, every
+     * start (scheduler or phone) is an OFFER: the routine begins when the
+     * child taps START and not before. The RR_CONTROL wire protocol and the
+     * ATT codes are FROZEN and unchanged — this is a semantic change only, and
+     * the parent app's "started on the watch" wording is handled app-side.
+     */
     RR_START_OK = 0,
     /** A routine is ALREADY RUNNING and was deliberately left alone. */
     RR_START_BUSY,
@@ -58,7 +66,12 @@ typedef enum {
 } rr_start_result_t;
 
 /**
- * Ask for `assignment_id` to start at step 1, right now.
+ * Offer `assignment_id` to the child, right now.
+ *
+ * Shows the READY screen (§7). It does NOT run the routine — rr_routine_start()
+ * fires when START is tapped, and the countdown begins there. That is the whole
+ * point of the choke point: a remote start used to drop a child who was not
+ * looking at their wrist straight into a running step 1.
  *
  * SAFE FROM ANY TASK. The decision (busy? cached?) is made synchronously so
  * the caller gets a real answer to relay — the BLE handler turns it straight
@@ -71,6 +84,47 @@ typedef enum {
  * watch knows what is on its screen.
  */
 rr_start_result_t rr_routine_request_start(const char *assignment_id);
+
+// ── The pending READY offer ─────────────────────────────────────────────────
+//
+// RAM ONLY, and that is a decision rather than an omission: a watch that
+// rebooted at 3 a.m. and offered this morning's routine when the child put it
+// on would be worse than one that quietly lost the offer. Nothing here is
+// persisted, so a reboot ends the offer.
+
+/** True while a READY offer is up and unanswered. */
+bool rr_routine_ready_pending(void);
+
+/**
+ * Re-paint the pending offer. No-op when nothing is pending.
+ *
+ * For the case where READY was raised, the panel slept, and something else
+ * (a ROUTINE_PUSH's paired screen, an aborted reset hold) painted over it.
+ * MUST be called from the LVGL task. Cheap to call when READY is already the
+ * screen on display — it checks before rebuilding, because its one caller is
+ * a predicate polled twice a second.
+ */
+void rr_routine_show_ready(void);
+
+/**
+ * Withdraw the offer for `assignment_id` and put the watch face back.
+ *
+ * Ignored unless that id is the one currently offered, so a scheduler giving
+ * up on its own occurrence cannot cancel an offer the phone has since made.
+ */
+void rr_routine_cancel_ready(const char *assignment_id);
+
+/**
+ * Register a callback for "the child answered a READY offer".
+ *
+ * `started` is true for START and false for NOT NOW. rr_sched needs both to
+ * close out its pending occurrence — START means the fire did its job, NOT NOW
+ * means dismiss it for today — and without this it would be guessing from the
+ * outside whether an offer it raised is still up.
+ *
+ * Runs on the LVGL task, from the button handler. Do not block in it.
+ */
+void rr_routine_set_answer_hook(void (*fn)(const char *assignment_id, bool started));
 
 /**
  * Register the "wake the screen" action, called just before a deferred start

@@ -9,5 +9,8 @@ idf_component_register(
     INCLUDE_DIRS "include"
     # nvs_flash: the last handled fire is persisted, so a reboot neither
     # repeats a routine that already rang nor loses one it slept through.
-    REQUIRES rr_store rr_rtc rr_routine rr_ui rr_audio nvs_flash
+    # rr_ui dropped when the alarm screen was replaced by READY: the fire
+    # raises no screen itself any more, it goes through rr_routine like the
+    # phone's remote start does.
+    REQUIRES rr_store rr_rtc rr_routine rr_audio nvs_flash
 )

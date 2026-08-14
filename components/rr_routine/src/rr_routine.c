@@ -341,11 +341,108 @@ void rr_routine_set_finish_hook(void (*fn)(void))
     s_finish_hook = fn;
 }
 
+// ── The READY offer ─────────────────────────────────────────────────────────
+//
+// The deferred callback used to call rr_routine_start() and drop the child
+// into a running step 1. It raises the READY screen instead, and START is the
+// only thing that starts anything. Both start paths — the scheduler and the
+// phone's RR_CONTROL start_routine — already funnel through here, so this is
+// one change in one place rather than a second mechanism bolted to one of them.
+//
+// RAM ONLY. Nothing about an offer is persisted: see rr_routine.h.
+static struct {
+    bool pending;
+    int  routine_idx;
+    char assignment_id[40];
+    char routine_name[64];
+    char routine_emoji[16];
+    int  step_count;
+    char language[4];
+} s_ready;
+
+static void (*s_answer_hook)(const char *assignment_id, bool started);
+
+void rr_routine_set_answer_hook(void (*fn)(const char *assignment_id, bool started))
+{
+    s_answer_hook = fn;
+}
+
+bool rr_routine_ready_pending(void) { return s_ready.pending; }
+
+// Both answers report to whoever raised the offer BEFORE acting on it, so the
+// scheduler's bookkeeping is closed even if the start below fails.
+static void answer_ready(bool started)
+{
+    char id[sizeof(s_ready.assignment_id)];
+    char name[sizeof(s_ready.routine_name)];
+    strlcpy(id, s_ready.assignment_id, sizeof(id));
+    strlcpy(name, s_ready.routine_name, sizeof(name));
+    const int idx = s_ready.routine_idx;
+
+    // Cleared FIRST: the answer hook re-arms the scheduler, and a scheduler
+    // pass that still saw pending==true would think the offer was unanswered.
+    memset(&s_ready, 0, sizeof(s_ready));
+
+    if (s_answer_hook != NULL) s_answer_hook(id, started);
+
+    if (started) {
+        esp_err_t err = rr_routine_start(idx);
+        if (err != ESP_OK) {
+            // Only reachable if the cache was replaced between the offer and
+            // the tap. The child tapped START and nothing happened, so put the
+            // face back rather than leaving a dead READY screen up.
+            ESP_LOGE(TAG, "START tapped but routine %d would not start: %s",
+                     idx, esp_err_to_name(err));
+            rr_ui_show_last_status();
+        }
+        return;
+    }
+
+    // NOT NOW is a DISMISSAL, not a snooze — see rr_sched. Stop the alarm
+    // (it repeats for ~80 s and the child has just said no) and put the watch
+    // face back, or the dismissed offer stays on the glass.
+    ESP_LOGI(TAG, "READY '%s' dismissed — not now", name);
+    rr_audio_stop();
+    rr_ui_dismiss_ready();
+}
+
+static void on_ready_start(void)   { answer_ready(true);  }
+static void on_ready_not_now(void) { answer_ready(false); }
+
+static void paint_ready(void)
+{
+    rr_ui_show_ready(s_ready.routine_name, s_ready.routine_emoji, s_ready.step_count,
+                     s_ready.language, on_ready_start, on_ready_not_now);
+}
+
+void rr_routine_show_ready(void)
+{
+    if (!s_ready.pending) return;
+    // Its caller is main.c's face gate, which rr_idle polls twice a second.
+    // Rebuilding unconditionally would re-read the routine emoji off littlefs
+    // at 2 Hz and destroy the touch this screen is waiting for.
+    if (rr_ui_last_screen_is_ready()) return;
+
+    ESP_LOGI(TAG, "re-showing the pending READY offer for '%s'", s_ready.routine_name);
+    paint_ready();
+}
+
+void rr_routine_cancel_ready(const char *assignment_id)
+{
+    if (!s_ready.pending) return;
+    if (assignment_id == NULL || strcmp(assignment_id, s_ready.assignment_id) != 0) return;
+
+    ESP_LOGI(TAG, "READY offer for '%s' withdrawn", s_ready.routine_name);
+    memset(&s_ready, 0, sizeof(s_ready));
+    rr_audio_stop();
+    rr_ui_dismiss_ready();
+}
+
 // The index is resolved BEFORE deferring and carried through as a plain int,
 // not a pointer: lv_async_call takes ownership of nothing, so anything heap-
 // allocated here would need freeing in the callback, and anything stack-
 // allocated would be gone. An int fits in the void* itself.
-static void deferred_start(void *arg)
+static void deferred_offer(void *arg)
 {
     const int routine_idx = (int) (intptr_t) arg;
 
@@ -354,21 +451,42 @@ static void deferred_start(void *arg)
     // been accepted. The synchronous check is what the phone was TOLD; this is
     // what actually protects the running routine.
     if (s.active) {
-        ESP_LOGW(TAG, "deferred start dropped — a routine started in the meantime");
+        ESP_LOGW(TAG, "deferred offer dropped — a routine started in the meantime");
         return;
     }
 
+    rr_step_view_t v;
+    if (rr_store_get_step(routine_idx, 0, &v) != ESP_OK) {
+        // Only reachable if the cache changed between the lookup and here.
+        ESP_LOGE(TAG, "deferred offer of routine %d dropped — no cached steps", routine_idx);
+        return;
+    }
+
+    rr_child_t child;
+    const char *lang = (rr_store_get_child(&child) == ESP_OK) ? child.language : "en";
+
+    memset(&s_ready, 0, sizeof(s_ready));
+    s_ready.pending = true;
+    s_ready.routine_idx = routine_idx;
+    s_ready.step_count = v.step_count;
+    strlcpy(s_ready.assignment_id, v.assignment_id, sizeof(s_ready.assignment_id));
+    strlcpy(s_ready.routine_name, v.routine_name, sizeof(s_ready.routine_name));
+    strlcpy(s_ready.routine_emoji, v.routine_emoji, sizeof(s_ready.routine_emoji));
+    strlcpy(s_ready.language, lang, sizeof(s_ready.language));
+
     // Wake FIRST, then paint. wake_up() rebuilds the watch face on its way
-    // back up, so starting first would show the step screen and then have the
-    // face drawn straight over it.
+    // back up, so painting first would show READY and then have the face drawn
+    // straight over it.
     if (s_wake_hook != NULL) s_wake_hook();
 
-    esp_err_t err = rr_routine_start(routine_idx);
-    if (err != ESP_OK) {
-        // Only reachable if the cache changed between the lookup and here.
-        ESP_LOGE(TAG, "deferred start of routine %d failed: %s",
-                 routine_idx, esp_err_to_name(err));
-    }
+    ESP_LOGI(TAG, "════ READY: '%s' — %d step(s), waiting for START ════",
+             s_ready.routine_name, s_ready.step_count);
+    // Unconditional, even though waking from sleep will already have painted
+    // READY through main.c's face gate (pending is set above, so the gate is
+    // shut by the time wake_up() renders). One redundant render per offer beats
+    // a conditional that would silently skip repainting when a PREVIOUS offer
+    // for a different routine happens to still be the screen on display.
+    paint_ready();
 }
 
 rr_start_result_t rr_routine_request_start(const char *assignment_id)
@@ -397,15 +515,27 @@ rr_start_result_t rr_routine_request_start(const char *assignment_id)
     // takes the display lock like any other LVGL call from a foreign task —
     // the callback itself then runs inside lv_timer_handler, where building
     // screens and creating timers is legal.
+    // An offer already up is REPLACED, not refused. The busy rule protects a
+    // routine in progress; READY is nobody mid-task, and a parent who just
+    // tapped "start bedtime" means that one rather than the breakfast offer
+    // still sitting unanswered on the glass. The scheduler notices its own
+    // occurrence went unanswered when the grace window runs out.
+    if (s_ready.pending) {
+        ESP_LOGW(TAG, "start_routine %s REPLACES the unanswered offer for '%s'",
+                 assignment_id, s_ready.routine_name);
+    }
+
     bsp_display_lock(0);
-    lv_result_t rc = lv_async_call(deferred_start, (void *) (intptr_t) idx);
+    lv_result_t rc = lv_async_call(deferred_offer, (void *) (intptr_t) idx);
     bsp_display_unlock();
 
     if (rc != LV_RESULT_OK) {
-        ESP_LOGE(TAG, "start_routine %s: could not queue the start", assignment_id);
+        ESP_LOGE(TAG, "start_routine %s: could not queue the offer", assignment_id);
         return RR_START_ERROR;
     }
 
-    ESP_LOGI(TAG, "start_routine %s ACCEPTED → routine index %d", assignment_id, idx);
+    // ACCEPTED means "READY will be on screen", NOT "running" — see
+    // rr_start_result_t. The routine begins when the child taps START.
+    ESP_LOGI(TAG, "start_routine %s ACCEPTED → READY for routine index %d", assignment_id, idx);
     return RR_START_OK;
 }

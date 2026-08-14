@@ -4,7 +4,7 @@
 // ── The loop, in one place ──────────────────────────────────────────────────
 //
 //   1. read the RTC, convert to LOCAL (schedules are authored local "HH:MM")
-//   2. if an alarm is already pending, service it (ring / defer / snooze / drop)
+//   2. if a fire is already pending, service it (ring / repeat / defer / drop)
 //   3. otherwise find the next occurrence after the last one handled
 //   4. sleep until it is due — one wake, no polling — or until re-armed
 //
@@ -27,7 +27,8 @@
 #include "rr_routine.h"
 #include "rr_rtc.h"
 #include "rr_store.h"
-#include "rr_ui.h"
+// NOT rr_ui: the fire no longer builds a screen of its own. It hands the
+// occurrence to rr_routine, which owns the READY screen for BOTH start paths.
 
 static const char *TAG = "rr_sched";
 
@@ -50,14 +51,12 @@ static const char *TAG = "rr_sched";
 typedef struct {
     bool valid;
     int64_t occ_epoch;        /**< LOCAL epoch of the scheduled moment */
-    int64_t not_before;       /**< snooze target; 0 = ring as soon as possible */
-    bool ringing;             /**< the alarm screen is up and unanswered */
-    int64_t shown_at;
+    bool offered;             /**< READY is up for this fire and unanswered */
+    int64_t last_ring;        /**< when the alarm tone last played */
+    int  rings;               /**< capped by RR_SCHED_ALARM_MAX_RINGS */
     bool deferral_logged;     /**< so a 30-min defer logs once, not 90 times */
     char assignment_id[40];
     char routine_name[64];
-    char routine_emoji[16];
-    int  minute_of_day;
 } pending_t;
 
 static TaskHandle_t s_task;
@@ -70,11 +69,16 @@ static int     s_skip_count;
 static pending_t s_pending;
 static char s_rearm_reason[32] = "boot";
 
-// Touched from the LVGL task (the alarm buttons) and read by the scheduler
-// task. Both are single writes of a small enum, and the scheduler re-reads
-// them on its next pass; a mutex here would buy nothing but a deadlock risk
-// against the display lock.
-typedef enum { ANSWER_NONE = 0, ANSWER_START, ANSWER_SNOOZE } answer_t;
+// Touched from the LVGL task (the READY buttons, via rr_routine's answer hook)
+// and read by the scheduler task. Both are single writes of a small enum, and
+// the scheduler re-reads them on its next pass; a mutex here would buy nothing
+// but a deadlock risk against the display lock.
+//
+// ANSWER_DISMISS replaced ANSWER_SNOOZE: "Not now" ends THIS occurrence rather
+// than pushing it five minutes out. Tomorrow's schedule is untouched — the
+// occurrence is committed to the handled list like any other, and the search
+// moves on to the next one.
+typedef enum { ANSWER_NONE = 0, ANSWER_START, ANSWER_DISMISS } answer_t;
 static volatile answer_t s_answer;
 
 // ── time helpers ────────────────────────────────────────────────────────────
@@ -191,21 +195,35 @@ static void handled_commit(int64_t occ, const char *id)
     handled_save();
 }
 
-// ── the alarm screen's two answers (these run on the LVGL task) ─────────────
+// ── the child's answer, relayed from the READY screen ───────────────────────
+//
+// Registered with rr_routine (this module already depends on it, so no cycle
+// and nothing for main.c to wire). It fires for EVERY answered offer, phone
+// starts included, so the id is checked: a parent starting bedtime by hand
+// must not close out an unrelated scheduled occurrence.
+//
+// Runs on the LVGL task.
+static void on_ready_answer(const char *assignment_id, bool started)
+{
+    if (!s_pending.valid || !s_pending.offered) return;
+    if (assignment_id == NULL || strcmp(assignment_id, s_pending.assignment_id) != 0) return;
 
-static void on_alarm_start(void)  { s_answer = ANSWER_START;  rr_sched_rearm("alarm answered"); }
-static void on_alarm_snooze(void) { s_answer = ANSWER_SNOOZE; rr_sched_rearm("snoozed"); }
+    s_answer = started ? ANSWER_START : ANSWER_DISMISS;
+    rr_sched_rearm(started ? "READY started" : "READY dismissed");
+}
 
 // ── firing ──────────────────────────────────────────────────────────────────
 
-static void ring(void)
-{
-    char when[24];
-    fmt_local(s_pending.occ_epoch, when, sizeof(when));
-    ESP_LOGI(TAG, "════ ALARM: '%s' scheduled %s ════", s_pending.routine_name, when);
+static void pending_clear(const char *why);
 
+// The tone, on its own. Split out of ring() because an unanswered offer
+// re-sounds it every RR_SCHED_ALARM_REPEAT_S without rebuilding anything.
+static void sound_alarm(void)
+{
     // Screen first: the tone and the screen arrive together, and waking after
     // the sound has already started reads as a glitch rather than an alarm.
+    // Repeats wake too — a repeat exists precisely for a child who was not
+    // looking the first time, and one they cannot see is just noise.
     if (s_wake_hook != NULL) s_wake_hook();
 
     // The ONLY alerting channel on this board — there is no vibration motor
@@ -217,16 +235,38 @@ static void ring(void)
         ESP_LOGE(TAG, "ALARM TONE DID NOT PLAY — the fire is visual only");
     }
 
-    rr_child_t child;
-    const char *lang = (rr_store_get_child(&child) == ESP_OK) ? child.language : "en";
+    s_pending.rings++;
+    s_pending.last_ring = local_now();
+}
+
+static void ring(void)
+{
+    char when[24];
+    fmt_local(s_pending.occ_epoch, when, sizeof(when));
+    ESP_LOGI(TAG, "════ ALARM: '%s' scheduled %s ════", s_pending.routine_name, when);
 
     s_answer = ANSWER_NONE;
-    rr_ui_show_alarm(s_pending.routine_name, s_pending.routine_emoji,
-                     s_pending.minute_of_day / 60, s_pending.minute_of_day % 60,
-                     lang, on_alarm_start, on_alarm_snooze);
+    sound_alarm();
 
-    s_pending.ringing = true;
-    s_pending.shown_at = local_now();
+    // THE SHARED START PATH, and now the shared SCREEN too: this is the same
+    // call the phone's remote start makes, and it raises READY rather than
+    // running anything. The routine begins when the child taps START, so the
+    // scheduled and remote paths are one behaviour with one screen instead of
+    // two that had drifted apart.
+    const rr_start_result_t r = rr_routine_request_start(s_pending.assignment_id);
+    if (r != RR_START_OK) {
+        // BUSY is handled before we get here (the deferral branch), so this is
+        // a cache problem: the routine was in the schedule and is not in the
+        // cache. Ringing at a child with nothing on screen to explain it is
+        // worse than dropping the fire.
+        ESP_LOGE(TAG, "scheduled offer of '%s' refused (%d) — dropping this fire",
+                 s_pending.routine_name, (int) r);
+        rr_audio_stop();
+        pending_clear("could not raise READY");
+        return;
+    }
+
+    s_pending.offered = true;
 }
 
 static void pending_clear(const char *why)
@@ -247,55 +287,51 @@ static int service_pending(int64_t now)
     const int64_t late_by = now - s_pending.occ_epoch;
 
     // ── the child answered ──────────────────────────────────────────────────
-    if (s_pending.ringing && s_answer != ANSWER_NONE) {
+    // rr_routine has already acted on the tap — START ran the routine, NOT NOW
+    // put the face back. Nothing to do here but close the books, which for
+    // BOTH answers means the same thing: this occurrence is done with. NOT NOW
+    // dismisses it for today; tomorrow's is a different occurrence and is not
+    // affected, because it is found by the ordinary search from s_last_handled.
+    if (s_pending.offered && s_answer != ANSWER_NONE) {
         const answer_t a = s_answer;
         s_answer = ANSWER_NONE;
-
-        if (a == ANSWER_START) {
-            rr_audio_stop();
-            // THE SHARED START PATH. Not a second mechanism — the same call
-            // the phone's remote start makes, so the busy rule, the cache
-            // lookup and the LVGL hand-off are decided in exactly one place.
-            const rr_start_result_t r = rr_routine_request_start(s_pending.assignment_id);
-            if (r != RR_START_OK) {
-                ESP_LOGW(TAG, "scheduled start of '%s' refused (%d)",
-                         s_pending.routine_name, (int) r);
-            }
-            pending_clear("started by the child");
-            return 1;
-        }
-
-        // Snooze. Deliberately keeps the SAME occurrence pending rather than
-        // inventing a new one, so the grace window still measures from the
-        // scheduled moment: five more minutes, not a fresh half hour.
-        s_pending.ringing = false;
-        s_pending.not_before = now + RR_SCHED_SNOOZE_S;
         rr_audio_stop();
-        rr_ui_show_last_status();
-        if (s_pending.not_before - s_pending.occ_epoch > RR_SCHED_GRACE_WINDOW_S) {
-            ESP_LOGW(TAG, "snoozed '%s', but +%d min lands past the %d-min grace "
-                          "window — it will NOT ring again",
-                     s_pending.routine_name, RR_SCHED_SNOOZE_S / 60,
-                     RR_SCHED_GRACE_WINDOW_S / 60);
-        } else {
-            ESP_LOGI(TAG, "snoozed '%s' for %d min", s_pending.routine_name,
-                     RR_SCHED_SNOOZE_S / 60);
-        }
+        pending_clear(a == ANSWER_START ? "started by the child"
+                                        : "dismissed for today — not now");
         return 1;
     }
 
-    // ── nobody answered ─────────────────────────────────────────────────────
-    if (s_pending.ringing) {
-        const int64_t up_for = now - s_pending.shown_at;
-        if (up_for >= RR_SCHED_ALARM_TIMEOUT_S) {
-            ESP_LOGI(TAG, "alarm unanswered for %ds — auto-snoozing", RR_SCHED_ALARM_TIMEOUT_S);
-            s_pending.ringing = false;
-            s_pending.not_before = now + RR_SCHED_SNOOZE_S;
-            rr_audio_stop();
-            rr_ui_show_last_status();
+    // ── offered, nobody has answered yet ────────────────────────────────────
+    if (s_pending.offered) {
+        // Give up on the whole fire once the moment is properly past. The
+        // offer outliving its grace window would leave READY on the glass all
+        // day AND block every later fire, since one occurrence is in flight at
+        // a time.
+        if (late_by > RR_SCHED_GRACE_WINDOW_S) {
+            ESP_LOGW(TAG, "READY for '%s' went unanswered for the whole %d-min grace "
+                          "window — withdrawing it", s_pending.routine_name,
+                     RR_SCHED_GRACE_WINDOW_S / 60);
+            rr_routine_cancel_ready(s_pending.assignment_id);
+            pending_clear("offer expired unanswered");
             return 1;
         }
-        return (int) (RR_SCHED_ALARM_TIMEOUT_S - up_for);
+
+        // Ring again, up to the cap. After that the watch goes QUIET AND THE
+        // OFFER STAYS UP: the child has had ~80 s of noise, and re-ringing at
+        // someone who has already seen the screen is how an alarm becomes
+        // something a parent disables. Sleeping the panel does not lose it —
+        // main.c's face gate re-shows READY on the next wake.
+        if (s_pending.rings >= RR_SCHED_ALARM_MAX_RINGS) {
+            return (int) (RR_SCHED_GRACE_WINDOW_S - late_by);
+        }
+        const int64_t since = now - s_pending.last_ring;
+        if (since >= RR_SCHED_ALARM_REPEAT_S) {
+            ESP_LOGI(TAG, "READY for '%s' still unanswered — alarm %d/%d",
+                     s_pending.routine_name, s_pending.rings + 1, RR_SCHED_ALARM_MAX_RINGS);
+            sound_alarm();
+            return RR_SCHED_ALARM_REPEAT_S;
+        }
+        return (int) (RR_SCHED_ALARM_REPEAT_S - since);
     }
 
     // ── the moment has passed ───────────────────────────────────────────────
@@ -306,11 +342,6 @@ static int service_pending(int64_t now)
                  s_pending.routine_name, late_by / 60, RR_SCHED_GRACE_WINDOW_S / 60);
         pending_clear("grace window expired");
         return 1;
-    }
-
-    // ── snoozed, not due yet ────────────────────────────────────────────────
-    if (s_pending.not_before > now) {
-        return (int) (s_pending.not_before - now);
     }
 
     // ── DO NOT INTERRUPT a running routine ──────────────────────────────────
@@ -335,7 +366,7 @@ static int service_pending(int64_t now)
     }
 
     ring();
-    return RR_SCHED_ALARM_TIMEOUT_S;
+    return RR_SCHED_ALARM_REPEAT_S;
 }
 
 // ── the search ──────────────────────────────────────────────────────────────
@@ -404,10 +435,8 @@ static int find_next(int64_t now)
         memset(&s_pending, 0, sizeof(s_pending));
         s_pending.valid = true;
         s_pending.occ_epoch = occ;
-        s_pending.minute_of_day = hit.minute_of_day;
         strlcpy(s_pending.assignment_id, hit.assignment_id, sizeof(s_pending.assignment_id));
         strlcpy(s_pending.routine_name, hit.routine_name, sizeof(s_pending.routine_name));
-        strlcpy(s_pending.routine_emoji, hit.routine_emoji, sizeof(s_pending.routine_emoji));
         return 0;   // service it immediately
     }
 
@@ -491,8 +520,15 @@ esp_err_t rr_sched_init(void)
         ESP_LOGE(TAG, "could not start the scheduler task — NOTHING WILL FIRE");
         return ESP_ERR_NO_MEM;
     }
-    ESP_LOGI(TAG, "scheduler up (grace %d min, snooze %d min)",
-             RR_SCHED_GRACE_WINDOW_S / 60, RR_SCHED_SNOOZE_S / 60);
+    // The child's answer comes back through rr_routine, which owns the READY
+    // screen. Registered here rather than wired in main.c because this module
+    // already depends on rr_routine — the arrow exists, so no cycle is created
+    // and main.c has nothing to hold together.
+    rr_routine_set_answer_hook(on_ready_answer);
+
+    ESP_LOGI(TAG, "scheduler up (grace %d min, alarm %d x %ds)",
+             RR_SCHED_GRACE_WINDOW_S / 60, RR_SCHED_ALARM_MAX_RINGS,
+             RR_SCHED_ALARM_REPEAT_S);
     return ESP_OK;
 }
 
@@ -500,11 +536,6 @@ void rr_sched_rearm(const char *reason)
 {
     if (reason != NULL) strlcpy(s_rearm_reason, reason, sizeof(s_rearm_reason));
     if (s_task != NULL) xTaskNotifyGive(s_task);
-}
-
-bool rr_sched_alarm_is_showing(void)
-{
-    return s_pending.valid && s_pending.ringing;
 }
 
 void rr_sched_set_wake_hook(void (*fn)(void))

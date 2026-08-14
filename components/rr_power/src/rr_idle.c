@@ -77,6 +77,7 @@ static bool s_enabled;
 static int64_t s_last_activity_ms;
 static int64_t s_paired_at_ms;      // 0 = no pending promote-to-face
 static bool s_gate_open;            // last observed face-gate state
+static bool s_gate_ever_open;       // the gate has been open at least once
 static lv_timer_t *s_idle_timer;
 static volatile bool s_queue_dirty;   // set by rr_idle_notify_queue_changed()
 
@@ -288,8 +289,20 @@ static void idle_tick(lv_timer_t *t)
     //
     // Then hold the "Paired ✓" confirmation briefly before the face replaces
     // it, so the flow ends where the child will actually use the watch.
+    // ⚠️ PAIRING HAPPENS ONCE, AND THE GATE NO LONGER DOES. This used to read a
+    // false->true transition as "just paired", which held while the gate could
+    // only ever open once per boot. It cannot any more: the READY offer closes
+    // the gate deliberately (main.c watchface_allowed) so the face does not paint
+    // over a routine waiting to be started, and every offer therefore ends with
+    // the gate REOPENING.
+    //
+    // Without the s_gate_ever_open latch that reopen is indistinguishable from a
+    // pairing, so the 2-second promote fires at the end of every routine — and
+    // the thing it replaces is the "Τέλος!" completion screen, two seconds after
+    // a child finishes. The transition is only a pairing the FIRST time.
     const bool gate_open = face_allowed();
-    if (gate_open && !s_gate_open) {
+    if (gate_open && !s_gate_open && !s_gate_ever_open) {
+        s_gate_ever_open = true;
         s_paired_at_ms = now_ms();
         ESP_LOGI(TAG, "pairing complete — face in %d ms", PAIRED_HOLD_MS);
     }
@@ -365,8 +378,11 @@ esp_err_t rr_idle_init(void)
     s_awake = true;
     s_enabled = true;
     // Seed the edge detector, so a paired boot does not read as a fresh
-    // pairing and re-promote a face that is already up.
+    // pairing and re-promote a face that is already up. The ever-open latch is
+    // seeded from the same reading: a watch that boots already paired has done
+    // its pairing, and must never run the promote again.
     s_gate_open = face_allowed();
+    s_gate_ever_open = s_gate_open;
     rr_ui_set_watchface_repaint(repaint_face);
 
     // NOT unconditional. app_main has already decided what this boot shows —

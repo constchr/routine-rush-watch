@@ -88,8 +88,41 @@ static const char *TAG = "rr_watch";
 static bool s_face_ok;
 static int64_t s_face_checked_ms;
 
+// ── AN UNANSWERED READY OFFER OUTRANKS THE FACE ─────────────────────────────
+//
+// A scheduled or remotely-started routine puts up the READY screen and then
+// waits. The panel is allowed to sleep on rr_idle's normal timeout while it
+// waits — but the OFFER must not be lost with it, or a child who looks at
+// their watch a minute later sees a clock and never learns a routine was
+// asked for.
+//
+// ⚠️ WHY THIS SIDE EFFECT LIVES INSIDE A PREDICATE, which is otherwise a bad
+// idea and is not being defended as good design:
+//
+//   • rr_idle has NO wake callback. The face gate is the only thing it
+//     consults on the way out of sleep (wake_up -> build_and_show_face ->
+//     face_allowed), so it is the one hook that reliably runs at the moment
+//     the screen comes back.
+//   • rr_idle.c is under concurrent edit by someone else, so adding a proper
+//     wake hook there would collide with work in flight.
+//
+// If a wake hook ever appears in rr_idle, move the re-show onto it and leave
+// this function a pure predicate again.
+//
+// It is safe to poll: rr_routine_show_ready() rebuilds NOTHING when READY is
+// already the screen on display, which matters because rr_idle calls this
+// twice a second and rebuilding would re-read the routine emoji off littlefs
+// at 2 Hz and swallow the tap the screen is waiting for.
+//
+// Returning false is the other half — without it the face would be painted
+// straight over the offer we just re-showed.
 static bool watchface_allowed(void)
 {
+    if (rr_routine_ready_pending()) {
+        rr_routine_show_ready();
+        return false;
+    }
+
     if (s_face_ok) return true;
 
     const int64_t now = (int64_t) xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -152,12 +185,16 @@ static void rr_sched_rearm_on_idle(void)
 //     Blanking it after 8 s makes a reset watch look bricked, and the wrist
 //     raise that would wake it is not something you do while holding a phone
 //     up to scan.
-//   - a scheduled alarm is ringing and nobody has answered it yet: an alarm
-//     that blanks itself after 8 s is not an alarm. rr_sched auto-snoozes it
-//     after a minute, which is what ends this suspension.
+//
+// An unanswered READY offer is DELIBERATELY NOT on this list, and that is a
+// change: the old alarm screen suspended sleep so it could not blank itself
+// before anyone answered. READY does not need to hold the panel lit, because
+// sleeping no longer loses it — watchface_allowed() above re-shows it on the
+// next wake. Holding a lit AMOLED for up to half an hour of grace window to
+// preserve state we now keep properly is the wrong trade on a battery.
 static bool idle_suspended(void)
 {
-    return rr_routine_is_active() || !rr_identity_is_paired() || rr_sched_alarm_is_showing();
+    return rr_routine_is_active() || !rr_identity_is_paired();
 }
 
 void app_main(void)
@@ -366,9 +403,10 @@ void app_main(void)
     rr_idle_set_face_gate(watchface_allowed);
     rr_idle_set_suspend_check(idle_suspended);
 
-    // A remotely-started routine has to light the screen — the whole point of
-    // the nudge is that the watch is on a wrist, asleep, and the child has not
-    // touched it. Wired here, not called directly from rr_routine, because
+    // A start request has to light the screen — the whole point of the nudge is
+    // that the watch is on a wrist, asleep, and the child has not touched it.
+    // It lights up on READY, not on a running step 1. Wired here, not called
+    // directly from rr_routine, because
     // rr_power depends on rr_ble which depends on rr_routine; the hook keeps
     // that a straight line instead of a build cycle. Same shape as the two
     // gates above. Phase 7's scheduler inherits it for free — it goes through

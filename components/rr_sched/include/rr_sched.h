@@ -52,11 +52,37 @@
  */
 #define RR_SCHED_GRACE_WINDOW_S   (30 * 60)
 
-/** Single tap = short snooze (§7). Bounded by the grace window above. */
-#define RR_SCHED_SNOOZE_S         (5 * 60)
+// ── SNOOZE IS GONE. What replaced it, and why ───────────────────────────────
+//
+// RR_SCHED_SNOOZE_S (5 min) and RR_SCHED_ALARM_TIMEOUT_S (60 s) were REMOVED,
+// not repurposed. They belonged to an alarm screen whose quiet button meant
+// "ring at me again in five minutes"; the READY screen's quiet button means
+// "not now", which DISMISSES this occurrence for today. Keeping the constants
+// under new meanings would have left the word "snooze" in a module that no
+// longer snoozes.
+//
+// The two behaviours they encoded are both still here, in a different shape:
+//
+//   • "the alarm should not give up after one beep" was RR_SCHED_ALARM_TIMEOUT_S
+//     auto-snoozing an unanswered alarm. It is now REPEAT/MAX_RINGS below: the
+//     tone replays while READY is unanswered, capped, and then the watch goes
+//     quiet with THE OFFER STILL UP. An offer that survives in silence is
+//     better than one that re-rings on a five-minute cycle at a child who has
+//     already seen it.
+//   • "an unanswered fire eventually expires" is still RR_SCHED_GRACE_WINDOW_S
+//     above, measured from the scheduled moment exactly as before.
 
-/** An unanswered alarm auto-snoozes rather than holding the panel lit. */
-#define RR_SCHED_ALARM_TIMEOUT_S  60
+/** How long between repeats of the alarm tone while READY is unanswered. */
+#define RR_SCHED_ALARM_REPEAT_S   20
+
+/**
+ * How many times the alarm may sound for one fire, first ring included.
+ *
+ * 5 × 20 s is about 80 seconds of noise. Past that the child either cannot
+ * hear it or is deliberately ignoring it, and a watch that keeps beeping is
+ * one a parent turns off. Ringing stops; the offer does not.
+ */
+#define RR_SCHED_ALARM_MAX_RINGS  5
 
 /** How often a deferred fire re-checks whether the watch went idle. */
 #define RR_SCHED_BUSY_RETRY_S     20
@@ -98,13 +124,12 @@ esp_err_t rr_sched_init(void);
  */
 void rr_sched_rearm(const char *reason);
 
-/**
- * True while the alarm screen is up and unanswered.
- *
- * main.c folds this into the idle-sleep suspend check: an alarm that blanks
- * itself after 8 s because nobody has touched it yet is not an alarm.
- */
-bool rr_sched_alarm_is_showing(void);
+// rr_sched_alarm_is_showing() was REMOVED along with the alarm screen. It fed
+// main.c's idle-sleep suspension so an unanswered alarm could not blank
+// itself. The READY screen does not need that: it is allowed to sleep on
+// rr_idle's normal timeout, because the offer is not lost when it does — the
+// next wake re-shows it (rr_routine_ready_pending, wired through main.c's face
+// gate). Holding the panel lit was only ever a way of not losing the alarm.
 
 /**
  * Register how to wake the screen for a fire.

@@ -39,9 +39,14 @@ static lv_obj_t *s_screen;
 // Last non-transient screen, so an aborted reset countdown can restore exactly
 // what the watch was showing instead of guessing at pairing state.
 typedef enum { RR_SCREEN_NONE, RR_SCREEN_QR, RR_SCREEN_PAIRED, RR_SCREEN_WAITING,
-               RR_SCREEN_WATCHFACE, RR_SCREEN_ALARM } rr_screen_t;
+               RR_SCREEN_WATCHFACE, RR_SCREEN_READY } rr_screen_t;
 static rr_screen_t s_last_screen;
 static char s_last_qr_payload[128];
+
+// What READY covered, so dismissing it restores that rather than guessing.
+// READY can be raised over the face, the QR or the paired confirmation — the
+// scheduler and the phone do not care what was on screen when they asked.
+static rr_screen_t s_screen_before_ready;
 
 static void log_heap(const char *when)
 {
@@ -176,6 +181,61 @@ esp_err_t rr_ui_show_pairing_qr(const char *payload)
     return ESP_OK;
 }
 
+// ── PAIRED-STATUS LAYOUT ─────────────────────────────────────────────────────
+//
+// This screen was built before the font set existed and never had a font set on
+// it, so all three labels inherited LV_FONT_DEFAULT — montserrat 14. On a 2.06"
+// panel held at a child's arm's length that is unreadable, and it was the only
+// screen still at the default: everything else already goes through rr_font_*.
+// So this is not a redesign, it is the screen catching up with §9's type scale
+// (36 title / 28 body / 20 secondary).
+//
+// Two things forced the positions to be redone rather than just the fonts:
+//
+//   1. OVERLAP. The old offsets (-60 / -10 / +24 from centre) were spaced for
+//      14 px text. At 36/28 the title's box (44 px tall) and the subtitle's
+//      (33 px) intersect — the title would have been drawn through the "s" of
+//      the line below it. Bumping the font without re-spacing swaps one
+//      unreadable screen for another.
+//
+//   2. MIXED ORIGINS. The old code placed everything from the centre, which is
+//      exactly the trap the step screen documents above: offsets in different
+//      directions cannot be compared, so a collision is invisible in the source
+//      and only shows up on glass. Every Y below is TOP-RELATIVE to the safe
+//      area for the same reason, and the _Static_asserts make an overlapping or
+//      overflowing stack a build failure.
+//
+// The stack is 145 px tall and the safe area is 412, so it is centred with
+// 133 px of air either side — deliberate: this screen is a two-second
+// confirmation, not something to read, and crowding it would make it look busy.
+//
+// The tick keeps rendering in rr_font_36 rather than a built-in montserrat
+// because tools/gen-fonts.sh merges the four LV_SYMBOL_* codepoints we use into
+// the Noto fonts; see the note there about why swapping fonts for a symbol is
+// the wrong fix.
+//
+// HORIZONTAL FIT is the reason no copy had to be cut. Summing Noto Sans adv_w
+// (adv_w is 1/16 px) over the strings:
+//   "Paired"          @36 = 108.6 px
+//   "Routines synced" @28 = 214.4 px
+// against RR_SAFE_W = 320, both centred. The wider line still has 105 px of
+// slack, so the curved bezel cannot clip either. (Worth knowing for whoever
+// localises this: the same string at 36 px is 275.4 px, so even a much longer
+// Greek translation has room before the subtitle needs shortening.)
+#define PAIRED_TICK_Y    134
+#define PAIRED_TICK_H    44    /* rr_font_36 line_height */
+#define PAIRED_TITLE_Y   194
+#define PAIRED_TITLE_H   44    /* rr_font_36 line_height */
+#define PAIRED_SUB_Y     246
+#define PAIRED_SUB_H     33    /* rr_font_28 line_height */
+
+_Static_assert(PAIRED_TICK_Y + PAIRED_TICK_H <= PAIRED_TITLE_Y,
+               "paired screen: the tick overlaps the title");
+_Static_assert(PAIRED_TITLE_Y + PAIRED_TITLE_H <= PAIRED_SUB_Y,
+               "paired screen: the title overlaps the subtitle");
+_Static_assert(PAIRED_SUB_Y + PAIRED_SUB_H <= RR_SAFE_H,
+               "paired screen: the subtitle falls outside the safe area");
+
 esp_err_t rr_ui_show_paired_status(void)
 {
     // Called from the NimBLE host task on a successful ROUTINE_PUSH, so it must
@@ -183,22 +243,28 @@ esp_err_t rr_ui_show_paired_status(void)
     bsp_display_lock(0);
 
     lv_obj_t *root = rr_ui_begin_screen(lv_color_black());
-    
+
 
     lv_obj_t *tick = lv_label_create(root);
     lv_label_set_text(tick, LV_SYMBOL_OK);
+    lv_obj_set_style_text_font(tick, &rr_font_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(tick, lv_color_hex(0x10B981), LV_PART_MAIN);
-    lv_obj_align(tick, LV_ALIGN_CENTER, 0, -60);
+    lv_obj_align(tick, LV_ALIGN_TOP_MID, 0, PAIRED_TICK_Y);
 
     lv_obj_t *title = lv_label_create(root);
     lv_label_set_text(title, "Paired");
+    lv_obj_set_style_text_font(title, &rr_font_36, LV_PART_MAIN);
     lv_obj_set_style_text_color(title, lv_color_white(), LV_PART_MAIN);
-    lv_obj_align(title, LV_ALIGN_CENTER, 0, -10);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, PAIRED_TITLE_Y);
 
+    // Body weight, not title weight. Both lines at 36 would read as two equal
+    // headlines and lose the "what happened / what it means" split; the grey
+    // already says secondary, and the size should agree with it.
     lv_obj_t *sub = lv_label_create(root);
     lv_label_set_text(sub, "Routines synced");
+    lv_obj_set_style_text_font(sub, &rr_font_28, LV_PART_MAIN);
     lv_obj_set_style_text_color(sub, lv_color_hex(0x8E8E93), LV_PART_MAIN);
-    lv_obj_align(sub, LV_ALIGN_CENTER, 0, 24);
+    lv_obj_align(sub, LV_ALIGN_TOP_MID, 0, PAIRED_SUB_Y);
 
     bsp_display_unlock();
 
@@ -279,12 +345,19 @@ esp_err_t rr_ui_show_last_status(void)
     case RR_SCREEN_PAIRED:  return rr_ui_show_paired_status();
     case RR_SCREEN_WAITING: return rr_ui_show_waiting_status();
     case RR_SCREEN_WATCHFACE:
-    case RR_SCREEN_ALARM:
         // Without this an ABORTED reset hold left the red countdown on screen
-        // until the next minute tick happened to repaint it. A SNOOZED alarm
-        // needs the same treatment for the same reason — dismissing it has to
-        // put something back, or the alarm screen simply stays up.
+        // until the next minute tick happened to repaint it.
         if (s_repaint_face) s_repaint_face();
+        return ESP_OK;
+    case RR_SCREEN_READY:
+        // DELIBERATELY A NO-OP, and this is the case that matters most.
+        //
+        // rr_idle's wake path is `if (!build_and_show_face()) show_last_status()`.
+        // An unanswered READY offer closes the face gate, so wake lands here —
+        // and painting anything would wipe the very offer the wake exists to
+        // show. The widgets are still alive behind the dark panel; leaving them
+        // alone IS the restore. Answering READY goes through
+        // rr_ui_dismiss_ready(), which restores what it covered.
         return ESP_OK;
     default:                return ESP_OK;
     }
@@ -886,64 +959,134 @@ bool rr_ui_last_screen_is_watchface(void)
     return s_last_screen == RR_SCREEN_WATCHFACE;
 }
 
-// ── Phase 7: the alarm screen (§7, §8 screen 1) ─────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// Phase 7 — the READY screen (§7, §8 screen 1)
 //
-// This is §8's "Start" screen with one thing added: a snooze. It is NOT a
-// second way to run a routine — nothing starts until "Πάμε"/"Let's go" is
-// tapped, and that tap goes through rr_routine_request_start() like every
-// other start on this watch.
+// The one thing between "start routine X" and a running countdown, for BOTH
+// callers: the scheduler falling due, and the parent app's start_routine.
 //
-// Why a screen at all, rather than dropping straight into step 1: a scheduled
-// routine fires at a child who is not holding the watch and did not ask for
-// it. Starting a 30-second countdown they are not looking at spends the first
-// step before they have picked up their wrist. The alarm rings, the screen
-// says what it wants, and the child decides.
+// It exists because a start is aimed at a child who is not holding the watch
+// and did not ask for it. Dropping straight into step 1 spends the first step
+// before the wrist has come up — which is what the remote-start path used to
+// do, while the scheduled path already asked. Now they ask the same way, with
+// the same words, and the timer starts on the tap and nowhere else.
+//
+// NO COUNTDOWN, NO ARC, NO CLOCK on this screen, deliberately. Anything that
+// moves says "you are already losing time", which is the exact pressure the
+// screen was added to remove. The scheduled HH:MM the alarm screen printed is
+// gone with it: a remote start has none to print, and a single screen shape
+// for both paths is worth more than that line.
+//
+// ⚠️ EVERY Y IS TOP-RELATIVE TO THE SAFE AREA, like the step screen and the
+// paired screen — the two anchors the OK-button-through-the-ring bug came
+// from mixing. The _Static_asserts below turn an overlap into a build failure
+// instead of something to spot on a photograph of the glass.
+//
+//   emoji      20 ..116   (96 px, the same asset size the step screen streams)
+//   name      128 ..216   (two lines of rr_font_36 at 44 px)
+//   steps     224 ..250   (one line of rr_font_20 at 26 px)
+//   START     288 ..356   (68 px, the runtime Done button's exact size)
+//   NOT NOW   368 ..412   (44 px, flush with the bottom of the safe area)
+//
+// 412 is RR_SAFE_H, so NOT NOW ends exactly on the safe edge and the curved
+// bezel cannot reach it. Absolute panel coordinates: X 45..365, Y 45..457.
+// ═════════════════════════════════════════════════════════════════════════════
 
-esp_err_t rr_ui_show_alarm(const char *routine_name, const char *routine_emoji,
-                           int hour, int minute, const char *language,
-                           rr_ui_step_cb_t on_start, rr_ui_step_cb_t on_snooze)
+#define READY_EMOJI_Y    20
+#define READY_EMOJI_H    96
+#define READY_NAME_Y     128
+#define READY_NAME_H     88    /* two lines of rr_font_36 */
+#define READY_STEPS_Y    224
+#define READY_STEPS_H    26    /* rr_font_20 line_height */
+#define READY_NOT_NOW_H  44
+#define READY_NOT_NOW_Y  (RR_SAFE_H - READY_NOT_NOW_H)
+#define READY_GO_H       68
+#define READY_GO_Y       (READY_NOT_NOW_Y - 12 - READY_GO_H)
+#define READY_NOT_NOW_W  200
+
+_Static_assert(READY_EMOJI_Y + READY_EMOJI_H <= READY_NAME_Y,
+               "ready screen: the emoji overlaps the routine name");
+_Static_assert(READY_NAME_Y + READY_NAME_H <= READY_STEPS_Y,
+               "ready screen: the routine name overlaps the step count");
+_Static_assert(READY_STEPS_Y + READY_STEPS_H <= READY_GO_Y,
+               "ready screen: the step count overlaps the START button");
+_Static_assert(READY_GO_Y + READY_GO_H <= READY_NOT_NOW_Y,
+               "ready screen: the START button overlaps NOT NOW");
+_Static_assert(READY_NOT_NOW_Y + READY_NOT_NOW_H <= RR_SAFE_H,
+               "ready screen: NOT NOW falls outside the safe area");
+_Static_assert(READY_NOT_NOW_W <= RR_SAFE_W,
+               "ready screen: NOT NOW is wider than the safe area");
+
+esp_err_t rr_ui_show_ready(const char *routine_name, const char *routine_emoji,
+                           int step_count, const char *language,
+                           rr_ui_step_cb_t on_start, rr_ui_step_cb_t on_not_now)
 {
     const bool el = (language != NULL && language[0] == 'e' && language[1] == 'l');
+
+    // Remember the restore target BEFORE begin_screen, and only on the way IN
+    // — re-showing READY on top of itself (rr_idle repaints it after a screen
+    // was drawn over it) must not make READY its own restore target.
+    if (s_last_screen != RR_SCREEN_READY) s_screen_before_ready = s_last_screen;
 
     bsp_display_lock(0);
     lv_obj_t *root = rr_ui_begin_screen(RR_BG);
     s_arc = NULL;
     s_mmss = NULL;
 
-    // The scheduled time, in the accent colour — this is data, and it is the
-    // answer to the child's first question ("why is my watch making noise").
-    char hhmm[8];
-    snprintf(hhmm, sizeof(hhmm), "%02d:%02d", hour, minute);
-    lv_obj_t *ltime = lv_label_create(root);
-    lv_label_set_text(ltime, hhmm);
-    lv_obj_set_style_text_font(ltime, &rr_font_36, LV_PART_MAIN);
-    lv_obj_set_style_text_color(ltime, RR_ACCENT, LV_PART_MAIN);
-    lv_obj_align(ltime, LV_ALIGN_TOP_MID, 0, 0);
-
     char lvpath[96];
     const char *posix_path = routine_emoji ? rr_emoji_path(routine_emoji) : NULL;
+    bool drew_emoji = false;
     if (posix_path != NULL && to_lv_path(posix_path, lvpath, sizeof(lvpath))) {
         lv_obj_t *img = lv_image_create(root);
         lv_image_set_src(img, lvpath);
-        lv_obj_align(img, LV_ALIGN_TOP_MID, 0, 56);
+        lv_obj_align(img, LV_ALIGN_TOP_MID, 0, READY_EMOJI_Y);
+        drew_emoji = true;
+    } else {
+        ESP_LOGW(TAG, "routine emoji '%s' unmapped — READY shows text only",
+                 routine_emoji ? routine_emoji : "(none)");
     }
 
+    // The name is the answer to "why is my watch making noise", so it is the
+    // biggest thing here. Sized down only when it genuinely needs a third line
+    // at 36 — same measure-don't-assume rule as the step label, because most
+    // routine names are two short words and shrinking those everywhere to fit
+    // the rare long one is paying the cost in the wrong place.
+    lv_point_t sz;
+    lv_text_get_size(&sz, routine_name ? routine_name : "", &rr_font_36, 0, 0,
+                     RR_SAFE_W, LV_TEXT_FLAG_NONE);
     lv_obj_t *lname = lv_label_create(root);
-    lv_label_set_long_mode(lname, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(lname, RR_SAFE_W);
+    lv_obj_set_size(lname, RR_SAFE_W, READY_NAME_H);
+    // LONG_DOT, not WRAP: with a fixed height an over-long name is truncated
+    // with an ellipsis INSIDE the box instead of growing down through the
+    // step count and the START button, which no _Static_assert can catch.
+    lv_label_set_long_mode(lname, LV_LABEL_LONG_DOT);
     lv_label_set_text(lname, routine_name ? routine_name : "");
-    lv_obj_set_style_text_font(lname, &rr_font_36, LV_PART_MAIN);
+    lv_obj_set_style_text_font(lname, sz.y <= READY_NAME_H ? &rr_font_36 : &rr_font_28,
+                               LV_PART_MAIN);
     lv_obj_set_style_text_color(lname, RR_TEXT, LV_PART_MAIN);
     lv_obj_set_style_text_align(lname, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN);
-    lv_obj_align(lname, LV_ALIGN_TOP_MID, 0, 170);
+    lv_obj_align(lname, LV_ALIGN_TOP_MID, 0, READY_NAME_Y);
 
-    // Primary action, full width — the same shape and size as the runtime's
-    // Done button, so "the big one starts things" holds across every screen.
+    // How much is being asked for. A child deciding whether to tap START wants
+    // the size of the commitment, and it is the one number this screen has —
+    // grey, because it is context, not the headline.
+    char steps[32];
+    if (step_count == 1) snprintf(steps, sizeof(steps), el ? "1 βήμα" : "1 step");
+    else                 snprintf(steps, sizeof(steps), el ? "%d βήματα" : "%d steps", step_count);
+    lv_obj_t *lsteps = lv_label_create(root);
+    lv_label_set_text(lsteps, steps);
+    lv_obj_set_style_text_font(lsteps, &rr_font_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lsteps, RR_MUTED, LV_PART_MAIN);
+    lv_obj_align(lsteps, LV_ALIGN_TOP_MID, 0, READY_STEPS_Y);
+
+    // START: full width, accent — the same shape and size as the runtime's
+    // Done button, so "the big orange one moves things forward" holds across
+    // every screen. Orange is a DATA/action colour here, never chrome (§9).
     lv_obj_t *bgo = lv_button_create(root);
-    lv_obj_set_size(bgo, RR_SAFE_W, 68);
-    lv_obj_align(bgo, LV_ALIGN_BOTTOM_MID, 0, -48);
+    lv_obj_set_size(bgo, RR_SAFE_W, READY_GO_H);
+    lv_obj_align(bgo, LV_ALIGN_TOP_MID, 0, READY_GO_Y);
     lv_obj_set_style_bg_color(bgo, RR_ACCENT, LV_PART_MAIN);
-    lv_obj_set_style_radius(bgo, 34, LV_PART_MAIN);
+    lv_obj_set_style_radius(bgo, READY_GO_H / 2, LV_PART_MAIN);
     lv_obj_add_event_cb(bgo, done_event_cb, LV_EVENT_CLICKED, (void *) on_start);
     lv_obj_t *lgo = lv_label_create(bgo);
     lv_label_set_text(lgo, el ? "Πάμε!" : "Let's go!");
@@ -951,31 +1094,53 @@ esp_err_t rr_ui_show_alarm(const char *routine_name, const char *routine_emoji,
     lv_obj_set_style_text_color(lgo, RR_BG, LV_PART_MAIN);
     lv_obj_center(lgo);
 
-    // Snooze: quiet, like Skip. Deliberately NOT "tap anywhere to snooze" —
-    // the alarm wakes a lit screen on a moving wrist, and a whole-screen
-    // snooze target would be hit by accident far more often than on purpose.
-    lv_obj_t *bsn = lv_button_create(root);
-    lv_obj_set_size(bsn, 180, 44);
-    lv_obj_align(bsn, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(bsn, RR_BG, LV_PART_MAIN);
-    lv_obj_set_style_border_width(bsn, 1, LV_PART_MAIN);
-    lv_obj_set_style_border_color(bsn, RR_MUTED, LV_PART_MAIN);
-    lv_obj_set_style_radius(bsn, 22, LV_PART_MAIN);
-    lv_obj_add_event_cb(bsn, done_event_cb, LV_EVENT_CLICKED, (void *) on_snooze);
-    lv_obj_t *lsn = lv_label_create(bsn);
-    lv_label_set_text(lsn, el ? "Σε 5′" : "Snooze 5′");
-    lv_obj_set_style_text_font(lsn, &rr_font_20, LV_PART_MAIN);
-    lv_obj_set_style_text_color(lsn, RR_MUTED, LV_PART_MAIN);
-    lv_obj_center(lsn);
+    // NOT NOW: quiet and outlined, exactly like Skip. Deliberately NOT "tap
+    // anywhere to dismiss" — READY lights a screen on a moving wrist, and a
+    // whole-screen dismiss target would be hit by accident far more often than
+    // on purpose, which loses the routine the child meant to run.
+    lv_obj_t *bno = lv_button_create(root);
+    lv_obj_set_size(bno, READY_NOT_NOW_W, READY_NOT_NOW_H);
+    lv_obj_align(bno, LV_ALIGN_TOP_MID, 0, READY_NOT_NOW_Y);
+    lv_obj_set_style_bg_color(bno, RR_BG, LV_PART_MAIN);
+    lv_obj_set_style_border_width(bno, 1, LV_PART_MAIN);
+    lv_obj_set_style_border_color(bno, RR_MUTED, LV_PART_MAIN);
+    lv_obj_set_style_radius(bno, READY_NOT_NOW_H / 2, LV_PART_MAIN);
+    lv_obj_add_event_cb(bno, done_event_cb, LV_EVENT_CLICKED, (void *) on_not_now);
+    lv_obj_t *lno = lv_label_create(bno);
+    lv_label_set_text(lno, el ? "Όχι τώρα" : "Not now");
+    lv_obj_set_style_text_font(lno, &rr_font_20, LV_PART_MAIN);
+    lv_obj_set_style_text_color(lno, RR_MUTED, LV_PART_MAIN);
+    lv_obj_center(lno);
 
     bsp_display_unlock();
 
     // Its own screen kind, for two reasons: rr_ui_last_screen_is_watchface()
-    // must say NO (or rr_idle's minute tick repaints the face straight over a
-    // ringing alarm), and dismissing a snooze has to restore something, which
-    // rr_ui_show_last_status() can only do if it knows what is up.
-    s_last_screen = RR_SCREEN_ALARM;
-    ESP_LOGI(TAG, "ALARM screen: %s @ %s (%s)", routine_name ? routine_name : "?",
-             hhmm, el ? "el" : "en");
+    // must say NO (or rr_idle's minute tick repaints the face straight over an
+    // unanswered offer), and main.c's face gate needs to tell "READY is
+    // already up" from "something painted over it" without re-rendering.
+    s_last_screen = RR_SCREEN_READY;
+    ESP_LOGI(TAG, "READY screen: '%s' %s, %s (%s)", routine_name ? routine_name : "?",
+             steps, drew_emoji ? "emoji ok" : "emoji FALLBACK", el ? "el" : "en");
     return ESP_OK;
+}
+
+bool rr_ui_last_screen_is_ready(void)
+{
+    return s_last_screen == RR_SCREEN_READY;
+}
+
+esp_err_t rr_ui_dismiss_ready(void)
+{
+    if (s_last_screen != RR_SCREEN_READY) return ESP_OK;
+    s_last_screen = s_screen_before_ready;
+
+    // RR_SCREEN_NONE means READY covered a transient screen with no restore of
+    // its own — the routine-complete screen is the real case. show_last_status()
+    // is a no-op there, which would leave the dismissed offer sitting on the
+    // glass, so fall back to the face: it is where an idle watch belongs.
+    if (s_last_screen == RR_SCREEN_NONE && s_repaint_face != NULL) {
+        s_repaint_face();
+        return ESP_OK;
+    }
+    return rr_ui_show_last_status();
 }
