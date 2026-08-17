@@ -100,14 +100,18 @@ endif()
 # and "nobody moved it" stay distinguishable. Phase 9 concluded the engine does
 # not count on this part; this is how that conclusion gets re-checked on a new
 # board or a new silicon revision instead of being taken on faith.
-# -DRR_LIGHT_SLEEP=1 enables automatic CPU light sleep. OFF BY DEFAULT: it is
-# implemented and the PM locks are correct, but LVGL's millisecond-period tick
-# timer thrashes against the sleep entry/exit overhead and starves both the IDLE
-# and main tasks (reproduced on hardware — see the comment in main.c). Gating the
-# LVGL tick on the panel being lit is the remaining work.
-if(RR_LIGHT_SLEEP)
+# ── Automatic CPU light sleep: ON BY DEFAULT since 2026-08-17 ────────────────
+# Measured unplugged on this board: 33.1 mA / ~12 h without it, 11.1 mA / ~36 h
+# with it at a 40 ms LVGL tick (92.3% sleep residency). The starvation warning
+# that kept this opt-in for two phases was never substantiated and is now
+# measured false: worst-case scheduling lateness 0 ms across 2.53 h, and a real
+# routine fired under light sleep end to end. See docs/POWER.md.
+#
+# -DRR_NO_LIGHT_SLEEP=1 opts out, for isolating a suspected PM interaction.
+if(NOT RR_NO_LIGHT_SLEEP)
     idf_build_set_property(COMPILE_DEFINITIONS "RR_LIGHT_SLEEP=1" APPEND)
-    message(WARNING "RR_LIGHT_SLEEP is set — KNOWN ISSUE: IDLE/main task starvation via the LVGL tick.")
+else()
+    message(WARNING "RR_NO_LIGHT_SLEEP is set — the CPU will never sleep. Expect ~33 mA idle, ~12 h runtime.")
 endif()
 
 # -DRR_AUDIO_BOOT_TEST=1 plays one tone at boot, to confirm the Phase 10 I2S
@@ -215,11 +219,21 @@ file(COPY ${RR_AUDIO_WAVS} DESTINATION "${LFS_STAGE}/audio")
 # eating a child's completed routines.
 littlefs_create_partition_image(littlefs "${LFS_STAGE}")
 
-# -DRR_LVGL_TICK_MS=<n> raises LVGL's tick period from the BSP's 5 ms, globally
-# (rr_ui.c). The tick is the only periodic esp_timer on the device and sets the
-# granularity of every CPU idle gap. Nothing here animates faster than 1 Hz (no
-# lv_anim_* calls exist; the countdown ring is a 1 Hz lv_timer), so the awake-side
-# cost of a coarser tick is small. Diagnostic/experimental — see docs/POWER.md.
+# ── LVGL tick period: 40 ms BY DEFAULT since 2026-08-17 ──────────────────────
+# The BSP ships 5 ms. The tick is the only periodic esp_timer on this device and
+# it therefore caps how long each light sleep can last: at 5 ms the CPU took
+# 1.33M sleeps of 330 us (65% residency, 35% awake), at 40 ms it takes 395k of
+# 3.75 ms (92.3% residency, 7.3% awake). That is most of the 33.1 -> 11.1 mA win.
+#
+# Safe visually, and this was checked rather than assumed: there are NO lv_anim_*
+# calls anywhere in this firmware, the routine countdown ring redraws on a 1 Hz
+# lv_timer, and touch does not wait for the tick at all (the FT3168 interrupt
+# wakes the LVGL task directly). Nothing animates faster than 1 Hz.
+#
+# -DRR_LVGL_TICK_MS=5 restores the BSP default; other values are the A/B knob.
+if(NOT DEFINED RR_LVGL_TICK_MS)
+    set(RR_LVGL_TICK_MS 40)
+endif()
 if(RR_LVGL_TICK_MS)
     idf_build_set_property(COMPILE_DEFINITIONS "RR_LVGL_TICK_MS=${RR_LVGL_TICK_MS}" APPEND)
     message(STATUS "RR_LVGL_TICK_MS=${RR_LVGL_TICK_MS} — LVGL tick period raised from 5 ms")
@@ -233,4 +247,14 @@ endif()
 if(RR_SCHED_TEST_MIN)
     idf_build_set_property(COMPILE_DEFINITIONS "RR_SCHED_TEST_MIN=${RR_SCHED_TEST_MIN}" APPEND)
     message(WARNING "RR_SCHED_TEST_MIN=${RR_SCHED_TEST_MIN} — this image DELIBERATELY SETS THE CLOCK WRONG.")
+endif()
+
+# -DRR_SCHED_CLEAR_HANDLED=1 erases rr_sched's last_handled / handled_ids keys
+# once at boot. Recovery for a testing side effect: RR_SCHED_TEST_MIN winds the
+# clock forward, which marks that occurrence handled, so once the clock is
+# corrected the real fire that day is skipped. Flash once, boot once, then flash
+# a normal image. Does NOT touch pairing, device_id or the routine cache.
+if(RR_SCHED_CLEAR_HANDLED)
+    idf_build_set_property(COMPILE_DEFINITIONS "RR_SCHED_CLEAR_HANDLED=1" APPEND)
+    message(WARNING "RR_SCHED_CLEAR_HANDLED is set — this image erases rr_sched's handled-fire state at boot.")
 endif()

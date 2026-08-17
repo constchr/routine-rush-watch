@@ -222,44 +222,41 @@ void app_main(void)
     // BLE or any driver that takes one of its own, and the display lock is
     // acquired inside rr_pm_init() because the screen is lit from boot.
     //
-    // ⚠️ LIGHT SLEEP IS OPT-IN AND CURRENTLY OFF BY DEFAULT — build with
-    //     idf.py -DRR_LIGHT_SLEEP=1 build
-    // to turn it on. This is NOT caution left over from Phase 8; it is a
-    // measured, reproduced fault, and the flag exists so the remaining work can
-    // be done without shipping a watch that misses alarms in the meantime.
+    // ── LIGHT SLEEP IS ON BY DEFAULT SINCE 2026-08-17 ───────────────────────
+    // Opt out with -DRR_NO_LIGHT_SLEEP=1 (costs ~3x the idle current).
     //
-    // WHAT HAPPENS WITH IT ON, on hardware, at 5+ minutes of uptime:
-    //   E task_wdt: Task watchdog got triggered ... IDLE (CPU 0)
-    //   E task_wdt: Tasks currently running: CPU 0: esp_timer
-    // repeating every 5 s, WITH THE 30 s HEARTBEAT ABSENT ENTIRELY — so the
-    // main task is being starved too, not just the idle task.
+    // Measured, unplugged, on this board:
     //
-    // WHY. Automatic light sleep costs a fixed entry/exit overhead each time.
-    // LVGL drives its tick from an esp_timer with a period of the same order
-    // (single-digit milliseconds), and that timer runs whether or not anything
-    // is on screen. So the scheduler thrashes: sleep, wake on the tick almost
-    // immediately, sleep again — never completing an idle pass. `ls` stuck at 1
-    // with `slp 0%` is the same story from the other side: it entered light
-    // sleep and got essentially no sleep out of it.
+    //   light sleep off          33.1 mA +/- 1.0   ~12 h runtime
+    //   light sleep + 40 ms tick 11.1 mA +/- 1.6   ~36 h runtime, 92.3% residency
     //
-    // THE FIX, NOT YET DONE: stop LVGL's tick and refresh timers while the panel
-    // is dark (they have nothing to drive) and restore them in wake_up(), so the
-    // idle period between step samples is tens of milliseconds rather than two.
-    // That is display surgery, and the Phase 4b "went unresponsive" incident is
-    // exactly what happens when it is done carelessly — hence a flag rather than
-    // a rushed change.
+    // ⚠️ THIS BLOCK USED TO CARRY A LONG WARNING ABOUT TASK STARVATION. It is
+    // gone because it was never substantiated, and the two things it asserted are
+    // now both measured:
     //
-    // EVERYTHING ELSE FROM PHASE 10 STAYS ON and is independently useful: the
-    // I2S locks are released (rr_audio), advertising is at 852.5 ms, the
-    // wrist-raise gate is live, and the PM locks and telemetry are in place and
-    // correct — the lock dump with light sleep enabled showed every
-    // sleep-blocking lock at Active 0, which is what makes the LVGL tick the
-    // remaining obstacle rather than one of several.
+    //   • "the LVGL tick thrashes against the entry/exit overhead" — the tick IS
+    //     the mechanism, but it caps sleep LENGTH rather than blocking sleep.
+    //     Sleep always engaged. Raising the tick period to 40 ms (rr_ui.c) turned
+    //     1.33M sleeps of 330 us into 395k of 3.75 ms.
+    //   • "the IDLE and main tasks are starved, so rr_sched can miss a fire" —
+    //     across 2.53 h at 92.3% residency, a 60 s periodic task at the main
+    //     task's priority was never once even 1 ms late (rr_powerlog reports
+    //     worst-case lateness). And a real scheduled routine was fired under
+    //     light sleep end to end: screen wake and alarm tone, both confirmed on
+    //     hardware via RR_SCHED_TEST_MIN.
+    //
+    // The old warning's suggested fix — "stop LVGL's tick while the panel is
+    // dark" — was also tried and is strictly WORSE than doing nothing. See
+    // RR_LVGL_TICK_SLEEP in rr_idle.c: lvgl_port_stop() leaves the port task
+    // spinning at 1 kHz.
+    //
+    // Full chain of evidence, including the two wrong conclusions reached on the
+    // way, in docs/POWER.md.
 #ifdef RR_LIGHT_SLEEP
     ESP_ERROR_CHECK_WITHOUT_ABORT(rr_pm_init(true));
-    ESP_LOGW(TAG, "⚠ light sleep ENABLED by RR_LIGHT_SLEEP — expect IDLE task "
-                  "watchdog warnings until the LVGL tick is gated on the panel");
 #else
+    ESP_LOGW(TAG, "light sleep DISABLED by RR_NO_LIGHT_SLEEP — expect ~33 mA "
+                  "idle and ~12 h of runtime instead of ~36 h");
     ESP_ERROR_CHECK_WITHOUT_ABORT(rr_pm_init(false));
 #endif
 
@@ -485,6 +482,35 @@ void app_main(void)
     // one way and main.c ties the ends together.
     rr_sched_set_wake_hook(rr_idle_wake_manual);
     rr_routine_set_finish_hook(rr_sched_rearm_on_idle);
+
+#ifdef RR_SCHED_CLEAR_HANDLED
+    // ── Recovery for a fire that RR_SCHED_TEST_MIN consumed ─────────────────
+    //
+    // rr_sched persists s_last_handled (a LOCAL epoch) and handled_commit() only
+    // ever moves it FORWARD. So winding the clock forward to test a fire marks
+    // that occurrence handled, and when the clock is corrected back the occurrence
+    // is in the future and gets skipped — the real routine silently does not fire
+    // that day.
+    //
+    // This erases rr_sched's two NVS keys so the next arm starts from scratch. It
+    // touches nothing else: pairing, device_id and the routine cache are all in
+    // other namespaces. Same shape as RR_CLEAR_BONDS — flash once, boot once,
+    // then flash a normal image.
+    {
+        nvs_handle_t h;
+        if (nvs_open("rr_sched", NVS_READWRITE, &h) == ESP_OK) {
+            const esp_err_t e1 = nvs_erase_key(h, "last_handled");
+            const esp_err_t e2 = nvs_erase_key(h, "handled_ids");
+            nvs_commit(h);
+            nvs_close(h);
+            ESP_LOGW(TAG, "RR_SCHED_CLEAR_HANDLED — erased last_handled (%s) and "
+                          "handled_ids (%s); the next occurrence will fire again",
+                     esp_err_to_name(e1), esp_err_to_name(e2));
+        } else {
+            ESP_LOGE(TAG, "RR_SCHED_CLEAR_HANDLED — could not open rr_sched NVS");
+        }
+    }
+#endif
 
 #ifdef RR_SCHED_TEST_MIN
     // ── Scheduler-integrity test: does a routine still fire under light sleep? ──
