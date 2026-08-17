@@ -358,6 +358,8 @@ static struct {
     char routine_emoji[16];
     int  step_count;
     char language[4];
+    /** THIS offer is the screen on display. Cleared with the rest on memset. */
+    bool painted;
 } s_ready;
 
 static void (*s_answer_hook)(const char *assignment_id, bool started);
@@ -413,17 +415,35 @@ static void paint_ready(void)
 {
     rr_ui_show_ready(s_ready.routine_name, s_ready.routine_emoji, s_ready.step_count,
                      s_ready.language, on_ready_start, on_ready_not_now);
+    s_ready.painted = true;
 }
 
+/**
+ * Paint the pending offer unless THIS offer is already what is on screen.
+ *
+ * ⚠️ THE GUARD IS PER-OFFER, NOT PER-SCREEN-KIND, and the difference is both
+ * bugs at once. Its caller is main.c's face gate, polled twice a second, so a
+ * missing guard re-reads the emoji off littlefs at 2 Hz and destroys the touch
+ * this screen is waiting for. But guarding on "is a READY screen up" alone is
+ * wrong in the other direction: a NEW offer arriving while a PREVIOUS one is
+ * still displayed would be silently skipped, leaving the wrong routine on the
+ * glass with the new one's callbacks nowhere.
+ *
+ * `painted` is cleared by the memset that registers each offer, so it means
+ * "this offer, the one currently in s_ready, has been drawn" — which is the
+ * question both cases actually need answered.
+ *
+ * On hardware the two callers raced: the wake hook opened the face gate, which
+ * painted the offer, and deferred_offer then painted it again ~8 ms later
+ * (two "READY screen:" lines per remote start, two emoji reads). Whoever gets
+ * there first now wins and the other is a no-op.
+ */
 void rr_routine_show_ready(void)
 {
     if (!s_ready.pending) return;
-    // Its caller is main.c's face gate, which rr_idle polls twice a second.
-    // Rebuilding unconditionally would re-read the routine emoji off littlefs
-    // at 2 Hz and destroy the touch this screen is waiting for.
-    if (rr_ui_last_screen_is_ready()) return;
+    if (s_ready.painted && rr_ui_last_screen_is_ready()) return;
 
-    ESP_LOGI(TAG, "re-showing the pending READY offer for '%s'", s_ready.routine_name);
+    ESP_LOGI(TAG, "showing the READY offer for '%s'", s_ready.routine_name);
     paint_ready();
 }
 
@@ -481,12 +501,11 @@ static void deferred_offer(void *arg)
 
     ESP_LOGI(TAG, "════ READY: '%s' — %d step(s), waiting for START ════",
              s_ready.routine_name, s_ready.step_count);
-    // Unconditional, even though waking from sleep will already have painted
-    // READY through main.c's face gate (pending is set above, so the gate is
-    // shut by the time wake_up() renders). One redundant render per offer beats
-    // a conditional that would silently skip repainting when a PREVIOUS offer
-    // for a different routine happens to still be the screen on display.
-    paint_ready();
+    // Through the same guarded path the face gate uses. Waking from sleep has
+    // usually painted this offer already (pending is set above, so the gate is
+    // shut by the time wake_up() renders) — the guard is what keeps that from
+    // costing a second render and a second emoji read.
+    rr_routine_show_ready();
 }
 
 rr_start_result_t rr_routine_request_start(const char *assignment_id)
