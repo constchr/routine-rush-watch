@@ -447,6 +447,30 @@ static esp_err_t audio_hw_init(void)
         return ESP_FAIL;
     }
 
+    // ⚠️ SILENCE ONE PREDICTABLE DRIVER ERROR, BECAUSE IT PRINTS ON EVERY CLIP.
+    //
+    //   E i2s_common: i2s_channel_disable(1262): the channel has not been
+    //   enabled yet
+    //
+    // esp_codec_dev_open() disables the channel before reconfiguring it, and the
+    // channel is already disabled — because leaving it disabled while idle is the
+    // Phase 10 decision three lines above (an enabled channel holds an APB lock
+    // all night). So the error is the CORRECT state being reported as a fault,
+    // once per tone, at ERROR level.
+    //
+    // That volume of red is not cosmetic: an alarm that genuinely failed would
+    // scroll past in a river of identical lines, and the alarm is the only
+    // alerting channel this board has. Demoting the driver's own logging is the
+    // fix that costs nothing — every audio failure rr_audio can actually act on
+    // is checked by return code and logged HERE, in this file, with text that
+    // says what it means for the child.
+    //
+    // The alternative — enabling the channel ourselves before each open so the
+    // driver's disable is legal — was rejected: it guesses at esp_codec_dev's
+    // internal open sequence, and the path it would guess on is the one that
+    // must never break.
+    esp_log_level_set("i2s_common", ESP_LOG_WARN);
+
     ESP_LOGI(TAG, "I2S TX-only, channel left DISABLED until a clip plays "
                   "(no APB lock held while idle; no RX channel created)");
     return ESP_OK;
