@@ -44,6 +44,7 @@
 #include "rr_audio.h"
 #include "rr_steps.h"
 #include "rr_powerlog.h"
+#include "rr_sleepdiag.h"
 
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 5, 0)
 #error "Routine Rush Watch requires ESP-IDF v5.5+ (board BSP declares idf >=5.5.0)."
@@ -485,7 +486,53 @@ void app_main(void)
     rr_sched_set_wake_hook(rr_idle_wake_manual);
     rr_routine_set_finish_hook(rr_sched_rearm_on_idle);
 
+#ifdef RR_SCHED_TEST_MIN
+    // ── Scheduler-integrity test: does a routine still fire under light sleep? ──
+    //
+    // This is the last gate before RR_LIGHT_SLEEP ships (docs/POWER.md). The risk
+    // it tests is the one that matters: a watch that saves power and misses a
+    // routine is a failure, and rr_powerlog's lateness counter cannot see it
+    // because rr_sched waits on a task notification with a computed timeout, not
+    // on a fixed vTaskDelay.
+    //
+    // ⚠️ IT MOVES THE CLOCK, IT DOES NOT ADD A SCHEDULE. That is deliberate: a
+    // synthetic fire injected past rr_store would test a code path that does not
+    // exist in production. Winding the RTC to RR_SCHED_TEST_MIN minutes before an
+    // ALREADY-CACHED schedule means the genuine chain runs — rr_store_next_schedule
+    // finds it, rr_sched arms the LP timer for the real interval, the CPU light
+    // sleeps through it, and the fire has to survive that sleep to arrive.
+    //
+    // The cached 'Morning' routine is 07:30 local on weekday 5 (Friday), so this
+    // sets the clock to Friday 07:30 minus RR_SCHED_TEST_MIN. rr_rtc holds UTC and
+    // the offset is applied on the way out (rr_rtc.h), so the target is built in
+    // UTC by subtracting the stored offset.
+    //
+    // 2026-08-21 is a Friday; epoch of 2026-08-21 07:30:00 UTC = 1787297400.
+    // With a +3 h offset the RTC lands on Fri 04:10 UTC, which renders as the
+    // local Fri 07:10 the scheduler needs to see. Verified before writing it.
+    {
+        const int32_t off_s = rr_rtc_get_utc_offset();
+        const uint32_t target_utc = 1787297400u - (uint32_t) off_s
+                                  - (uint32_t) (RR_SCHED_TEST_MIN * 60);
+        ESP_LOGW(TAG, "╔══ SCHEDULER-INTEGRITY TEST ═══════════════════════════");
+        ESP_LOGW(TAG, "║ winding the RTC to %d min before the cached Friday 07:30",
+                 RR_SCHED_TEST_MIN);
+        ESP_LOGW(TAG, "║ UNPLUG NOW. Expect: screen wake + alarm tone in ~%d min.",
+                 RR_SCHED_TEST_MIN);
+        ESP_LOGW(TAG, "║ THE CLOCK IS NOW WRONG — the phone's next TIME_SYNC fixes it.");
+        ESP_LOGW(TAG, "╚═══════════════════════════════════════════════════════");
+        ESP_ERROR_CHECK_WITHOUT_ABORT(rr_rtc_set_epoch(target_utc));
+    }
+#endif
+
     ESP_ERROR_CHECK_WITHOUT_ABORT(rr_sched_init());
+
+#ifdef RR_SLEEPDIAG
+    // Bench-only. 20 s in, so the screen has blanked (AWAKE_MS = 30 s means it
+    // has NOT yet — the census reports screen state so this is visible rather
+    // than assumed) and boot-time one-shot timers have retired.
+    ESP_ERROR_CHECK_WITHOUT_ABORT(rr_sleepdiag_start(40, 30));
+#endif
 
 #ifdef RR_POWERLOG
     // Opt-in: `idf.py -DRR_POWERLOG=1 build`. Off by default so a shipping image

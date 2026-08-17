@@ -42,6 +42,8 @@ static esp_err_t IRAM_ATTR on_sleep_exit(int64_t sleep_time_us, void *arg)
 }
 #endif
 
+bool rr_pm_light_sleep_enabled(void) { return s_light_sleep_on; }
+
 esp_err_t rr_pm_init(bool enable_light_sleep)
 {
     // The lock is created BEFORE light sleep is enabled, so there is never a

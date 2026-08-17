@@ -17,8 +17,9 @@
 // to press anything to discover a routine has started. rr_sched calls
 // rr_idle_wake_manual() through a hook wired in main.c.
 //
-// While ASLEEP the panel is dark, touch is off, and the accelerometer keeps
-// sampling at 25 Hz so the daily step count stays real.
+// While ASLEEP the panel is dark, touch is not delivered (the CONTROLLER is
+// still scanning — see go_to_sleep()), and the accelerometer keeps sampling at
+// 25 Hz so the daily step count stays real.
 //
 // Phase 10 added the other half. Blanking the panel was only ever the dominant
 // draw, not the only one: the CPU stayed at full tilt through every dark hour.
@@ -37,6 +38,7 @@
 #include "freertos/task.h"
 #include "bsp/esp-bsp.h"
 #include "bsp/display.h"
+#include "esp_lvgl_port.h"
 #include "lvgl.h"
 
 #include "rr_battery.h"
@@ -64,6 +66,13 @@ static const char *TAG = "rr_idle";
 // a single constant for that reason: if runtime disappoints, this is the first
 // thing to trade back, and docs/POWER.md's idle-awake measurement is what tells
 // you how much it is worth.
+//
+// ⚠️ IT IS ONE CONSTANT BECAUSE THERE IS ONE KIND OF WAKE, AND THAT STOPS BEING
+// TRUE THE DAY TOUCH-TO-WAKE LANDS. 30 s is justified by the wake being
+// deliberate: a button press or the scheduler both mean something is genuinely
+// there to read. A tap on a dark screen may have been a sleeve, so it must NOT
+// inherit this timeout — give touch-originated wakes 5-8 s (§9B.2's original
+// figure) and leave this one for the deliberate paths. See go_to_sleep().
 #define AWAKE_MS 30000
 
 // How long the "Paired ✓" confirmation holds before the face replaces it.
@@ -183,20 +192,43 @@ static void go_to_sleep(void)
     // draw nothing, so a dark screen and no screen are nearly the same.
     bsp_display_backlight_off();
 
-    // Stop polling the touch panel.
+    // Stop DELIVERING touch. This is a behaviour change, not a power saving —
+    // see the correction below.
     //
-    // LVGL's input device is read on a timer and lvgl_port_touchpad_read() does
-    // an unconditional I2C transaction to the FT3168 every time — ~33 reads a
-    // second, all night, to a controller nobody is touching.
+    // ⚠️ WHAT THIS COMMENT USED TO CLAIM, AND WHY IT WAS WRONG. It said LVGL
+    // polls the FT3168 on a timer, "~33 reads a second, all night, to a
+    // controller nobody is touching", and that disabling the indev stopped that
+    // I2C traffic. There almost certainly was no such traffic:
+    // esp_lvgl_port's LVGL-9 backend registers the touch interrupt callback and
+    // sets LV_INDEV_MODE_EVENT whenever the handle carries an INT pin
+    // (esp_lvgl_port_touch.c:59-73), and this BSP does pass one
+    // (BSP_LCD_TOUCH_INT = GPIO15, as .int_gpio_num). The indev has been
+    // event-driven off TP_INT since bring-up: lvgl_port_touchpad_read() runs
+    // when the interrupt fires, not on a tick.
     //
-    // ⚠️ TRADE-OFF: this removes TOUCH-to-wake. The wake paths that remain are
-    // the ones §9B.2 actually specifies — wrist-raise via the IMU, and the
-    // button as a fallback — so this matches the spec rather than reducing it,
-    // but it IS a behaviour change: tapping a dark screen no longer wakes it.
-    // The proper fix is the FT3168's own INT line (GPIO15, already wired by the
-    // BSP as .int_gpio_num), which would give touch-to-wake for zero idle cost.
-    // That needs the lvgl_port indev driven from the interrupt instead of a
-    // timer, which is a bigger change than this one.
+    // So lv_indev_enable(false) is an LVGL-side switch whose real effect is that
+    // a touch on a dark screen is no longer delivered — i.e. it is what removed
+    // touch-to-wake — and whose power effect is between nil and negligible.
+    // docs/POWER.md's 0.5-1.5 mA credit for this line has been corrected to ~0.
+    // UNVERIFIED: read from source, not measured. See docs/POWER.md.
+    //
+    // ⚠️ AND THE PART THAT IS STILL TRUE, WHICH MATTERS MORE: nothing here (or
+    // anywhere) puts the FT3168 to sleep. esp_lcd_touch_ft5x06 defines
+    // FT5x06_ID_G_PMODE (0xA5) and never writes it, and implements neither
+    // enter_sleep nor exit_sleep. The controller scans continuously through
+    // every dark hour, and that current is in every measurement taken on this
+    // board.
+    //
+    // TOUCH-TO-WAKE IS DEFERRED, NOT REJECTED. The INT line is genuinely wired
+    // to the MCU and lvgl_port already drives the indev from it, so against
+    // today's build it would add no touch-controller current. But it forecloses
+    // hibernating the FT3168, which is the last untaken idle lever, and that
+    // trade cannot be priced until the idle-asleep measurement exists. When it
+    // is implemented it goes behind an RR_LIGHT_SLEEP-style flag AND with a
+    // shorter awake timeout than AWAKE_MS for touch-originated wakes (5-8 s,
+    // per §9B.2) — a tap that may have been a sleeve must not light the AMOLED
+    // for 30 s. See docs/POWER.md "Deferred — the FT3168's own idle current,
+    // and tap-to-wake" for the full constraint list.
     set_touch_enabled(false);
 
     // ⚠️ NOTHING IS ARMED HERE ANY MORE. This used to hand the watching over to
@@ -207,6 +239,85 @@ static void go_to_sleep(void)
     // The accelerometer now keeps sampling straight through sleep, which is what
     // makes the daily step count real. The screen is woken deliberately instead:
     // a short press on BOOT, or the scheduler when a routine is due.
+
+    // ── Stop the LVGL tick (Phase 11) ───────────────────────────────────────
+    //
+    // rr_sleepdiag measured it: the LVGL tick is the ONLY periodic esp_timer on
+    // this device, and it fires 200.0 times a second — 5 ms period, from
+    // ESP_LVGL_PORT_INIT_CONFIG() — whether or not anything is on screen. Its
+    // callback costs 0.1% CPU, so this is not about reclaiming cycles: it is
+    // about not chopping the idle timeline into 5 ms pieces. Every one of those
+    // pieces is a separate light-sleep entry and exit, 200 times a second, on a
+    // board that cannot power down the main XTAL while it sleeps (no 32.768 kHz
+    // crystal is available to the SoC — BLE runs off MAIN_XTAL).
+    //
+    // ⚠️ WHAT THIS DOES *NOT* CLAIM. An earlier version of the analysis said a
+    // 5 ms tick keeps sleep windows under IDF's 3 ms gate. THAT WAS WRONG — it
+    // assumed idle begins at a random phase within the tick period. In steady
+    // state the callback takes ~5 us and idle then runs for the remaining
+    // ~4.995 ms, which clears the 3 ms gate comfortably. So the tick does not
+    // block light sleep; it makes each sleep short and therefore mostly
+    // overhead. Read docs/POWER.md before quoting a residency figure here.
+    //
+    // lvgl_port_stop() is PUBLIC API (esp_lvgl_port.h) and is exactly
+    // lv_timer_enable(false) + esp_timer_stop(tick_timer) — no component fork,
+    // nothing to re-apply on an IDF or component update. It leaves the port TASK
+    // alive, so bsp_display_lock() keeps working and there is no teardown to get
+    // wrong.
+    //
+    // WHAT STOPS WITH IT, AND WHY EACH IS SAFE:
+    //   • rr_idle's own idle_tick (a 500 ms lv_timer) stops. Everything it does
+    //     while dark is either guarded by s_awake or recomputed by wake_up(),
+    //     and the sleep timeout it enforces is moot once we are asleep.
+    //   • lv_async_call work would not run. The only caller is rr_routine's
+    //     deferred_offer, which only happens during an ACTIVE routine — and an
+    //     active routine holds the screen awake via rr_idle_is_suspended().
+    //   • THE WAKE PATHS DO NOT DEPEND ON LVGL. Both live in their own tasks:
+    //     rr_reset_button (BOOT press) and rr_sched (a routine falling due),
+    //     each calling rr_idle_wake_manual(). This is the load-bearing check —
+    //     stopping LVGL must not be able to strand a sleeping watch.
+    //
+    // Gated so build A and build B differ by exactly one flag, which is what the
+    // discriminating measurement needs. See docs/POWER.md.
+    // ⚠️ THE lv_timer_enable(true) ON THE NEXT LINE IS NOT REDUNDANT. IT IS THE
+    // WHOLE FIX. MEASURED, NOT REASONED — the first attempt was strictly worse
+    // than doing nothing, and this is why.
+    //
+    // lvgl_port_stop() is two things: esp_timer_stop(tick_timer), which is what
+    // we want, AND lv_timer_enable(false), which is a trap. From LVGL's
+    // lv_timer.c:75:
+    //
+    //     if(state_p->lv_timer_run == false) {
+    //         state_p->already_running = false;
+    //         return 1;                  <-- 1 ms. NOT LV_NO_TIMER_READY.
+    //     }
+    //
+    // esp_lvgl_port's task does `task_delay_ms = lv_timer_handler()` and only
+    // substitutes task_max_sleep_ms (500 ms) when the return is
+    // LV_NO_TIMER_READY. A return of 1 means the event-group wait becomes ONE
+    // TICK, so the port task wakes at 1000 Hz for as long as the screen is dark.
+    // That leaves xExpectedIdleTime permanently below the 3-tick gate and
+    // FreeRTOS never calls vApplicationSleep at all.
+    //
+    // On hardware, 120 s of dark screen:
+    //     lvgl_port_stop() alone          ->  ls 0   (never slept, 1 kHz spin)
+    //     untouched 5 ms tick             ->  ls 69  slp 0%
+    //     lvgl_port_stop() + enable(true) ->  see docs/POWER.md
+    //
+    // Re-enabling LVGL's timers while leaving the tick STOPPED is what we
+    // actually want: lv_tick_get() is frozen, so no lv_timer ever comes due,
+    // lv_timer_handler() computes time-until-next from the frozen tick and
+    // returns a full period (~500 ms, rr_idle's own idle_tick), and the port task
+    // waits that long. One 200 Hz timer and one 1000 Hz spin both gone.
+    //
+    // Freezing LVGL's clock is safe here and is in fact better than a
+    // wall-clock tick: LVGL time simply pauses, so no timer sees a huge jump on
+    // resume. Nothing measures real elapsed time through lv_tick — the routine
+    // countdown reads rr_rtc, and routines only run with the screen lit.
+#ifdef RR_LVGL_TICK_SLEEP
+    ESP_ERROR_CHECK_WITHOUT_ABORT(lvgl_port_stop());
+    lv_timer_enable(true);
+#endif
 
     // ── Let the CPU sleep (Phase 10) ────────────────────────────────────────
     //
@@ -236,6 +347,13 @@ static void wake_up(const char *reason)
     // releasing it last: the lock brackets every transfer, so no QSPI or I2C
     // transaction can be issued in a state where the clocks might stop under it.
     rr_pm_display_hold(true);
+
+    // Symmetric with go_to_sleep(), and BEFORE any LVGL call: lv_timer_enable()
+    // is false while dark, so a render issued before this line would be queued
+    // against a handler that is not processing timers. Restarts the 5 ms tick.
+#ifdef RR_LVGL_TICK_SLEEP
+    ESP_ERROR_CHECK_WITHOUT_ABORT(lvgl_port_resume());
+#endif
 
     set_touch_enabled(true);
 

@@ -51,8 +51,19 @@ esp_err_t rr_powerlog_start(int interval_s);
 void rr_powerlog_stop(void);
 
 /**
- * Reset the baseline to now — call when a new state has just been established,
- * so the reported rate describes that state and not the transition into it.
+ * Reset the baseline to now — so the reported rate describes the state under
+ * test and not the transition into it.
+ *
+ * ⚠️ YOU ALMOST CERTAINLY DO NOT NEED TO CALL THIS, AND FOR TWO YEARS NOBODY
+ * COULD. It had no callers at all, and on this board there is no way to reach it
+ * at the moment it matters: the console has no REPL, and BOOT is already wake
+ * (short press) and factory reset (10 s hold). The measurement that matters runs
+ * on battery, i.e. with no host attached to ask.
+ *
+ * So the baseline now re-arms ITSELF on the USB->battery edge: unplugging is the
+ * act that starts a run, and replugging finalises it and prints the result. This
+ * remains only for a future state worth measuring that is not entered by pulling
+ * the cable.
  */
 void rr_powerlog_mark(const char *state_label);
 

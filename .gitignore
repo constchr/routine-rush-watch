@@ -1,5 +1,7 @@
 # ESP-IDF build output
 build/
+# Side-by-side build dirs from A/B power measurement (-B build-A, build-C, ...).
+build-*/
 managed_components/
 dependencies.lock
 

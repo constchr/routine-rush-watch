@@ -72,6 +72,29 @@ if(RR_POWERLOG)
     message(STATUS "RR_POWERLOG enabled — battery SOC will be logged every 60 s")
 endif()
 
+# -DRR_SLEEPDIAG=1 compiles in the "who holds the CPU awake" census
+# (rr_sleepdiag.h). Answers whether light sleep CAN engage by enumerating every
+# periodic wake source and comparing its period against IDF's 3 ms sleep gate —
+# a schedule question, so it needs no battery run and no unplugging.
+# Pair it with sdkconfig.diag or the timer dump carries no periods:
+#   idf.py -DRR_SLEEPDIAG=1 -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.diag" \
+#          -B build-diag build
+if(RR_SLEEPDIAG)
+    idf_build_set_property(COMPILE_DEFINITIONS "RR_SLEEPDIAG=1" APPEND)
+    message(STATUS "RR_SLEEPDIAG enabled — timer census will run ~20 s after boot")
+endif()
+
+# -DRR_LVGL_TICK_SLEEP=1 stops LVGL's 5 ms tick timer while the panel is dark
+# (rr_idle.c go_to_sleep/wake_up), via the public lvgl_port_stop/resume. It is the
+# only periodic esp_timer on the device and it fires 200x/s with nothing on
+# screen, so every idle gap is 5 ms long and each one is a separate light-sleep
+# entry and exit. Only meaningful together with -DRR_LIGHT_SLEEP=1.
+# Off by default so build A (baseline) and build B (fix) differ by ONE flag.
+if(RR_LVGL_TICK_SLEEP)
+    idf_build_set_property(COMPILE_DEFINITIONS "RR_LVGL_TICK_SLEEP=1" APPEND)
+    message(STATUS "RR_LVGL_TICK_SLEEP enabled — LVGL tick stops while the screen is dark")
+endif()
+
 # -DRR_PED_SELFTEST=1 re-runs the QMI8658 on-chip step-engine experiment at boot
 # and reports the counter alongside real accelerometer motion, so "inert engine"
 # and "nobody moved it" stay distinguishable. Phase 9 concluded the engine does
@@ -191,3 +214,23 @@ file(COPY ${RR_AUDIO_WAVS} DESTINATION "${LFS_STAGE}/audio")
 # every missing emoji — and the fix is one script. Worth it against silently
 # eating a child's completed routines.
 littlefs_create_partition_image(littlefs "${LFS_STAGE}")
+
+# -DRR_LVGL_TICK_MS=<n> raises LVGL's tick period from the BSP's 5 ms, globally
+# (rr_ui.c). The tick is the only periodic esp_timer on the device and sets the
+# granularity of every CPU idle gap. Nothing here animates faster than 1 Hz (no
+# lv_anim_* calls exist; the countdown ring is a 1 Hz lv_timer), so the awake-side
+# cost of a coarser tick is small. Diagnostic/experimental — see docs/POWER.md.
+if(RR_LVGL_TICK_MS)
+    idf_build_set_property(COMPILE_DEFINITIONS "RR_LVGL_TICK_MS=${RR_LVGL_TICK_MS}" APPEND)
+    message(STATUS "RR_LVGL_TICK_MS=${RR_LVGL_TICK_MS} — LVGL tick period raised from 5 ms")
+endif()
+
+# -DRR_SCHED_TEST_MIN=<n> winds the RTC to n minutes before the cached Friday
+# 07:30 routine, so a real scheduled fire lands n minutes after boot. The last
+# gate before RR_LIGHT_SLEEP ships: it tests whether a routine still fires when
+# the CPU has been light-sleeping through the wait. TEST BUILDS ONLY — it leaves
+# the clock wrong until the phone's next TIME_SYNC.
+if(RR_SCHED_TEST_MIN)
+    idf_build_set_property(COMPILE_DEFINITIONS "RR_SCHED_TEST_MIN=${RR_SCHED_TEST_MIN}" APPEND)
+    message(WARNING "RR_SCHED_TEST_MIN=${RR_SCHED_TEST_MIN} — this image DELIBERATELY SETS THE CLOCK WRONG.")
+endif()

@@ -87,6 +87,22 @@ void rr_pm_stats(uint32_t *entries, uint64_t *slept_us);
 bool rr_pm_stats_available(void);
 
 /**
+ * True if light sleep was actually enabled at init.
+ *
+ * ⚠️ THE COUNTERS ABOVE ARE RAM-ONLY, AND THAT IS THE SAME TRAP THAT MADE
+ * rr_powerlog USELESS FOR TWO PHASES. Light sleep can only be observed with USB
+ * DETACHED — CONFIG_USJ_NO_AUTO_LS_ON_CONNECTION holds a NO_LIGHT_SLEEP lock for
+ * as long as a host is attached, so `ls`/`slp%` read ~0 on the bench no matter
+ * what the firmware does. Bench A/B comparisons of these numbers are therefore
+ * MEANINGLESS; measured 2026-08-14, three builds, all `slp 0%`.
+ *
+ * The numbers are produced when nothing can read them, and a reset on attach
+ * loses them. So rr_powerlog folds them into the record it persists to NVS and
+ * replays them at the next boot — see rr_powerlog.h.
+ */
+bool rr_pm_light_sleep_enabled(void);
+
+/**
  * One line for the heartbeat, e.g. "ls 412 slp 71% disp-lock".
  * Never NULL; writes into the caller's buffer.
  */

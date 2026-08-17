@@ -108,7 +108,38 @@ esp_err_t rr_ui_init(void)
     // bsp_display_start() brings up the SH8601 panel over QSPI, the FT3168
     // touch controller, and the LVGL port task. It also calls bsp_i2c_init()
     // internally, which is idempotent.
+    // -DRR_LVGL_TICK_MS=<n> raises LVGL's tick period from the BSP's 5 ms. The
+    // tick is the only periodic esp_timer on this device (rr_sleepdiag measured
+    // it at 200.0 Hz with nothing on screen), so its period is the granularity
+    // of every idle gap the CPU ever gets.
+    //
+    // This is the GLOBAL alternative to gating the tick on the panel being lit:
+    // it is slower while awake too. The cost of that is lower than it sounds and
+    // was checked rather than assumed — THERE ARE NO lv_anim_* CALLS ANYWHERE IN
+    // THIS FIRMWARE, and the routine countdown ring is redrawn by a 1 Hz
+    // lv_timer (rr_routine.c). Nothing on this watch animates faster than 1 Hz,
+    // so tick resolution only has to stay well under a second.
+    //
+    // Everything except the period is a verbatim copy of bsp_display_start(),
+    // including .buff_spiram = true, which this board cannot honour (no PSRAM)
+    // and which is therefore load-bearing in the sense that changing it would
+    // change allocation behaviour that currently works.
+#ifdef RR_LVGL_TICK_MS
+    bsp_display_cfg_t cfg = {
+        .lvgl_port_cfg = ESP_LVGL_PORT_INIT_CONFIG(),
+        .buffer_size = BSP_LCD_DRAW_BUFF_SIZE,
+        .double_buffer = BSP_LCD_DRAW_BUFF_DOUBLE,
+        .flags = {
+            .buff_dma = false,
+            .buff_spiram = true,
+        }};
+    cfg.lvgl_port_cfg.timer_period_ms = RR_LVGL_TICK_MS;
+    ESP_LOGW(TAG, "LVGL tick period raised to %d ms (default 5) — RR_LVGL_TICK_MS",
+             RR_LVGL_TICK_MS);
+    lv_display_t *disp = bsp_display_start_with_config(&cfg);
+#else
     lv_display_t *disp = bsp_display_start();
+#endif
     if (disp == NULL) {
         ESP_LOGE(TAG, "bsp_display_start() failed");
         return ESP_FAIL;

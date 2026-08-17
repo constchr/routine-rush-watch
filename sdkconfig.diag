@@ -1,0 +1,16 @@
+# sdkconfig.diag — bench diagnostics only. NOT for shipping images.
+#
+# Use with:
+#   idf.py -DRR_SLEEPDIAG=1 -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.diag" \
+#          -B build-diag build
+#
+# Deliberately separate from sdkconfig.defaults, which CI asserts on: these
+# options cost RAM and CPU and exist to answer one question (see rr_sleepdiag.h).
+
+# Gives esp_timer_dump() each timer's period, arm count and trigger count.
+# Without it the dump cannot identify which timer sets the sleep-window ceiling.
+CONFIG_ESP_TIMER_PROFILING=y
+
+# Makes esp_pm_dump_locks() report how long each lock was actually held, not just
+# whether it is held right now.
+CONFIG_PM_PROFILING=y
